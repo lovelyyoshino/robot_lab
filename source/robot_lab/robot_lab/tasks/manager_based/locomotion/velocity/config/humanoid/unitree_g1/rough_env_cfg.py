@@ -17,31 +17,42 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
     base_link_name = "torso_link"
     foot_link_name = ".*_ankle_roll_link"
     # fmt: off
-    # joint_names = [
-    #     "left_hip_pitch_joint",          # 0  L_LEG_HIP_PITCH
-    #     "left_hip_roll_joint",           # 1  L_LEG_HIP_ROLL
-    #     "left_hip_yaw_joint",            # 2  L_LEG_HIP_YAW
-    #     "left_knee_joint",               # 3  L_LEG_KNEE
-    #     "left_ankle_pitch_joint",        # 4  L_LEG_ANKLE_B
-    #     "left_ankle_roll_joint",         # 5  L_LEG_ANKLE_A
-    #     "right_hip_pitch_joint",         # 6  R_LEG_HIP_PITCH
-    #     "right_hip_roll_joint",          # 7  R_LEG_HIP_ROLL
-    #     "right_hip_yaw_joint",           # 8  R_LEG_HIP_YAW
-    #     "right_knee_joint",              # 9  R_LEG_KNEE
-    #     "right_ankle_pitch_joint",       # 10 R_LEG_ANKLE_B
-    #     "right_ankle_roll_joint",        # 11 R_LEG_ANKLE_A
-    #     "waist_yaw_joint",               # 12 WAIST_YAW
-    #     "left_shoulder_pitch_joint",     # 15 L_SHOULDER_PITCH
-    #     "left_shoulder_roll_joint",      # 16 L_SHOULDER_ROLL
-    #     "left_shoulder_yaw_joint",       # 17 L_SHOULDER_YAW
-    #     "left_elbow_pitch_joint",        # 18 L_ELBOW
-    #     "left_elbow_roll_joint",         # 19 L_WRIST_ROLL
-    #     "right_shoulder_pitch_joint",    # 22 R_SHOULDER_PITCH
-    #     "right_shoulder_roll_joint",     # 23 R_SHOULDER_ROLL
-    #     "right_shoulder_yaw_joint",      # 24 R_SHOULDER_YAW
-    #     "right_elbow_pitch_joint",       # 25 R_ELBOW
-    #     "right_elbow_roll_joint",        # 26 R_WRIST_ROLL
-    # ]
+    # 29个控制关节（与URDF中的实际名称匹配）
+    joint_names = [
+        # 腿部关节 (12个)
+        "left_hip_pitch_joint",          # 0
+        "left_hip_roll_joint",           # 1
+        "left_hip_yaw_joint",            # 2
+        "left_knee_joint",               # 3
+        "left_ankle_pitch_joint",        # 4
+        "left_ankle_roll_joint",         # 5
+        "right_hip_pitch_joint",         # 6
+        "right_hip_roll_joint",          # 7
+        "right_hip_yaw_joint",           # 8
+        "right_knee_joint",              # 9
+        "right_ankle_pitch_joint",       # 10
+        "right_ankle_roll_joint",        # 11
+        # 腰部关节 (3个)
+        "waist_yaw_joint",               # 12
+        "waist_roll_joint",              # 13
+        "waist_pitch_joint",             # 14
+        # 左臂关节 (7个)
+        "left_shoulder_pitch_joint",     # 15
+        "left_shoulder_roll_joint",      # 16
+        "left_shoulder_yaw_joint",       # 17
+        "left_elbow_joint",              # 18
+        "left_wrist_roll_joint",         # 19
+        "left_wrist_pitch_joint",        # 20
+        "left_wrist_yaw_joint",          # 21
+        # 右臂关节 (7个)
+        "right_shoulder_pitch_joint",    # 22
+        "right_shoulder_roll_joint",     # 23
+        "right_shoulder_yaw_joint",      # 24
+        "right_elbow_joint",             # 25
+        "right_wrist_roll_joint",        # 26
+        "right_wrist_pitch_joint",       # 27
+        "right_wrist_yaw_joint",         # 28
+    ]
     # fmt: on
 
     def __post_init__(self):
@@ -60,15 +71,13 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.observations.policy.joint_vel.scale = 0.05
         self.observations.policy.base_lin_vel = None
         self.observations.policy.height_scan = None
-        # self.observations.policy.joint_pos.params["asset_cfg"].joint_names = self.joint_names
-        # self.observations.policy.joint_vel.params["asset_cfg"].joint_names = self.joint_names
+        self.observations.policy.joint_pos.params["asset_cfg"].joint_names = self.joint_names
+        self.observations.policy.joint_vel.params["asset_cfg"].joint_names = self.joint_names
 
         # ------------------------------Actions------------------------------
-        # reduce action scale
-        # self.actions.joint_pos.scale = 0.25
         self.actions.joint_pos.scale = UNITREE_G1_29DOF_ACTION_SCALE
         self.actions.joint_pos.clip = {".*": (-100.0, 100.0)}
-        # self.actions.joint_pos.joint_names = self.joint_names
+        self.actions.joint_pos.joint_names = self.joint_names
 
         # ------------------------------Events------------------------------
         self.events.randomize_rigid_body_mass_base.params["asset_cfg"].body_names = [self.base_link_name]
@@ -99,8 +108,8 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.joint_acc_l2.weight = -1.25e-7
         self.rewards.joint_acc_l2.params["asset_cfg"].joint_names = [".*_hip_.*", ".*_knee_joint"]
         self.rewards.create_joint_deviation_l1_rewterm("joint_deviation_hip_l1", -0.1, [".*hip_yaw.*", ".*hip_roll.*"])
-        self.rewards.create_joint_deviation_l1_rewterm("joint_deviation_arms_l1", -0.1, [".*shoulder.*", ".*elbow.*"])
-        self.rewards.create_joint_deviation_l1_rewterm("joint_deviation_torso_l1", -0.1, ["waist_yaw_joint"])
+        self.rewards.create_joint_deviation_l1_rewterm("joint_deviation_arms_l1", -0.1, [".*shoulder.*", ".*elbow.*", ".*wrist.*"])
+        self.rewards.create_joint_deviation_l1_rewterm("joint_deviation_torso_l1", -0.1, ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"])
         self.rewards.joint_pos_limits.weight = -0.5
         self.rewards.joint_vel_limits.weight = 0
         self.rewards.joint_power.weight = 0
