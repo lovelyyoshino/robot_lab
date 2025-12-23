@@ -17,9 +17,8 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
     base_link_name = "torso_link"
     foot_link_name = ".*_ankle_roll_link"
     # fmt: off
-    # 29个控制关节（与URDF中的实际名称匹配）
     joint_names = [
-        # 腿部关节 (12个)
+        # Leg joints (12)
         "left_hip_pitch_joint",          # 0
         "left_hip_roll_joint",           # 1
         "left_hip_yaw_joint",            # 2
@@ -32,11 +31,11 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         "right_knee_joint",              # 9
         "right_ankle_pitch_joint",       # 10
         "right_ankle_roll_joint",        # 11
-        # 腰部关节 (3个)
+        # Waist joints (3)
         "waist_yaw_joint",               # 12
         "waist_roll_joint",              # 13
         "waist_pitch_joint",             # 14
-        # 左臂关节 (7个)
+        # Left arm joints (7)
         "left_shoulder_pitch_joint",     # 15
         "left_shoulder_roll_joint",      # 16
         "left_shoulder_yaw_joint",       # 17
@@ -44,7 +43,7 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         "left_wrist_roll_joint",         # 19
         "left_wrist_pitch_joint",        # 20
         "left_wrist_yaw_joint",          # 21
-        # 右臂关节 (7个)
+        # Right arm joints (7)
         "right_shoulder_pitch_joint",    # 22
         "right_shoulder_roll_joint",     # 23
         "right_shoulder_yaw_joint",      # 24
@@ -108,8 +107,12 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.joint_acc_l2.weight = -1.25e-7
         self.rewards.joint_acc_l2.params["asset_cfg"].joint_names = [".*_hip_.*", ".*_knee_joint"]
         self.rewards.create_joint_deviation_l1_rewterm("joint_deviation_hip_l1", -0.1, [".*hip_yaw.*", ".*hip_roll.*"])
-        self.rewards.create_joint_deviation_l1_rewterm("joint_deviation_arms_l1", -0.1, [".*shoulder.*", ".*elbow.*", ".*wrist.*"])
-        self.rewards.create_joint_deviation_l1_rewterm("joint_deviation_torso_l1", -0.1, ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"])
+        self.rewards.create_joint_deviation_l1_rewterm(
+            "joint_deviation_arms_l1", -0.1, [".*shoulder.*", ".*elbow.*", ".*wrist.*"]
+        )
+        self.rewards.create_joint_deviation_l1_rewterm(
+            "joint_deviation_torso_l1", -0.1, ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"]
+        )
         self.rewards.joint_pos_limits.weight = -0.5
         self.rewards.joint_vel_limits.weight = 0
         self.rewards.joint_power.weight = 0

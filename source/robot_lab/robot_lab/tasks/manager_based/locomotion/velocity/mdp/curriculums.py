@@ -21,50 +21,6 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-def terrain_levels_vel_relaxed(
-    env: ManagerBasedRLEnv,
-    env_ids: Sequence[int],
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    move_down_threshold: float = 0.1,
-) -> torch.Tensor:
-    """放宽降级条件的地形课程学习函数。
-
-    相比原版 terrain_levels_vel，此函数大幅放宽了降级条件，
-    更适合人形机器人等训练初期难以行走的机器人。
-
-    Args:
-        env: 环境实例
-        env_ids: 需要更新的环境ID
-        asset_cfg: 机器人资产配置
-        move_down_threshold: 降级阈值，默认0.1（原版是0.5）
-            - 值越小，越不容易降级
-            - 0.1 表示只有走的距离 < 命令要求的10%才会降级
-
-    Returns:
-        当前平均地形等级
-    """
-    # 获取机器人和地形
-    asset: Articulation = env.scene[asset_cfg.name]
-    terrain: TerrainImporter = env.scene.terrain
-    command = env.command_manager.get_command("base_velocity")
-
-    # 计算机器人走过的距离
-    distance = torch.norm(asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1)
-
-    # 走得远的机器人升级到更难的地形（保持原逻辑）
-    move_up = distance > terrain.cfg.terrain_generator.size[0] / 2
-
-    # 放宽降级条件：只有走的距离 < 命令要求的 move_down_threshold 才降级
-    # 原版是 0.5，这里默认改为 0.1，大幅降低降级概率
-    move_down = distance < torch.norm(command[env_ids, :2], dim=1) * env.max_episode_length_s * move_down_threshold
-    move_down *= ~move_up
-
-    # 更新地形等级
-    terrain.update_env_origins(env_ids, move_up, move_down)
-
-    # 返回平均地形等级
-    return torch.mean(terrain.terrain_levels.float())
-
 
 def command_levels_lin_vel(
     env: ManagerBasedRLEnv,
