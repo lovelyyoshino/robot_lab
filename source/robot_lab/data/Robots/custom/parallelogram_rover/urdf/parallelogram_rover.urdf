@@ -1,0 +1,495 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+  parallelogram_rover.urdf — 面向高并行训练的平行四边形等效开链模型
+
+  @author pony
+  @date 2026-08-11
+  @version v1.0.1
+  @last_modified 2026-08-12
+  @changelog
+    - v1.0.1 (2026-08-12): 四个轮端速度上限统一为 5 转/秒（10*pi rad/s）
+    - v1.0.0 (2026-08-11): 迁移 CAD 资产并加入上下摆臂 mimic 联动
+
+  边界：本文件保持 URDF 树结构；下摆臂远端不建立第二 parent，而由 mimic
+  关节保证理想平行四边形的运动学联动。真实闭环载荷分配由后续 USD/MJCF
+  派生模型负责，训练策略只应控制非 mimic 主关节。
+-->
+<robot name="parallelogram_rover">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="-8.6361926e-10 0.0019321624 -0.00063856783" rpy="0 0 0" />
+      <mass value="3.4461078" />
+      <inertia ixx="0.10363444" iyy="0.15841372" izz="0.25679732" ixy="-1.905376e-12" ixz="1.8141684e-11" iyz="-7.9038615e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.16301221 0.051000008 0.090569759" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_001_0806_04_01.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <box size="0.68 0.59728 0.146" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="fl_arm">
+    <inertial>
+      <origin xyz="0.080065293 -0.014341666 -0.0011581426" rpy="0 0 0" />
+      <mass value="0.2935297" />
+      <inertia ixx="0.00053646837" iyy="0.0015728498" izz="0.0019316215" ixy="-5.8425894e-05" ixz="-3.8770982e-05" iyz="7.8535183e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.25801222 -0.050569758 -0.23087" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_004_0806_04_05.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="fl_zhuanxiang">
+    <inertial>
+      <origin xyz="0.046766334 0.058557156 -0.013329707" rpy="0 0 0" />
+      <mass value="0.23839331" />
+      <inertia ixx="0.00023054384" iyy="0.00023379465" izz="0.00032017385" ixy="-2.6936591e-05" ixz="1.4107961e-07" iyz="6.5435729e-08" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.45287169 -0.095622906 -0.24464" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_002_0806_04_03.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="fl_qudong">
+    <inertial>
+      <origin xyz="-0.00029177758 -0.020772459 -0.15215975" rpy="0 0 0" />
+      <mass value="0.26857533" />
+      <inertia ixx="0.00089258896" iyy="0.0009611072" izz="0.00018895663" ixy="-7.8780609e-07" ixz="-2.1574507e-06" iyz="-0.00010374897" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.51025325 -0.23137 0.1558363" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_014_Copy_1_of_0806_02_10.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 -0.0045 -0.1259416" rpy="0 0 0" />
+      <geometry>
+        <box size="0.11 0.088 0.2175832" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="fl_wheel">
+    <inertial>
+      <origin xyz="-6.4261245e-06 -5.0633409e-05 0.033367991" rpy="0 0 0" />
+      <mass value="0.87778312" />
+      <inertia ixx="0.0036472254" iyy="0.0036391495" izz="0.0069910427" ixy="5.0153255e-06" ixz="1.0822219e-07" iyz="8.2226923e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.51025325 -0.3355695 -0.19787" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_018_Copy_1_of_0806_02_02.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.0335" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.1085" length="0.048" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rl_arm">
+    <inertial>
+      <origin xyz="-0.081854204 -0.013463534 -0.0011346707" rpy="0 0 0" />
+      <mass value="0.2977402" />
+      <inertia ixx="0.00055453246" iyy="0.0016408131" izz="0.0020161184" ixy="9.090418e-05" ixz="3.9642529e-05" iyz="7.4258156e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.068012217 -0.050569758 -0.23087" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_007_Copy_1_of_0806_02_06.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="rl_zhuanxiang">
+    <inertial>
+      <origin xyz="-0.046766191 0.058556992 -0.026059795" rpy="0 0 0" />
+      <mass value="0.23839111" />
+      <inertia ixx="0.00023054296" iyy="0.00023379253" izz="0.00032017135" ixy="2.6936018e-05" ixz="-1.4071972e-07" iyz="6.5810717e-08" />
+    </inertial>
+    <visual>
+      <origin xyz="0.12684726 -0.095622906 -0.25737" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_005_0806_04_00.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="rl_qudong">
+    <inertial>
+      <origin xyz="0.00029156796 -0.02077225 -0.14750978" rpy="0 0 0" />
+      <mass value="0.26857092" />
+      <inertia ixx="0.00089258681" iyy="0.00096110345" izz="0.00018895367" ixy="7.8705403e-07" ixz="2.1553983e-06" iyz="-0.00010374929" />
+    </inertial>
+    <visual>
+      <origin xyz="0.18422882 -0.23137 0.1604863" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_015_Copy_1_of_Copy_1_of_2.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 -0.0045 -0.1212916" rpy="0 0 0" />
+      <geometry>
+        <box size="0.11 0.088 0.2175832" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rl_wheel">
+    <inertial>
+      <origin xyz="-6.0973973e-06 -5.1464453e-05 0.037375721" rpy="0 0 0" />
+      <mass value="0.87767946" />
+      <inertia ixx="0.0036470114" iyy="0.0036378268" izz="0.0069895492" ixy="-3.3734156e-06" ixz="8.9903895e-08" iyz="8.3652997e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0.18422882 -0.3355695 -0.19387" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_019_Copy_1_of_0806_03_03.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.0375" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.1085" length="0.048" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="fr_arm">
+    <inertial>
+      <origin xyz="0.081853839 -0.013463576 0.0011347437" rpy="0 0 0" />
+      <mass value="0.29773954" />
+      <inertia ixx="0.00055453475" iyy="0.0016408053" izz="0.0020161139" ixy="-9.0906721e-05" ixz="3.9641197e-05" iyz="-7.4253219e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.25801222 -0.050569758 0.32887" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_010_Copy_1_of_Copy_1_of_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="fr_zhuanxiang">
+    <inertial>
+      <origin xyz="0.04676619 0.058556987 0.026059793" rpy="0 0 0" />
+      <mass value="0.23839103" />
+      <inertia ixx="0.00023054286" iyy="0.00023379238" izz="0.00032017114" ixy="-2.6935978e-05" ixz="-1.4072491e-07" iyz="-6.5807282e-08" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.45287169 -0.095622906 0.35537" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_008_Copy_1_of_0806_03_08.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="fr_qudong">
+    <inertial>
+      <origin xyz="-0.00029157462 0.02077225 -0.14750978" rpy="0 0 0" />
+      <mass value="0.26857087" />
+      <inertia ixx="0.00089258656" iyy="0.00096110317" izz="0.00018895357" ixy="7.8707354e-07" ixz="-2.1554412e-06" iyz="0.00010374924" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.51025325 0.32937 0.1604863" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_016_0806_02_01_01.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0.0045 -0.1212916" rpy="0 0 0" />
+      <geometry>
+        <box size="0.11 0.088 0.2175832" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="fr_wheel">
+    <inertial>
+      <origin xyz="6.0903916e-06 -5.1466374e-05 -0.037375721" rpy="0 0 0" />
+      <mass value="0.8776795" />
+      <inertia ixx="0.0036470116" iyy="0.0036378267" izz="0.0069895493" ixy="3.3733103e-06" ixz="8.9910591e-08" iyz="-8.3652121e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.51025325 -0.3355695 0.29187" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_020_Copy_1_of_0806_02_12.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.0375" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.1085" length="0.048" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rr_arm">
+    <inertial>
+      <origin xyz="-0.081854491 -0.013463903 0.0011347613" rpy="0 0 0" />
+      <mass value="0.29774266" />
+      <inertia ixx="0.0005545382" iyy="0.0016408183" izz="0.0020161285" ixy="9.0900283e-05" ixz="-3.9641251e-05" iyz="-7.4245077e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.068012217 -0.050569758 0.32887" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_013_Copy_1_of_0806_03_01.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="rr_zhuanxiang">
+    <inertial>
+      <origin xyz="-0.046766337 0.058557164 0.023059703" rpy="0 0 0" />
+      <mass value="0.23839339" />
+      <inertia ixx="0.00023054393" iyy="0.00023379479" izz="0.00032017405" ixy="2.6936642e-05" ixz="1.4106118e-07" iyz="-6.5439694e-08" />
+    </inertial>
+    <visual>
+      <origin xyz="0.12684726 -0.095622906 0.35237" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_011_Copy_1_of_0806_02_03.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="rr_qudong">
+    <inertial>
+      <origin xyz="0.00029177098 0.020772457 -0.14750974" rpy="0 0 0" />
+      <mass value="0.26857543" />
+      <inertia ixx="0.00089258944" iyy="0.00096110772" izz="0.00018895674" ixy="-7.8778706e-07" ixz="2.1574094e-06" iyz="0.00010374902" />
+    </inertial>
+    <visual>
+      <origin xyz="0.18422882 0.32937 0.1604863" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_017_Copy_1_of_Copy_1_of_Copy_1_of_Copy_1_of_Copy_1_of_Copy_1_of_0806_02_01_00.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0.0045 -0.1212916" rpy="0 0 0" />
+      <geometry>
+        <box size="0.11 0.088 0.2175832" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rr_wheel">
+    <inertial>
+      <origin xyz="6.1798232e-06 -5.0422534e-05 -0.045367991" rpy="0 0 0" />
+      <mass value="0.87778299" />
+      <inertia ixx="0.0036472249" iyy="0.0036391492" izz="0.0069910419" ixy="-5.0154198e-06" ixz="1.0346683e-07" iyz="-8.181107e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0.18422882 -0.3355695 0.28387" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_021_Copy_1_of_0806_01.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.0455" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.1085" length="0.048" />
+      </geometry>
+    </collision>
+  </link>
+  <!-- 下摆臂保留真实质量和视觉网格，但不参与外部碰撞；其远端在等效模型中
+       由 mimic 运动学重合，省去四个高频闭环约束和内部接触求解。 -->
+  <link name="fl_lower_arm">
+    <inertial>
+      <origin xyz="0.094747974 0.021905998 0.001007933" rpy="0 0 0" />
+      <mass value="0.11902542" />
+      <inertia ixx="8.651247e-05" iyy="0.00075147191" izz="0.00078593721" ixy="-0.00016243384" ixz="5.7168314e-06" iyz="1.3204616e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.25801222 -0.14856976 -0.23087" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_003_0806_04_04.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="rl_lower_arm">
+    <inertial>
+      <origin xyz="-0.094747977 0.021906 0.001007933" rpy="0 0 0" />
+      <mass value="0.11902541" />
+      <inertia ixx="8.651246e-05" iyy="0.00075147171" izz="0.000785937" ixy="0.0001624338" ixz="-5.7168321e-06" iyz="1.3204625e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.068012217 -0.14856976 -0.23087" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_006_0806_05_00.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="fr_lower_arm">
+    <inertial>
+      <origin xyz="0.094747976 0.021905999 -0.001007936" rpy="0 0 0" />
+      <mass value="0.11902543" />
+      <inertia ixx="8.6512477e-05" iyy="0.00075147192" izz="0.00078593722" ixy="-0.00016243384" ixz="-5.7168115e-06" iyz="-1.3204573e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.25801222 -0.14856976 0.32887" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_009_Copy_1_of_0806_02_07.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="rr_lower_arm">
+    <inertial>
+      <origin xyz="-0.094747979 0.021906001 -0.001007936" rpy="0 0 0" />
+      <mass value="0.11902541" />
+      <inertia ixx="8.6512468e-05" iyy="0.00075147173" izz="0.00078593702" ixy="0.0001624338" ixz="5.7168123e-06" iyz="-1.3204578e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.068012217 -0.14856976 0.32887" rpy="1.5707963 0 0" />
+      <geometry>
+        <mesh filename="../meshes/part_012_Copy_1_of_0806_02_04.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+  </link>
+  <joint name="fl_arm_joint" type="revolute">
+    <origin xyz="0.095000002 0.28187001 0.040000002" rpy="-1.5707963 0 0" />
+    <parent link="base_link" />
+    <child link="fl_arm" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.6109" upper="0.6109" effort="10" velocity="5" />
+  </joint>
+  <joint name="fl_zhuanxiang_joint" type="revolute">
+    <origin xyz="0.19485947 0.045053148 0.01377" rpy="0 0 0" />
+    <parent link="fl_arm" />
+    <child link="fl_zhuanxiang" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.6109" upper="0.6109" effort="10" velocity="5" />
+    <mimic joint="fl_arm_joint" multiplier="-1" offset="0" />
+  </joint>
+  <joint name="fl_qudong_joint" type="revolute">
+    <origin xyz="0.057381563 0.060213395 -0.01327" rpy="1.5707963 0 0" />
+    <parent link="fl_zhuanxiang" />
+    <child link="fl_qudong" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.57" upper="1.57" effort="10" velocity="5" />
+  </joint>
+  <joint name="fl_wheel_joint" type="continuous">
+    <origin xyz="0 -0.0335 -0.1797332" rpy="-1.5707963 0 0" />
+    <parent link="fl_qudong" />
+    <child link="fl_wheel" />
+    <axis xyz="0 0 1" />
+    <limit effort="10" velocity="31.4159265359" />
+  </joint>
+  <joint name="rl_arm_joint" type="revolute">
+    <origin xyz="-0.094999998 0.28187001 0.040000002" rpy="-1.5707963 0 0" />
+    <parent link="base_link" />
+    <child link="rl_arm" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.6109" upper="0.6109" effort="10" velocity="5" />
+  </joint>
+  <joint name="rl_zhuanxiang_joint" type="revolute">
+    <origin xyz="-0.19485947 0.045053148 0.0265" rpy="0 0 0" />
+    <parent link="rl_arm" />
+    <child link="rl_zhuanxiang" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.6109" upper="0.6109" effort="10" velocity="5" />
+    <mimic joint="rl_arm_joint" multiplier="-1" offset="0" />
+  </joint>
+  <joint name="rl_qudong_joint" type="revolute">
+    <origin xyz="-0.057381563 0.064863395 -0.026" rpy="1.5707963 0 0" />
+    <parent link="rl_zhuanxiang" />
+    <child link="rl_qudong" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.57" upper="1.57" effort="10" velocity="5" />
+  </joint>
+  <joint name="rl_wheel_joint" type="continuous">
+    <origin xyz="0 -0.0375 -0.1750832" rpy="-1.5707963 0 0" />
+    <parent link="rl_qudong" />
+    <child link="rl_wheel" />
+    <axis xyz="0 0 1" />
+    <limit effort="10" velocity="31.4159265359" />
+  </joint>
+  <joint name="fr_arm_joint" type="revolute">
+    <origin xyz="0.095000002 -0.27786999 0.040000002" rpy="-1.5707963 0 0" />
+    <parent link="base_link" />
+    <child link="fr_arm" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.6109" upper="0.6109" effort="10" velocity="5" />
+  </joint>
+  <joint name="fr_zhuanxiang_joint" type="revolute">
+    <origin xyz="0.19485947 0.045053148 -0.0265" rpy="0 0 0" />
+    <parent link="fr_arm" />
+    <child link="fr_zhuanxiang" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.6109" upper="0.6109" effort="10" velocity="5" />
+    <mimic joint="fr_arm_joint" multiplier="-1" offset="0" />
+  </joint>
+  <joint name="fr_qudong_joint" type="revolute">
+    <origin xyz="0.057381563 0.064863395 0.026" rpy="1.5707963 0 0" />
+    <parent link="fr_zhuanxiang" />
+    <child link="fr_qudong" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.57" upper="1.57" effort="10" velocity="5" />
+  </joint>
+  <joint name="fr_wheel_joint" type="continuous">
+    <origin xyz="0 0.0375 -0.1750832" rpy="-1.5707963 0 0" />
+    <parent link="fr_qudong" />
+    <child link="fr_wheel" />
+    <axis xyz="0 0 1" />
+    <limit effort="10" velocity="31.4159265359" />
+  </joint>
+  <joint name="rr_arm_joint" type="revolute">
+    <origin xyz="-0.094999998 -0.27786999 0.040000002" rpy="-1.5707963 0 0" />
+    <parent link="base_link" />
+    <child link="rr_arm" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.6109" upper="0.6109" effort="10" velocity="5" />
+  </joint>
+  <joint name="rr_zhuanxiang_joint" type="revolute">
+    <origin xyz="-0.19485947 0.045053148 -0.0235" rpy="0 0 0" />
+    <parent link="rr_arm" />
+    <child link="rr_zhuanxiang" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.6109" upper="0.6109" effort="10" velocity="5" />
+    <mimic joint="rr_arm_joint" multiplier="-1" offset="0" />
+  </joint>
+  <joint name="rr_qudong_joint" type="revolute">
+    <origin xyz="-0.057381563 0.064863395 0.023" rpy="1.5707963 0 0" />
+    <parent link="rr_zhuanxiang" />
+    <child link="rr_qudong" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.57" upper="1.57" effort="10" velocity="5" />
+  </joint>
+  <joint name="rr_wheel_joint" type="continuous">
+    <origin xyz="0 0.0455 -0.1750832" rpy="-1.5707963 0 0" />
+    <parent link="rr_qudong" />
+    <child link="rr_wheel" />
+    <axis xyz="0 0 1" />
+    <limit effort="10" velocity="31.4159265359" />
+  </joint>
+  <joint name="fl_lower_arm_joint" type="revolute">
+    <origin xyz="0.095000002 0.28187001 -0.057999998" rpy="-1.5707963 0 0" />
+    <parent link="base_link" />
+    <child link="fl_lower_arm" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.6109" upper="0.6109" effort="10" velocity="5" />
+    <mimic joint="fl_arm_joint" multiplier="1" offset="0" />
+  </joint>
+  <joint name="rl_lower_arm_joint" type="revolute">
+    <origin xyz="-0.094999998 0.28187001 -0.057999998" rpy="-1.5707963 0 0" />
+    <parent link="base_link" />
+    <child link="rl_lower_arm" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.6109" upper="0.6109" effort="10" velocity="5" />
+    <mimic joint="rl_arm_joint" multiplier="1" offset="0" />
+  </joint>
+  <joint name="fr_lower_arm_joint" type="revolute">
+    <origin xyz="0.095000002 -0.27786999 -0.057999998" rpy="-1.5707963 0 0" />
+    <parent link="base_link" />
+    <child link="fr_lower_arm" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.6109" upper="0.6109" effort="10" velocity="5" />
+    <mimic joint="fr_arm_joint" multiplier="1" offset="0" />
+  </joint>
+  <joint name="rr_lower_arm_joint" type="revolute">
+    <origin xyz="-0.094999998 -0.27786999 -0.057999998" rpy="-1.5707963 0 0" />
+    <parent link="base_link" />
+    <child link="rr_lower_arm" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.6109" upper="0.6109" effort="10" velocity="5" />
+    <mimic joint="rr_arm_joint" multiplier="1" offset="0" />
+  </joint>
+</robot>

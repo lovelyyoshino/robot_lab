@@ -94,3 +94,24 @@ def update_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespac
         agent_cfg.neptune_project = args_cli.log_project_name
 
     return agent_cfg
+
+
+def handle_deprecated_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, installed_version: str):
+    """Use IsaacLab's config migration when available.
+
+    IsaacLab 2.x ships with RSL-RL 3.x configs but may not expose the
+    migration helper added by later IsaacLab releases.
+    """
+    from packaging import version
+
+    import isaaclab_rl.rsl_rl as rsl_rl_utils
+
+    handler = getattr(rsl_rl_utils, "handle_deprecated_rsl_rl_cfg", None)
+    if handler is not None:
+        return handler(agent_cfg, installed_version)
+    if version.parse(installed_version) >= version.parse("4.0.0"):
+        raise RuntimeError(
+            "The installed isaaclab_rl does not provide handle_deprecated_rsl_rl_cfg "
+            f"required by rsl-rl {installed_version}."
+        )
+    return agent_cfg
