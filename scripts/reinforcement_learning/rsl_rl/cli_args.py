@@ -6,6 +6,13 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+# @author pony
+# @date 2026-09-17
+# @version v0.1.0
+# @last_modified 2026-09-17
+# @changelog
+#   - v0.1.0 (2026-09-17): 未显式传 --resume 时保留 Hydra/任务配置，避免续训静默变成从头训练。
+
 from __future__ import annotations
 
 import argparse
@@ -30,7 +37,8 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     )
     arg_group.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")
     # -- load arguments
-    arg_group.add_argument("--resume", action="store_true", default=False, help="Whether to resume from a checkpoint.")
+    # None 表示未覆盖；False 会在 Hydra 解析之后抹掉 agent.resume=true。
+    arg_group.add_argument("--resume", action="store_true", default=None, help="Whether to resume from a checkpoint.")
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
     # -- logger arguments

@@ -1,5 +1,13 @@
 # Copyright (c) 2024-2026 Ziqi Fan
 # SPDX-License-Identifier: Apache-2.0
+# @author pony
+# @date 2026-09-16
+# @version v0.3.0
+# @last_modified 2026-09-16
+# @changelog
+#   - v0.3.0 (2026-09-16): 深度策略导出携带对应预处理/时间合同，避免4141维变体误用。
+#   - v0.2.0 (2026-09-16): 增加有限步回放、视觉相机自动开启，并关闭正确的推扰事件。
+#   - v0.1.0 (2026-09-16): 兼容无 locomotion 随机化/curriculum 的 recovery 与 upright 任务。
 
 # Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
@@ -26,6 +34,7 @@ parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+parser.add_argument("--max_steps", type=int, default=None, help="可选的回放步数，适合无界面导出检查。")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
@@ -45,7 +54,7 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
 # always enable cameras to record video
-if args_cli.video:
+if args_cli.video or (args_cli.task and "Vision-Student" in args_cli.task):
     args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
@@ -66,6 +75,7 @@ installed_version = metadata.version("rsl-rl-lib")
 """Rest everything follows."""
 
 import os
+import json
 import time
 
 import gymnasium as gym
@@ -126,11 +136,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # disable randomization for play
     env_cfg.observations.policy.enable_corruption = False
-    # remove random pushing
-    env_cfg.events.randomize_apply_external_force_torque = None
-    env_cfg.events.push_robot = None
-    env_cfg.curriculum.command_levels_lin_vel = None
-    env_cfg.curriculum.command_levels_ang_vel = None
+    # standalone recovery/upright 不声明 locomotion 专用随机化和 curriculum。
+    if env_cfg.events is not None:
+        for event_name in ("randomize_apply_external_force_torque", "randomize_push_robot", "push_robot"):
+            if hasattr(env_cfg.events, event_name):
+                setattr(env_cfg.events, event_name, None)
+    if env_cfg.curriculum is not None:
+        for curriculum_name in ("command_levels_lin_vel", "command_levels_ang_vel"):
+            if hasattr(env_cfg.curriculum, curriculum_name):
+                setattr(env_cfg.curriculum, curriculum_name, None)
 
     if args_cli.keyboard:
         env_cfg.scene.num_envs = 1
@@ -226,6 +240,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
         export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
+    if args_cli.task and "Parallelogram-Rover-Vision-Student" in args_cli.task:
+        from robot_lab.tasks.manager_based.locomotion.velocity.config.wheeled.parallelogram_rover.vision_env_cfg import vision_depth_contract
+
+        with open(os.path.join(export_model_dir, "depth_contract.json"), "w", encoding="utf-8") as stream:
+            json.dump(vision_depth_contract(env_cfg), stream, ensure_ascii=False, indent=2, allow_nan=False)
+
     dt = env.unwrapped.step_dt
 
     # reset environment
@@ -245,8 +265,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 policy.reset(dones)
             else:
                 policy_nn.reset(dones)
+        timestep += 1
+        if args_cli.max_steps is not None and timestep >= args_cli.max_steps:
+            break
         if args_cli.video:
-            timestep += 1
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break

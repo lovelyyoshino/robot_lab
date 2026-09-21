@@ -1,0 +1,234 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="parallelogram_rover">
+  <compiler angle="radian" autolimits="true" />
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast" />
+  <size njmax="2000" nconmax="2000" />
+  <statistic center="0 0 0.25" extent="2.5" />
+  <visual>
+    <headlight diffuse="0.8 0.8 0.8" ambient="0.35 0.35 0.35" specular="0.15 0.15 0.15" />
+    <rgba haze="0.15 0.20 0.28 1" />
+    <global azimuth="-135" elevation="-25" />
+    <quality shadowsize="2048" />
+  </visual>
+  <default>
+    <joint damping="0.5" armature="0.002" />
+    <geom condim="4" friction="1 0.02 0.001" />
+    <default class="wheel_contact">
+      <geom friction="1.0 0.05 0.005" condim="4" solref="0.004 1" solimp="0.9 0.95 0.001" />
+    </default>
+    <motor ctrllimited="true" ctrlrange="-10 10" forcelimited="true" forcerange="-10 10" />
+  </default>
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.28 0.42 0.62" rgb2="0.02 0.03 0.05" width="512" height="3072" />
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.22 0.24 0.27" rgb2="0.10 0.11 0.13" markrgb="0.42 0.44 0.48" width="300" height="300" />
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="6 6" reflectance="0.15" />
+    <material name="robot_visual" rgba="0.32 0.42 0.54 1" specular="0.35" shininess="0.35" />
+    <material name="wheel_visual" rgba="0.06 0.07 0.09 1" specular="0.20" shininess="0.20" />
+    <mesh name="mesh_part_001_0806_04_01_stl" file="../meshes/part_001_0806_04_01.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_004_0806_04_05_stl" file="../meshes/part_004_0806_04_05.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_002_0806_04_03_stl" file="../meshes/part_002_0806_04_03.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_014_Copy_1_of_0806_02_10_stl" file="../meshes/part_014_Copy_1_of_0806_02_10.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_018_Copy_1_of_0806_02_02_stl" file="../meshes/part_018_Copy_1_of_0806_02_02.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_007_Copy_1_of_0806_02_06_stl" file="../meshes/part_007_Copy_1_of_0806_02_06.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_005_0806_04_00_stl" file="../meshes/part_005_0806_04_00.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_015_Copy_1_of_Copy_1_of_2_stl" file="../meshes/part_015_Copy_1_of_Copy_1_of_2.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_019_Copy_1_of_0806_03_03_stl" file="../meshes/part_019_Copy_1_of_0806_03_03.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_010_Copy_1_of_Copy_1_of_1_stl" file="../meshes/part_010_Copy_1_of_Copy_1_of_1.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_008_Copy_1_of_0806_03_08_stl" file="../meshes/part_008_Copy_1_of_0806_03_08.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_016_0806_02_01_01_stl" file="../meshes/part_016_0806_02_01_01.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_020_Copy_1_of_0806_02_12_stl" file="../meshes/part_020_Copy_1_of_0806_02_12.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_013_Copy_1_of_0806_03_01_stl" file="../meshes/part_013_Copy_1_of_0806_03_01.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_011_Copy_1_of_0806_02_03_stl" file="../meshes/part_011_Copy_1_of_0806_02_03.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_017_Copy_1_of_Copy_1_of_Copy_1_of_Copy_1_of_Copy_1_of_Copy_1_of_0806_02_01_00_stl" file="../meshes/part_017_Copy_1_of_Copy_1_of_Copy_1_of_Copy_1_of_Copy_1_of_Copy_1_of_0806_02_01_00.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_021_Copy_1_of_0806_01_stl" file="../meshes/part_021_Copy_1_of_0806_01.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_003_0806_04_04_stl" file="../meshes/part_003_0806_04_04.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_006_0806_05_00_stl" file="../meshes/part_006_0806_05_00.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_009_Copy_1_of_0806_02_07_stl" file="../meshes/part_009_Copy_1_of_0806_02_07.stl" scale="0.001 0.001 0.001" />
+    <mesh name="mesh_part_012_Copy_1_of_0806_02_04_stl" file="../meshes/part_012_Copy_1_of_0806_02_04.stl" scale="0.001 0.001 0.001" />
+  </asset>
+  <worldbody>
+    <light name="sun_key" directional="true" pos="2 -3 5" dir="-0.30 0.45 -1" diffuse="0.95 0.90 0.78" specular="0.25 0.25 0.25" castshadow="true" />
+    <light name="sky_fill" directional="true" pos="-2 3 3" dir="0.25 -0.35 -1" diffuse="0.35 0.42 0.55" specular="0 0 0" castshadow="false" />
+    <camera name="overview" pos="1.65 -2.55 1.40" xyaxes="0.838 0.545 0 -0.177 0.272 0.946" />
+    <geom name="ground" type="plane" size="20 20 0.1" pos="0 0 0" material="groundplane" friction="1 0.02 0.001" contype="2" conaffinity="1" />
+    <body name="base_link" pos="0 0 0.3535">
+      <freejoint name="base_freejoint" />
+      <inertial mass="3.4461078" pos="-8.6361926e-10 0.0019321624 -0.00063856783" fullinertia="0.10363444 0.15841372 0.25679732 -1.905376e-12 1.8141684e-11 -7.9038615e-06" />
+      <geom name="base_link_visual_0" contype="0" conaffinity="0" group="2" pos="-0.16301221 0.051000008 0.090569759" type="mesh" mesh="mesh_part_001_0806_04_01_stl" material="robot_visual" />
+      <geom name="base_link_collision_0" contype="1" conaffinity="2" group="1" type="box" size="0.34 0.29864 0.073" />
+      <site name="imu" type="sphere" pos="0 0 0" size="0.005" rgba="0 0 0 0" />
+      <body name="fl_arm" pos="0.095000002 0.28187001 0.040000002" quat="0.7071067907 -0.7071067717 0 0">
+        <joint name="fl_arm_joint" type="hinge" axis="0 0 1" range="-0.6109 0.6109" limited="true" damping="0" frictionloss="0" />
+        <inertial mass="0.2935297" pos="0.080065293 -0.014341666 -0.0011581426" fullinertia="0.00053646837 0.0015728498 0.0019316215 -5.8425894e-05 -3.8770982e-05 7.8535183e-06" />
+        <geom name="fl_arm_visual_0" contype="0" conaffinity="0" group="2" pos="-0.25801222 -0.050569758 -0.23087" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_004_0806_04_05_stl" material="robot_visual" />
+        <body name="fl_zhuanxiang" pos="0.19485947 0.045053148 0.01377">
+          <joint name="fl_zhuanxiang_joint" type="hinge" axis="0 0 1" range="-0.6109 0.6109" limited="true" damping="0" frictionloss="0" />
+          <inertial mass="0.23839331" pos="0.046766334 0.058557156 -0.013329707" fullinertia="0.00023054384 0.00023379465 0.00032017385 -2.6936591e-05 1.4107961e-07 6.5435729e-08" />
+          <geom name="fl_zhuanxiang_visual_0" contype="0" conaffinity="0" group="2" pos="-0.45287169 -0.095622906 -0.24464" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_002_0806_04_03_stl" material="robot_visual" />
+          <body name="fl_qudong" pos="0.057381563 0.060213395 -0.01327" quat="0.7071067907 0.7071067717 0 0">
+            <joint name="fl_qudong_joint" type="hinge" axis="0 0 1" range="-1.57 1.57" limited="true" damping="0" frictionloss="0" />
+            <inertial mass="0.26857533" pos="-0.00029177758 -0.020772459 -0.15215975" fullinertia="0.00089258896 0.0009611072 0.00018895663 -7.8780609e-07 -2.1574507e-06 -0.00010374897" />
+            <geom name="fl_qudong_visual_0" contype="0" conaffinity="0" group="2" pos="-0.51025325 -0.23137 0.1558363" type="mesh" mesh="mesh_part_014_Copy_1_of_0806_02_10_stl" material="robot_visual" />
+            <geom name="fl_qudong_collision_0" contype="1" conaffinity="2" group="1" pos="0 -0.0045 -0.1259416" type="box" size="0.055 0.044 0.1087916" />
+            <body name="fl_wheel" pos="0 -0.0335 -0.1797332" quat="0.7071067907 -0.7071067717 0 0">
+              <joint name="fl_wheel_joint" type="hinge" axis="0 0 1" damping="0" frictionloss="0" />
+              <inertial mass="0.87778312" pos="-6.4261245e-06 -5.0633409e-05 0.033367991" fullinertia="0.0036472254 0.0036391495 0.0069910427 5.0153255e-06 1.0822219e-07 8.2226923e-07" />
+              <geom name="fl_wheel_visual_0" contype="0" conaffinity="0" group="2" pos="-0.51025325 -0.3355695 -0.19787" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_018_Copy_1_of_0806_02_02_stl" material="wheel_visual" />
+              <geom name="fl_wheel_collision_0" contype="1" conaffinity="2" group="1" pos="0 0 0.0335" type="cylinder" size="0.1085 0.024" class="wheel_contact" />
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="rl_arm" pos="-0.094999998 0.28187001 0.040000002" quat="0.7071067907 -0.7071067717 0 0">
+        <joint name="rl_arm_joint" type="hinge" axis="0 0 1" range="-0.6109 0.6109" limited="true" damping="0" frictionloss="0" />
+        <inertial mass="0.2977402" pos="-0.081854204 -0.013463534 -0.0011346707" fullinertia="0.00055453246 0.0016408131 0.0020161184 9.090418e-05 3.9642529e-05 7.4258156e-06" />
+        <geom name="rl_arm_visual_0" contype="0" conaffinity="0" group="2" pos="-0.068012217 -0.050569758 -0.23087" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_007_Copy_1_of_0806_02_06_stl" material="robot_visual" />
+        <body name="rl_zhuanxiang" pos="-0.19485947 0.045053148 0.0265">
+          <joint name="rl_zhuanxiang_joint" type="hinge" axis="0 0 1" range="-0.6109 0.6109" limited="true" damping="0" frictionloss="0" />
+          <inertial mass="0.23839111" pos="-0.046766191 0.058556992 -0.026059795" fullinertia="0.00023054296 0.00023379253 0.00032017135 2.6936018e-05 -1.4071972e-07 6.5810717e-08" />
+          <geom name="rl_zhuanxiang_visual_0" contype="0" conaffinity="0" group="2" pos="0.12684726 -0.095622906 -0.25737" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_005_0806_04_00_stl" material="robot_visual" />
+          <body name="rl_qudong" pos="-0.057381563 0.064863395 -0.026" quat="0.7071067907 0.7071067717 0 0">
+            <joint name="rl_qudong_joint" type="hinge" axis="0 0 1" range="-1.57 1.57" limited="true" damping="0" frictionloss="0" />
+            <inertial mass="0.26857092" pos="0.00029156796 -0.02077225 -0.14750978" fullinertia="0.00089258681 0.00096110345 0.00018895367 7.8705403e-07 2.1553983e-06 -0.00010374929" />
+            <geom name="rl_qudong_visual_0" contype="0" conaffinity="0" group="2" pos="0.18422882 -0.23137 0.1604863" type="mesh" mesh="mesh_part_015_Copy_1_of_Copy_1_of_2_stl" material="robot_visual" />
+            <geom name="rl_qudong_collision_0" contype="1" conaffinity="2" group="1" pos="0 -0.0045 -0.1212916" type="box" size="0.055 0.044 0.1087916" />
+            <body name="rl_wheel" pos="0 -0.0375 -0.1750832" quat="0.7071067907 -0.7071067717 0 0">
+              <joint name="rl_wheel_joint" type="hinge" axis="0 0 1" damping="0" frictionloss="0" />
+              <inertial mass="0.87767946" pos="-6.0973973e-06 -5.1464453e-05 0.037375721" fullinertia="0.0036470114 0.0036378268 0.0069895492 -3.3734156e-06 8.9903895e-08 8.3652997e-07" />
+              <geom name="rl_wheel_visual_0" contype="0" conaffinity="0" group="2" pos="0.18422882 -0.3355695 -0.19387" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_019_Copy_1_of_0806_03_03_stl" material="wheel_visual" />
+              <geom name="rl_wheel_collision_0" contype="1" conaffinity="2" group="1" pos="0 0 0.0375" type="cylinder" size="0.1085 0.024" class="wheel_contact" />
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="fr_arm" pos="0.095000002 -0.27786999 0.040000002" quat="0.7071067907 -0.7071067717 0 0">
+        <joint name="fr_arm_joint" type="hinge" axis="0 0 1" range="-0.6109 0.6109" limited="true" damping="0" frictionloss="0" />
+        <inertial mass="0.29773954" pos="0.081853839 -0.013463576 0.0011347437" fullinertia="0.00055453475 0.0016408053 0.0020161139 -9.0906721e-05 3.9641197e-05 -7.4253219e-06" />
+        <geom name="fr_arm_visual_0" contype="0" conaffinity="0" group="2" pos="-0.25801222 -0.050569758 0.32887" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_010_Copy_1_of_Copy_1_of_1_stl" material="robot_visual" />
+        <body name="fr_zhuanxiang" pos="0.19485947 0.045053148 -0.0265">
+          <joint name="fr_zhuanxiang_joint" type="hinge" axis="0 0 1" range="-0.6109 0.6109" limited="true" damping="0" frictionloss="0" />
+          <inertial mass="0.23839103" pos="0.04676619 0.058556987 0.026059793" fullinertia="0.00023054286 0.00023379238 0.00032017114 -2.6935978e-05 -1.4072491e-07 -6.5807282e-08" />
+          <geom name="fr_zhuanxiang_visual_0" contype="0" conaffinity="0" group="2" pos="-0.45287169 -0.095622906 0.35537" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_008_Copy_1_of_0806_03_08_stl" material="robot_visual" />
+          <body name="fr_qudong" pos="0.057381563 0.064863395 0.026" quat="0.7071067907 0.7071067717 0 0">
+            <joint name="fr_qudong_joint" type="hinge" axis="0 0 1" range="-1.57 1.57" limited="true" damping="0" frictionloss="0" />
+            <inertial mass="0.26857087" pos="-0.00029157462 0.02077225 -0.14750978" fullinertia="0.00089258656 0.00096110317 0.00018895357 7.8707354e-07 -2.1554412e-06 0.00010374924" />
+            <geom name="fr_qudong_visual_0" contype="0" conaffinity="0" group="2" pos="-0.51025325 0.32937 0.1604863" type="mesh" mesh="mesh_part_016_0806_02_01_01_stl" material="robot_visual" />
+            <geom name="fr_qudong_collision_0" contype="1" conaffinity="2" group="1" pos="0 0.0045 -0.1212916" type="box" size="0.055 0.044 0.1087916" />
+            <body name="fr_wheel" pos="0 0.0375 -0.1750832" quat="0.7071067907 -0.7071067717 0 0">
+              <joint name="fr_wheel_joint" type="hinge" axis="0 0 1" damping="0" frictionloss="0" />
+              <inertial mass="0.8776795" pos="6.0903916e-06 -5.1466374e-05 -0.037375721" fullinertia="0.0036470116 0.0036378267 0.0069895493 3.3733103e-06 8.9910591e-08 -8.3652121e-07" />
+              <geom name="fr_wheel_visual_0" contype="0" conaffinity="0" group="2" pos="-0.51025325 -0.3355695 0.29187" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_020_Copy_1_of_0806_02_12_stl" material="wheel_visual" />
+              <geom name="fr_wheel_collision_0" contype="1" conaffinity="2" group="1" pos="0 0 -0.0375" type="cylinder" size="0.1085 0.024" class="wheel_contact" />
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="rr_arm" pos="-0.094999998 -0.27786999 0.040000002" quat="0.7071067907 -0.7071067717 0 0">
+        <joint name="rr_arm_joint" type="hinge" axis="0 0 1" range="-0.6109 0.6109" limited="true" damping="0" frictionloss="0" />
+        <inertial mass="0.29774266" pos="-0.081854491 -0.013463903 0.0011347613" fullinertia="0.0005545382 0.0016408183 0.0020161285 9.0900283e-05 -3.9641251e-05 -7.4245077e-06" />
+        <geom name="rr_arm_visual_0" contype="0" conaffinity="0" group="2" pos="-0.068012217 -0.050569758 0.32887" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_013_Copy_1_of_0806_03_01_stl" material="robot_visual" />
+        <body name="rr_zhuanxiang" pos="-0.19485947 0.045053148 -0.0235">
+          <joint name="rr_zhuanxiang_joint" type="hinge" axis="0 0 1" range="-0.6109 0.6109" limited="true" damping="0" frictionloss="0" />
+          <inertial mass="0.23839339" pos="-0.046766337 0.058557164 0.023059703" fullinertia="0.00023054393 0.00023379479 0.00032017405 2.6936642e-05 1.4106118e-07 -6.5439694e-08" />
+          <geom name="rr_zhuanxiang_visual_0" contype="0" conaffinity="0" group="2" pos="0.12684726 -0.095622906 0.35237" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_011_Copy_1_of_0806_02_03_stl" material="robot_visual" />
+          <body name="rr_qudong" pos="-0.057381563 0.064863395 0.023" quat="0.7071067907 0.7071067717 0 0">
+            <joint name="rr_qudong_joint" type="hinge" axis="0 0 1" range="-1.57 1.57" limited="true" damping="0" frictionloss="0" />
+            <inertial mass="0.26857543" pos="0.00029177098 0.020772457 -0.14750974" fullinertia="0.00089258944 0.00096110772 0.00018895674 -7.8778706e-07 2.1574094e-06 0.00010374902" />
+            <geom name="rr_qudong_visual_0" contype="0" conaffinity="0" group="2" pos="0.18422882 0.32937 0.1604863" type="mesh" mesh="mesh_part_017_Copy_1_of_Copy_1_of_Copy_1_of_Copy_1_of_Copy_1_of_Copy_1_of_0806_02_01_00_stl" material="robot_visual" />
+            <geom name="rr_qudong_collision_0" contype="1" conaffinity="2" group="1" pos="0 0.0045 -0.1212916" type="box" size="0.055 0.044 0.1087916" />
+            <body name="rr_wheel" pos="0 0.0455 -0.1750832" quat="0.7071067907 -0.7071067717 0 0">
+              <joint name="rr_wheel_joint" type="hinge" axis="0 0 1" damping="0" frictionloss="0" />
+              <inertial mass="0.87778299" pos="6.1798232e-06 -5.0422534e-05 -0.045367991" fullinertia="0.0036472249 0.0036391492 0.0069910419 -5.0154198e-06 1.0346683e-07 -8.181107e-07" />
+              <geom name="rr_wheel_visual_0" contype="0" conaffinity="0" group="2" pos="0.18422882 -0.3355695 0.28387" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_021_Copy_1_of_0806_01_stl" material="wheel_visual" />
+              <geom name="rr_wheel_collision_0" contype="1" conaffinity="2" group="1" pos="0 0 -0.0455" type="cylinder" size="0.1085 0.024" class="wheel_contact" />
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="fl_lower_arm" pos="0.095000002 0.28187001 -0.057999998" quat="0.7071067907 -0.7071067717 0 0">
+        <joint name="fl_lower_arm_joint" type="hinge" axis="0 0 1" range="-0.6109 0.6109" limited="true" damping="0" frictionloss="0" />
+        <inertial mass="0.11902542" pos="0.094747974 0.021905998 0.001007933" fullinertia="8.651247e-05 0.00075147191 0.00078593721 -0.00016243384 5.7168314e-06 1.3204616e-06" />
+        <geom name="fl_lower_arm_visual_0" contype="0" conaffinity="0" group="2" pos="-0.25801222 -0.14856976 -0.23087" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_003_0806_04_04_stl" material="robot_visual" />
+      </body>
+      <body name="rl_lower_arm" pos="-0.094999998 0.28187001 -0.057999998" quat="0.7071067907 -0.7071067717 0 0">
+        <joint name="rl_lower_arm_joint" type="hinge" axis="0 0 1" range="-0.6109 0.6109" limited="true" damping="0" frictionloss="0" />
+        <inertial mass="0.11902541" pos="-0.094747977 0.021906 0.001007933" fullinertia="8.651246e-05 0.00075147171 0.000785937 0.0001624338 -5.7168321e-06 1.3204625e-06" />
+        <geom name="rl_lower_arm_visual_0" contype="0" conaffinity="0" group="2" pos="-0.068012217 -0.14856976 -0.23087" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_006_0806_05_00_stl" material="robot_visual" />
+      </body>
+      <body name="fr_lower_arm" pos="0.095000002 -0.27786999 -0.057999998" quat="0.7071067907 -0.7071067717 0 0">
+        <joint name="fr_lower_arm_joint" type="hinge" axis="0 0 1" range="-0.6109 0.6109" limited="true" damping="0" frictionloss="0" />
+        <inertial mass="0.11902543" pos="0.094747976 0.021905999 -0.001007936" fullinertia="8.6512477e-05 0.00075147192 0.00078593722 -0.00016243384 -5.7168115e-06 -1.3204573e-06" />
+        <geom name="fr_lower_arm_visual_0" contype="0" conaffinity="0" group="2" pos="-0.25801222 -0.14856976 0.32887" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_009_Copy_1_of_0806_02_07_stl" material="robot_visual" />
+      </body>
+      <body name="rr_lower_arm" pos="-0.094999998 -0.27786999 -0.057999998" quat="0.7071067907 -0.7071067717 0 0">
+        <joint name="rr_lower_arm_joint" type="hinge" axis="0 0 1" range="-0.6109 0.6109" limited="true" damping="0" frictionloss="0" />
+        <inertial mass="0.11902541" pos="-0.094747979 0.021906001 -0.001007936" fullinertia="8.6512468e-05 0.00075147173 0.00078593702 0.0001624338 5.7168123e-06 -1.3204578e-06" />
+        <geom name="rr_lower_arm_visual_0" contype="0" conaffinity="0" group="2" pos="-0.068012217 -0.14856976 0.32887" quat="0.7071067907 0.7071067717 0 0" type="mesh" mesh="mesh_part_012_Copy_1_of_0806_02_04_stl" material="robot_visual" />
+      </body>
+    </body>
+  </worldbody>
+  <equality>
+    <joint name="mimic_fl_zhuanxiang_joint" joint1="fl_zhuanxiang_joint" joint2="fl_arm_joint" polycoef="0 -1 0 0 0" solref="0.001 1" solimp="0.9 0.95 0.001" />
+    <joint name="mimic_rl_zhuanxiang_joint" joint1="rl_zhuanxiang_joint" joint2="rl_arm_joint" polycoef="0 -1 0 0 0" solref="0.001 1" solimp="0.9 0.95 0.001" />
+    <joint name="mimic_fr_zhuanxiang_joint" joint1="fr_zhuanxiang_joint" joint2="fr_arm_joint" polycoef="0 -1 0 0 0" solref="0.001 1" solimp="0.9 0.95 0.001" />
+    <joint name="mimic_rr_zhuanxiang_joint" joint1="rr_zhuanxiang_joint" joint2="rr_arm_joint" polycoef="0 -1 0 0 0" solref="0.001 1" solimp="0.9 0.95 0.001" />
+    <joint name="mimic_fl_lower_arm_joint" joint1="fl_lower_arm_joint" joint2="fl_arm_joint" polycoef="0 1 0 0 0" solref="0.001 1" solimp="0.9 0.95 0.001" />
+    <joint name="mimic_rl_lower_arm_joint" joint1="rl_lower_arm_joint" joint2="rl_arm_joint" polycoef="0 1 0 0 0" solref="0.001 1" solimp="0.9 0.95 0.001" />
+    <joint name="mimic_fr_lower_arm_joint" joint1="fr_lower_arm_joint" joint2="fr_arm_joint" polycoef="0 1 0 0 0" solref="0.001 1" solimp="0.9 0.95 0.001" />
+    <joint name="mimic_rr_lower_arm_joint" joint1="rr_lower_arm_joint" joint2="rr_arm_joint" polycoef="0 1 0 0 0" solref="0.001 1" solimp="0.9 0.95 0.001" />
+  </equality>
+  <actuator>
+    <motor name="effort_fl_arm_joint" joint="fl_arm_joint" ctrlrange="-10 10" ctrllimited="true" forcerange="-10 10" forcelimited="true" />
+    <motor name="effort_rl_arm_joint" joint="rl_arm_joint" ctrlrange="-10 10" ctrllimited="true" forcerange="-10 10" forcelimited="true" />
+    <motor name="effort_fr_arm_joint" joint="fr_arm_joint" ctrlrange="-10 10" ctrllimited="true" forcerange="-10 10" forcelimited="true" />
+    <motor name="effort_rr_arm_joint" joint="rr_arm_joint" ctrlrange="-10 10" ctrllimited="true" forcerange="-10 10" forcelimited="true" />
+    <motor name="effort_fl_qudong_joint" joint="fl_qudong_joint" ctrlrange="-10 10" ctrllimited="true" forcerange="-10 10" forcelimited="true" />
+    <motor name="effort_rl_qudong_joint" joint="rl_qudong_joint" ctrlrange="-10 10" ctrllimited="true" forcerange="-10 10" forcelimited="true" />
+    <motor name="effort_fr_qudong_joint" joint="fr_qudong_joint" ctrlrange="-10 10" ctrllimited="true" forcerange="-10 10" forcelimited="true" />
+    <motor name="effort_rr_qudong_joint" joint="rr_qudong_joint" ctrlrange="-10 10" ctrllimited="true" forcerange="-10 10" forcelimited="true" />
+    <motor name="effort_fl_wheel_joint" joint="fl_wheel_joint" ctrlrange="-10 10" ctrllimited="true" forcerange="-10 10" forcelimited="true" />
+    <motor name="effort_rl_wheel_joint" joint="rl_wheel_joint" ctrlrange="-10 10" ctrllimited="true" forcerange="-10 10" forcelimited="true" />
+    <motor name="effort_fr_wheel_joint" joint="fr_wheel_joint" ctrlrange="-10 10" ctrllimited="true" forcerange="-10 10" forcelimited="true" />
+    <motor name="effort_rr_wheel_joint" joint="rr_wheel_joint" ctrlrange="-10 10" ctrllimited="true" forcerange="-10 10" forcelimited="true" />
+  </actuator>
+  <sensor>
+    <jointpos name="q_fl_arm" joint="fl_arm_joint" />
+    <jointpos name="q_rl_arm" joint="rl_arm_joint" />
+    <jointpos name="q_fr_arm" joint="fr_arm_joint" />
+    <jointpos name="q_rr_arm" joint="rr_arm_joint" />
+    <jointpos name="q_fl_qudong" joint="fl_qudong_joint" />
+    <jointpos name="q_rl_qudong" joint="rl_qudong_joint" />
+    <jointpos name="q_fr_qudong" joint="fr_qudong_joint" />
+    <jointpos name="q_rr_qudong" joint="rr_qudong_joint" />
+    <jointpos name="q_fl_wheel" joint="fl_wheel_joint" />
+    <jointpos name="q_rl_wheel" joint="rl_wheel_joint" />
+    <jointpos name="q_fr_wheel" joint="fr_wheel_joint" />
+    <jointpos name="q_rr_wheel" joint="rr_wheel_joint" />
+    <jointvel name="dq_fl_arm" joint="fl_arm_joint" />
+    <jointvel name="dq_rl_arm" joint="rl_arm_joint" />
+    <jointvel name="dq_fr_arm" joint="fr_arm_joint" />
+    <jointvel name="dq_rr_arm" joint="rr_arm_joint" />
+    <jointvel name="dq_fl_qudong" joint="fl_qudong_joint" />
+    <jointvel name="dq_rl_qudong" joint="rl_qudong_joint" />
+    <jointvel name="dq_fr_qudong" joint="fr_qudong_joint" />
+    <jointvel name="dq_rr_qudong" joint="rr_qudong_joint" />
+    <jointvel name="dq_fl_wheel" joint="fl_wheel_joint" />
+    <jointvel name="dq_rl_wheel" joint="rl_wheel_joint" />
+    <jointvel name="dq_fr_wheel" joint="fr_wheel_joint" />
+    <jointvel name="dq_rr_wheel" joint="rr_wheel_joint" />
+    <jointactuatorfrc name="tau_fl_arm" joint="fl_arm_joint" />
+    <jointactuatorfrc name="tau_rl_arm" joint="rl_arm_joint" />
+    <jointactuatorfrc name="tau_fr_arm" joint="fr_arm_joint" />
+    <jointactuatorfrc name="tau_rr_arm" joint="rr_arm_joint" />
+    <jointactuatorfrc name="tau_fl_qudong" joint="fl_qudong_joint" />
+    <jointactuatorfrc name="tau_rl_qudong" joint="rl_qudong_joint" />
+    <jointactuatorfrc name="tau_fr_qudong" joint="fr_qudong_joint" />
+    <jointactuatorfrc name="tau_rr_qudong" joint="rr_qudong_joint" />
+    <jointactuatorfrc name="tau_fl_wheel" joint="fl_wheel_joint" />
+    <jointactuatorfrc name="tau_rl_wheel" joint="rl_wheel_joint" />
+    <jointactuatorfrc name="tau_fr_wheel" joint="fr_wheel_joint" />
+    <jointactuatorfrc name="tau_rr_wheel" joint="rr_wheel_joint" />
+    <framequat name="imu_quat" objtype="site" objname="imu" />
+    <gyro name="imu_gyro" site="imu" />
+  </sensor>
+</mujoco>

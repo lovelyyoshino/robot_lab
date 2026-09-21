@@ -1,5 +1,12 @@
 # Copyright (c) 2024-2026 Ziqi Fan
 # SPDX-License-Identifier: Apache-2.0
+# @author pony
+# @date 2026-09-16
+# @version v0.2.0
+# @last_modified 2026-09-16
+# @changelog
+#   - v0.2.0 (2026-09-16): 注册独立深度时序增强student，保留原连续帧任务。
+#   - v0.1.0 (2026-09-16): 注册视觉 height-scan teacher 与 depth student 任务。
 
 import gymnasium as gym
 
@@ -20,11 +27,47 @@ gym.register(
 )
 
 gym.register(
+    id="RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Teacher-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.vision_env_cfg:ParallelogramRoverVisionTeacherEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_vision_cfg:ParallelogramRoverVisionTeacherPPORunnerCfg"
+        ),
+    },
+)
+
+gym.register(
+    id="RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Student-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.vision_env_cfg:ParallelogramRoverVisionStudentEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_vision_cfg:ParallelogramRoverVisionStudentDistillationRunnerCfg"
+        ),
+    },
+)
+
+gym.register(
     id="RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rough_env_cfg:ParallelogramRoverRoughEnvCfg",
         "rsl_rl_cfg_entry_point": (f"{agents.__name__}.rsl_rl_ppo_cfg:ParallelogramRoverRoughPPORunnerCfg"),
+    },
+)
+
+gym.register(
+    id="RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Student-Temporal-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.vision_env_cfg:ParallelogramRoverVisionStudentTemporalEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_vision_cfg:ParallelogramRoverVisionStudentTemporalDistillationRunnerCfg"
+        ),
     },
 )
