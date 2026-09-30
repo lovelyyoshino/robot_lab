@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # @author pony
 # @date 2026-08-25
-# @version v0.6.0
-# @last_modified 2026-09-17
+# @version v0.8.0
+# @last_modified 2026-09-29
 # @changelog
+#   - v0.9.0 (2026-09-30): 注册60/72维失败末态重放 residual 微调任务。
+#   - v0.8.0 (2026-09-29): 注册独立60/72维Side-Phase恢复任务，不替换旧任务。
+#   - v0.7.0 (2026-09-28): 注册独立Side/Upside课程及新动作尺度，不覆盖旧Grounded。
 #   - v0.6.0 (2026-09-17): 独立注册人工连续横滚即时控制预训练，不替代正式倒姿验收。
 #   - v0.5.0 (2026-09-17): 注册独立姿态/高度进展 shaping 恢复任务。
 #   - v0.4.0 (2026-09-17): 注册独立失败状态池即时接管任务，必须显式提供采集数据。
@@ -29,6 +32,52 @@ import gymnasium as gym
 from .config import agents
 
 gym.register(
+    id="RobotLab-Isaac-Recovery-Side-Phase-Parallelogram-Rover-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv", disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.config.settled_ground.side_env_cfg:ParallelogramRoverSidePhaseRecoveryEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:ParallelogramRoverSidePhasePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="RobotLab-Isaac-Recovery-Side-Residual-Parallelogram-Rover-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv", disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.config.settled_ground.side_env_cfg:ParallelogramRoverSidePhaseRecoveryEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:ParallelogramRoverSideResidualPPORunnerCfg"
+        ),
+    },
+)
+
+gym.register(
+    id="RobotLab-Isaac-Recovery-Side-Parallelogram-Rover-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv", disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.config.settled_ground.side_env_cfg:ParallelogramRoverSideRecoveryEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:ParallelogramRoverSideRecoveryPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="RobotLab-Isaac-Recovery-Upside-Parallelogram-Rover-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv", disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.config.settled_ground.side_env_cfg:ParallelogramRoverUpsideRecoveryEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:ParallelogramRoverUpsideRecoveryPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="RobotLab-Isaac-Recovery-ControlledTilt-Parallelogram-Rover-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
@@ -49,6 +98,21 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.config.settled_ground.replay_env_cfg:ParallelogramRoverFailureReplayEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:ParallelogramRoverFailureReplayPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="RobotLab-Isaac-Recovery-FailureReplay-Residual-Parallelogram-Rover-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.config.settled_ground.replay_residual_env_cfg:"
+            "ParallelogramRoverFailureReplayResidualEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:ParallelogramRoverFailureReplayResidualPPORunnerCfg"
+        ),
     },
 )
 

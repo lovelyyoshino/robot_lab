@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-09-17
-@version v0.2.0
-@last_modified 2026-09-17
+@version v0.3.0
+@last_modified 2026-09-28
 @changelog
+    - v0.3.0 (2026-09-28): 支持独立侧躺/翻覆与进展任务，保持原严格四轮成功门。
     - v0.2.0 (2026-09-17): 重建来源分段动作及限位合同，防止改写示范动作后伪装原始执行。
     - v0.1.0 (2026-09-17): 逐控制步执行确认、完整成功回合筛选与来源/合同校验。
 """
@@ -51,11 +52,12 @@ def _array(value):
 
 
 def _validate_contract(contract):
-    if (contract.get("actor_observation_dim"), contract.get("critic_observation_dim"),
-            contract.get("action_dim")) != (58, 70, 12):
+    actor_dim, critic_dim = contract.get("actor_observation_dim"), contract.get("critic_observation_dim")
+    if (actor_dim, critic_dim, contract.get("action_dim")) != (58, 70, 12):
         raise ValueError("示范只支持58/70→12恢复合同")
-    if (contract.get("observation_order") != OBSERVATION_ORDER
-            or contract.get("observation_term_dims") != [[n] for n in OBSERVATION_DIMS]):
+    expected_order = OBSERVATION_ORDER
+    expected_dims = [[n] for n in OBSERVATION_DIMS]
+    if contract.get("observation_order") != expected_order or contract.get("observation_term_dims") != expected_dims:
         raise ValueError("恢复观测语义或顺序不匹配")
     if not math.isfinite(contract.get("step_dt", 0)) or contract["step_dt"] <= 0:
         raise ValueError("step_dt必须有限且为正")
@@ -71,7 +73,12 @@ def _validate_contract(contract):
 
 def _validate_source(source):
     if (source.get("complete") is not True or source.get("skill") != "recovery"
-            or source.get("task") != "RobotLab-Isaac-Recovery-Grounded-Parallelogram-Rover-v0"
+                or source.get("task") not in (
+                "RobotLab-Isaac-Recovery-Grounded-Parallelogram-Rover-v0",
+                "RobotLab-Isaac-Recovery-Grounded-Progress-Parallelogram-Rover-v0",
+                "RobotLab-Isaac-Recovery-Side-Parallelogram-Rover-v0",
+                "RobotLab-Isaac-Recovery-Upside-Parallelogram-Rover-v0",
+            )
             or source.get("protocol") != "settled_ground"
             or source.get("recovery_support_protocol") != "four_wheel_stable_v1"
             or source.get("action_source") != "segmented_joint_targets_with_active_pd"
@@ -79,6 +86,11 @@ def _validate_source(source):
             or source.get("checkpoint_policy_executed") is not False
             or source.get("acceptance_eligible") is not False or source.get("passed") is not False):
         raise ValueError("示范来源必须是完整严格Grounded脚本诊断，不能冒充策略验收")
+    if source["task"] in (
+        "RobotLab-Isaac-Recovery-Side-Parallelogram-Rover-v0",
+        "RobotLab-Isaac-Recovery-Upside-Parallelogram-Rover-v0",
+    ) and not isinstance(source.get("control_contract"), dict):
+        raise ValueError("新恢复任务必须携带物理控制合同，不能只凭相同维度认定来源兼容")
     if (source.get("episode_length_s") != 5. or source.get("gates", {}).get("maximum_time_to_stable_s") != 4.
             or source.get("gates", {}).get("minimum_terminal_stable_time_s") != .5):
         raise ValueError("恢复成功门或受控时间预算已改变")
@@ -215,6 +227,8 @@ def _validate_arrays(arrays, metadata):
     contract, source, episodes = metadata["contract"], metadata["source"], metadata["episodes"]
     _validate_contract(contract)
     _validate_source(source)
+    if source.get("control_contract") != contract.get("control_contract"):
+        raise ValueError("示范和评测的物理控制合同不一致")
     if source["step_dt"] != contract["step_dt"] or not episodes:
         raise ValueError("示范控制周期不符或没有成功回合")
     size = len(arrays["observations"])
@@ -244,6 +258,14 @@ def _validate_arrays(arrays, metadata):
             or active_steps < 1 or active_steps % segment_steps != 0):
         raise ValueError("来源动作程序分段时钟损坏")
     expected_shape = (source["expected_episodes"], active_steps // segment_steps, 12)
+    identities = program.get("source_program_ids")
+    mirrors = program.get("mirrored")
+    if identities is not None or mirrors is not None:
+        if (not isinstance(identities, list) or len(identities) != expected_shape[0]
+                or any(type(value) is not int or not 0 <= value < expected_shape[0] for value in identities)
+                or not isinstance(mirrors, list) or len(mirrors) != expected_shape[0]
+                or any(type(value) is not bool for value in mirrors)):
+            raise ValueError("来源程序或镜像身份损坏")
     if targets.shape != expected_shape or defaults.shape != (expected_shape[0], 12) or scales.shape != defaults.shape:
         raise ValueError("来源动作程序维度损坏")
     if not all(np.isfinite(value).all() for value in (targets, defaults, scales)) or (scales == 0).any():

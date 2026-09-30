@@ -2,9 +2,11 @@
 
 @author pony
 @date 2026-09-17
-@version v0.3.0
-@last_modified 2026-09-17
+@version v0.4.0
+@last_modified 2026-09-29
 @changelog
+    - v0.5.0 (2026-09-30): 增加弹射窗口正确方向滚转率和向上速度奖励。
+    - v0.4.0 (2026-09-29): 阶段任务支持按秒速率计算进展，分离腿/轮速度成本。
     - v0.3.0 (2026-09-17): 进展 shaping 改为有界有符号势能差，加入局部 reset 与重复读取缓存。
     - v0.2.0 (2026-09-17): 增加逐控制步去重的姿态/高度正向进展 shaping。
     - v0.1.0 (2026-09-17): 避免侧躺靠高度/默认关节获高分，准备期逐环境归零。
@@ -98,16 +100,18 @@ def _progress_reward(env, key: str, potential: torch.Tensor) -> torch.Tensor:
     return reward.clone()
 
 
-def recovery_orientation_progress(env, gain: float = 8.0) -> torch.Tensor:
+def recovery_orientation_progress(env, gain: float = 8.0, as_rate: bool = False) -> torch.Tensor:
     """势能为 gain*(1-g_z)，限定在 [0,2*gain]；倒退计负分。"""
     if not math.isfinite(gain) or gain <= 0.0:
         raise ValueError("orientation progress gain 必须为有限正数")
     gravity_z = env.scene["robot"].data.projected_gravity_b[:, 2]
     potential = (1.0 - gravity_z).clamp(0.0, 2.0) * gain
-    return _progress_reward(env, "orientation_gz", potential)
+    return _progress_units(env, _progress_reward(env, "orientation_gz", potential), as_rate)
 
 
-def recovery_height_progress(env, scale: float = 0.05, target_height: float = 0.332) -> torch.Tensor:
+def recovery_height_progress(
+    env, scale: float = 0.05, target_height: float = 0.332, as_rate: bool = False,
+) -> torch.Tensor:
     """正立方向门乘以有界高度势能；侧躺抬高和超过目标高度不继续加分。"""
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError("height progress scale 必须为有限正数")
@@ -116,7 +120,72 @@ def recovery_height_progress(env, scale: float = 0.05, target_height: float = 0.
     data = env.scene["robot"].data
     height = data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
     potential = _orientation_gate(env) * height.clamp(0.0, target_height) / scale
-    return _progress_reward(env, "height", potential)
+    return _progress_units(env, _progress_reward(env, "height", potential), as_rate)
+
+
+def _progress_units(env, value, as_rate):
+    # Isaac RewardManager统一乘step_dt；速率模式抵消该缩放，旧任务默认行为不变。
+    if not as_rate:
+        return value
+    if not math.isfinite(env.step_dt) or env.step_dt <= 0:
+        raise ValueError("进展速率要求有限正step_dt")
+    return value / env.step_dt
+
+
+def _phase_velocity_cost(env, ids, standing_multiplier):
+    if not math.isfinite(standing_multiplier) or standing_multiplier < 1:
+        raise ValueError("standing_multiplier 必须有限且不小于1")
+    speed_squared = env.scene["robot"].data.joint_vel[:, ids].square().sum(-1)
+    multiplier = 1. + (standing_multiplier - 1.) * _orientation_gate(env)
+    return _active_value(env, speed_squared * multiplier)
+
+
+def recovery_leg_velocity(env, standing_multiplier: float = 5.0):
+    """只统计8个主动腿；恢复早期允许运动，翻正后连续加强平稳成本。"""
+    return _phase_velocity_cost(env, _leg_ids(env), standing_multiplier)
+
+
+def recovery_phase_wheel_velocity(env, standing_multiplier: float = 5.0):
+    """四轮只在本项计费，避免与腿速度项重复；硬速度/力矩限制保持不变。"""
+    return _phase_velocity_cost(env, env._recovery_joint_groups["wheel"], standing_multiplier)
+
+
+def _launch_window(env, duration_s: float) -> torch.Tensor:
+    """返回接管后的早期发力窗口；准备期和窗口外都严格为零。"""
+    if not math.isfinite(duration_s) or duration_s <= 0.0:
+        raise ValueError("launch window 必须是有限正数")
+    if not hasattr(env, "_recovery_control_steps"):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    phase = env._recovery_control_steps.float() * env.step_dt
+    return env._recovery_control_active & (phase < duration_s)
+
+
+def recovery_launch_roll_rate(env, duration_s: float = 1.2, max_rate: float = 4.0) -> torch.Tensor:
+    """弹射窗口内的正确方向滚转角速度奖励。
+
+    直接奖励 ``ω×g`` 导致的正立势能增加，而不是奖励无方向的高速旋转：
+    ``d(1-g_z)/dt ≈ ω_x g_y - ω_y g_x``。这与初始左右倒向无关，能避免
+    策略通过反向空转刷分，同时给“机械臂摆动 + 轮子发力”一个短暂动力学梯度。
+    """
+    if not math.isfinite(max_rate) or max_rate <= 0.0:
+        raise ValueError("max_rate 必须是有限正数")
+    data = env.scene["robot"].data
+    gravity = data.projected_gravity_b
+    omega = data.root_ang_vel_b
+    rate = omega[:, 0] * gravity[:, 1] - omega[:, 1] * gravity[:, 0]
+    value = torch.relu(rate).clamp(max=max_rate) / max_rate
+    finite = torch.isfinite(rate) & torch.isfinite(value)
+    return _active_value(env, torch.where(_launch_window(env, duration_s) & finite, value, 0.0))
+
+
+def recovery_launch_vertical_speed(env, duration_s: float = 1.2, max_speed: float = 1.0) -> torch.Tensor:
+    """弹射窗口内有限的向上速度奖励；只奖励正速度并截断，避免鼓励持续跳跃。"""
+    if not math.isfinite(max_speed) or max_speed <= 0.0:
+        raise ValueError("max_speed 必须是有限正数")
+    data = env.scene["robot"].data
+    speed = torch.relu(data.root_lin_vel_w[:, 2]).clamp(max=max_speed) / max_speed
+    finite = torch.isfinite(speed)
+    return _active_value(env, torch.where(_launch_window(env, duration_s) & finite, speed, 0.0))
 
 
 def _orientation_gate(env):

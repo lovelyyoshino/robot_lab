@@ -256,7 +256,197 @@ BeyondMimic for Unitree G1:
   python scripts/reinforcement_learning/rsl_rl/play.py --task=RobotLab-Isaac-BeyondMimic-Flat-Unitree-G1-v0 --num_envs 2
   ```
 
-Others (**Experimental**)
+### 平行四边形轮式车：从零训练侧躺恢复（实验性）
+
+本流程按**旧模型、旧示范和旧日志都已删除**编写，不依赖任何历史 checkpoint，
+也不需要先运行 BC。目标是 **侧躺 → 四轮承重 → 稳定保持**，路线为：
+
+**创建采集源模型 → 生成 program31 动作数据 → 校验数据 → residual PPO 短训 → 回放/评估 → 续训 → 最终验收。**
+
+以下命令在已经配置好的 Isaac Lab Python 环境中运行，所有项目和产物路径均已填全。
+控制原理、当前实测结果及部署限制见 [侧躺恢复说明](docs/recovery_side_workflow.md)。
+
+#### 1. 从零生成采集所需的 Side 源模型
+
+不加 `--resume`，不提供任何旧 checkpoint，先运行 20 轮：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/train.py \
+  --task RobotLab-Isaac-Recovery-Side-Parallelogram-Rover-v0 \
+  --experiment_name /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/source \
+  --run_name source_bootstrap \
+  --num_envs 1024 --max_iterations 20 --seed 42 --headless
+```
+
+本步用于生成合法 checkpoint 以及同级 `params/agent.yaml`、`params/env.yaml` 和恢复控制配置。
+**这里 reward 低不表示后续脚本采集失败；不要把这 20 轮当作最终恢复训练。**
+保留整个运行目录，不能只保留 `.pt`。
+
+等命令正常结束后，确认本轮确实生成了模型：
+
+```bash
+find /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/source \
+  -mindepth 2 -maxdepth 2 -type f \
+  -path '*_source_bootstrap/model_*.pt' -print | sort -V
+```
+
+必须看到真实文件路径再进行下一步。下方采集命令会自动选择这里最新运行的最新模型。
+
+#### 2. 重新生成 program31 动作先验
+
+本步加载刚生成的源模型来建立采集环境，但动作由**脚本程序**执行，而不是源策略。
+固定程序生成 seed 731、候选编号 31、左右镜像和轮速幅值 30 rad/s；不要随意改成程序 7。
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_skills.py \
+  --task RobotLab-Isaac-Recovery-Side-Parallelogram-Rover-v0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/source -mindepth 2 -maxdepth 2 -type f -path '*_source_bootstrap/model_*.pt' -print | sort -V | tail -n 1)" \
+  --skill recovery --scenario side_lying --recovery_protocol settled_ground \
+  --diagnostic_action_program --program_seed 731 --program_id 31 \
+  --program_mirror --program_wheel_speed 30 \
+  --num_envs 64 --episodes_per_env 1 --seed 1942 \
+  --output /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/demos/train.json \
+  --demonstration_output /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/demos/train.npz \
+  --headless
+```
+
+预期产物为 `/media/bigdisk/robot_lab/logs/recovery_side_restart_v1/demos/train.json`
+和 `/media/bigdisk/robot_lab/logs/recovery_side_restart_v1/demos/train.npz`。
+NPZ 只接受完整的成功脚本回合，**本次能生成多少成功回合必须实际测量，不沿用以前的数量或成功率**。
+
+这是动作诊断，JSON 的 `passed=false` 是预期标记，不代表已经执行过策略验收。
+检查 `complete`、`success_rate`、`demonstration_dataset.successful_episodes`。
+如果成功回合为 0，或 NPZ 没生成，先停在这里排查动作/物理配置，不要继续 BC 或 PPO。
+重复采集不会覆盖同名 JSON/NPZ；确认数据有效后进入第 3 节，不必重复本步。
+
+#### 3. 从零训练 residual PPO：先跑 100 轮
+
+这里不加载第 1 节的源模型权重，只使用第 2 节新生成的 program31 动作先验。
+任务为 `Side-Residual`，Actor / Critic 观测分别是 **60 / 72 维**，输出 **12 维残差动作**。
+60 维是在原 58 维上追加接管阶段和初始倒向，72 维则保留训练用特权信息。
+它不能直接加载 58 维 Side/Grounded/BC 权重。
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/train.py \
+  --task RobotLab-Isaac-Recovery-Side-Residual-Parallelogram-Rover-v0 \
+  --recovery_prior_data /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/demos/train.npz \
+  --recovery_prior_program_id 31 --recovery_residual_profile constant \
+  --recovery_residual_std 0.15 \
+  --experiment_name /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/policy \
+  --run_name constant \
+  --num_envs 1024 --max_iterations 100 --seed 42 --headless
+```
+
+本步正常结束后，会在 `/media/bigdisk/robot_lab/logs/recovery_side_restart_v1/policy/`
+下生成新的 `时间戳_constant` 运行目录。
+`recovery_pre_update.pt` 是首次 PPO 更新前的初始化快照，`model_0.pt` 已经过第一次更新。
+回放和评估只自动选择 `model_*.pt`，不猜测末尾编号。
+
+#### 4. 回放刚训练的模型
+
+无需填写新时间戳，play 自动读取本轮 policy 目录中最新的 `constant` 运行：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/play.py \
+  --task RobotLab-Isaac-Recovery-Side-Residual-Parallelogram-Rover-v0 \
+  --experiment_name /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/policy \
+  --load_run '.*_constant$' \
+  --recovery_prior_data /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/demos/train.npz \
+  --recovery_prior_program_id 31 --recovery_residual_profile auto \
+  --num_envs 8 --max_steps 1250
+```
+
+本命令不带 `--headless`，需要可用显示环境；只想做无窗口运行检查时才追加该参数。
+核对终端 `Loading model checkpoint from:` 打印的路径属于本轮 `policy/`。
+看完整的“侧躺、翻转、四轮支撑、稳定保持”，不能只凭某一帧翻正判定成功。
+
+#### 5. 在两个开发 seed 上评估当前模型
+
+先等训练结束，评估期间不要启动新的训练或修改模型。下面自动选择本轮同一个最新 checkpoint，
+输出文件自动带时间戳；同一秒内不要重复启动同一 seed 的评估。
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_skills.py \
+  --task RobotLab-Isaac-Recovery-Side-Residual-Parallelogram-Rover-v0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/policy -mindepth 2 -maxdepth 2 -type f -path '*_constant/model_*.pt' -print | sort -V | tail -n 1)" \
+  --recovery_prior_data /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/demos/train.npz \
+  --recovery_prior_program_id 31 --recovery_residual_profile auto \
+  --skill recovery --scenario side_lying --recovery_protocol settled_ground \
+  --num_envs 64 --episodes_per_env 1 --seed 3942 \
+  --output "/media/bigdisk/robot_lab/logs/recovery_side_restart_v1/evaluation/dev_seed3942_$(date +%Y%m%d_%H%M%S).json" --headless
+
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_skills.py \
+  --task RobotLab-Isaac-Recovery-Side-Residual-Parallelogram-Rover-v0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/policy -mindepth 2 -maxdepth 2 -type f -path '*_constant/model_*.pt' -print | sort -V | tail -n 1)" \
+  --recovery_prior_data /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/demos/train.npz \
+  --recovery_prior_program_id 31 --recovery_residual_profile auto \
+  --skill recovery --scenario side_lying --recovery_protocol settled_ground \
+  --num_envs 64 --episodes_per_env 1 --seed 4051 \
+  --output "/media/bigdisk/robot_lab/logs/recovery_side_restart_v1/evaluation/dev_seed4051_$(date +%Y%m%d_%H%M%S).json" --headless
+```
+
+查看 JSON 的 `checkpoint`、`checkpoint_sha256`、`complete`、`success_rate`、`passed`
+和 `episode_results` 中的 `failure_state`；两份报告的模型哈希应相同。
+开发评估没有达到 85% 不等于脚本运行故障；退出码 1 且报告完整表示技能未达标。
+traceback、不完整回合或 NaN 才需要先排查运行问题。
+
+100 轮只是短训检查，不要求必然达到最终门槛；但若一直 0 成功或明显破坏脚本动作，
+先停下排查，不能靠继续增加轮数掩盖问题。
+
+#### 6. 继续本轮训练：每次追加 5000 轮
+
+短训、回放和开发评估完成后，用 `--resume` 接着**本轮最新模型**训练。
+不要重复第 3 节，否则会另建一个从零开始的策略。
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/train.py \
+  --task RobotLab-Isaac-Recovery-Side-Residual-Parallelogram-Rover-v0 \
+  --resume \
+  --experiment_name /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/policy \
+  --load_run '.*_constant$' --run_name constant \
+  --recovery_prior_data /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/demos/train.npz \
+  --recovery_prior_program_id 31 --recovery_residual_profile auto \
+  --num_envs 1024 --max_iterations 5000 --seed 42 --headless
+```
+
+`--max_iterations 5000` 表示本次追加预算，续训保存到新的时间戳运行目录，旧运行不被覆盖。
+每次完成后重新执行 **第 4 节回放 + 第 5 节开发评估**；再需要训练就重复本节。
+保留同一个 `train.npz` 和 profile，不要在续训中替换先验、扩大力矩或更换动作尺度。
+没有 NaN 不代表已学会恢复，mean reward 上升也不能代替真实成功率。
+
+#### 7. 冻结模型后的最终验收
+
+开发结果满足目标后停止训练，不再更改 checkpoint、数据和参数，再做最终测试。
+下面给出 seed 71061 / 81061；如果你已经用它们调参，应换成其他未使用的 seed。
+评估期间不要新建 `constant` 运行，并核对两份报告的 `checkpoint_sha256` 相同。
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_skills.py \
+  --task RobotLab-Isaac-Recovery-Side-Residual-Parallelogram-Rover-v0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/policy -mindepth 2 -maxdepth 2 -type f -path '*_constant/model_*.pt' -print | sort -V | tail -n 1)" \
+  --recovery_prior_data /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/demos/train.npz \
+  --recovery_prior_program_id 31 --recovery_residual_profile auto \
+  --skill recovery --scenario side_lying --recovery_protocol settled_ground \
+  --num_envs 128 --episodes_per_env 1 --seed 71061 \
+  --output "/media/bigdisk/robot_lab/logs/recovery_side_restart_v1/evaluation/holdout_seed71061_$(date +%Y%m%d_%H%M%S).json" --headless
+
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_skills.py \
+  --task RobotLab-Isaac-Recovery-Side-Residual-Parallelogram-Rover-v0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/policy -mindepth 2 -maxdepth 2 -type f -path '*_constant/model_*.pt' -print | sort -V | tail -n 1)" \
+  --recovery_prior_data /media/bigdisk/robot_lab/logs/recovery_side_restart_v1/demos/train.npz \
+  --recovery_prior_program_id 31 --recovery_residual_profile auto \
+  --skill recovery --scenario side_lying --recovery_protocol settled_ground \
+  --num_envs 128 --episodes_per_env 1 --seed 81061 \
+  --output "/media/bigdisk/robot_lab/logs/recovery_side_restart_v1/evaluation/holdout_seed81061_$(date +%Y%m%d_%H%M%S).json" --headless
+```
+
+每个 seed 都需报告完整、`passed=true`，当前侧躺恢复成功率门槛为 85%。
+成功还要求四轮真实承重、没有非轮部件承重、姿态/高度/速度合格；
+合格稳态需连续延伸到 5 秒终点，持续至少 0.5 秒，且该稳态段开始不晚于 4 秒。
+通过有限样本测试也不意味着任意姿态或真机成功率有保证。
+
+
+### 其他实验示例
 
 - Train AMP Dance for Unitree G1
 

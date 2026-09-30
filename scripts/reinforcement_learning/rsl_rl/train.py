@@ -2,9 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # @author pony
 # @date 2026-09-16
-# @version v0.13.0
-# @last_modified 2026-09-17
+# @version v0.22.0
+# @last_modified 2026-09-30
 # @changelog
+#   - v0.22.0 (2026-09-30): 续训校验先验语义；显式权重迁移支持settle_feedback新实验。
+#   - v0.20.0 (2026-09-30): 允许FailureReplay-Residual使用同一先验和60/72维Actor微调。
+#   - v0.21.0 (2026-09-30): Residual先验谱系记录NPZ哈希，阻止回放时静默替换动作表。
+#   - v0.19.0 (2026-09-30): 增加 upright_release 先验释放消融，constant 仍为默认基线。
+#   - v0.18.0 (2026-09-30): Side-Residual增加分阶段 residual profile，默认保护前1秒弹射。
+#   - v0.17.0 (2026-09-30): 新增Side-Residual动作先验、零均值Actor初始化及显式先验合同入口。
+#   - v0.16.0 (2026-09-29): 默认保护切换锚点改为20倍/2步，降低PPO破坏脚本时序的风险。
+#   - v0.15.0 (2026-09-29): 阶段恢复增加critic预热、示范锚点、物理噪声和可续训快照。
+#   - v0.14.0 (2026-09-28): 恢复独立电机标定/控制合同快照，创建仿真前拒绝错误尺度续训。
 #   - v0.13.0 (2026-09-17): teacher迁移后保存独立零更新快照，避免将PPO退化误判为扩维错误。
 #   - v0.12.0 (2026-09-17): 显式 blind45→teacher232 warm start，严格合同及谱系记录，不继承优化器或迭代。
 #   - v0.11.0 (2026-09-17): 恢复 checkpoint 的有效 PPO 学习率，并支持显式可追溯覆盖。
@@ -59,6 +68,34 @@ parser.add_argument("--resume_noise_scale", type=float, default=None,
                     help="续训时缩放 checkpoint 探索标准差并清零其优化器动量；范围 (0,1]。")
 parser.add_argument("--resume_learning_rate", type=float, default=None,
                     help="显式覆盖 PPO 续训学习率；省略时继承 checkpoint optimizer 的有效值。")
+parser.add_argument("--recovery_protected", action="store_true",
+                    help="Side-Phase专用：BC后先critic预热，再以脚本动作锚点保护Actor。")
+parser.add_argument("--recovery_demo_data", type=Path, default=None,
+                    help="受保护恢复训练使用的原58维成功示范NPZ；运行时显式转换为60维。")
+parser.add_argument("--recovery_warmup_iterations", type=int, default=15,
+                    help="受保护恢复训练冻结Actor/std的PPO更新次数。")
+parser.add_argument("--recovery_anchor_coef", type=float, default=0.2,
+                    help="示范锚点Adam学习率与PPO学习率之比；不是PPO目标中的loss系数。")
+parser.add_argument("--recovery_anchor_batch_size", type=int, default=2048,
+                    help="每次锚点更新抽取的成功示范帧数。")
+parser.add_argument("--recovery_anchor_transition_weight", type=float, default=20.,
+                    help="锚点损失在启动/换段附近的权重。")
+parser.add_argument("--recovery_anchor_transition_window", type=int, default=2,
+                    help="锚点换段窗口，控制步数。")
+parser.add_argument("--recovery_motor_profile", type=Path,
+                    help="恢复专用实测电机JSON；省略保留仿真假设，resume自动读取源run快照。")
+parser.add_argument("--recovery_prior_data", type=Path,
+                    help="Residual恢复任务使用的成功 program NPZ；必须包含 action_program.targets。")
+parser.add_argument("--recovery_prior_program_id", type=int, default=31,
+                    help="Side-Residual 使用的固定动作程序编号，默认31。")
+parser.add_argument("--recovery_residual_std", type=float, default=0.15,
+                    help="Side-Residual 新策略的初始归一化探索std；只作用于新建run。")
+parser.add_argument("--recovery_residual_profile",
+                    choices=("auto", "constant", "launch_protected", "upright_release", "settle_feedback"),
+                    default="auto",
+                    help="新训练auto=constant；续训auto恢复源合同；settle_feedback允许3秒后小幅纠偏。")
+parser.add_argument("--recovery_residual_warm_start", type=Path,
+                    help="显式迁移Residual权重到新profile/课程，重建optimizer和迭代；不能与resume混用。")
 parser.add_argument(
     "--failure_states",
     type=Path,
@@ -172,6 +209,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # handle deprecated configurations
     agent_cfg = cli_args.handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
 
+    if args_cli.recovery_protected:
+        from recovery_phase_training import PHASE_TASK
+
+        if (args_cli.task != PHASE_TASK or not agent_cfg.resume or args_cli.recovery_demo_data is None
+                or agent_cfg.algorithm.class_name != "PPO" or agent_cfg.class_name != "OnPolicyRunner"
+                or args_cli.distributed or args_cli.upright_warm_start or args_cli.vision_teacher_warm_start):
+            raise ValueError("recovery_protected只支持Side-Phase单设备PPO resume，须提供训练示范")
+        if args_cli.resume_noise_scale is not None:
+            raise ValueError("recovery_protected按物理单位固定探索std，不能叠加resume_noise_scale")
+    elif args_cli.recovery_demo_data is not None:
+        raise ValueError("recovery_demo_data必须与recovery_protected一起使用")
+
+    # 任务分类集中在 recovery_contract，训练/评估/回放不能各自维护字符串白名单。
+    from recovery_contract import (
+        configure_failure_replay_env, is_residual_recovery_task,
+    )
+
+    residual_task = is_residual_recovery_task(args_cli.task)
+    if residual_task and args_cli.recovery_prior_data is None:
+        raise ValueError("Residual恢复训练必须提供 --recovery_prior_data")
+    if not residual_task and args_cli.recovery_prior_data is not None:
+        raise ValueError("--recovery_prior_data 只允许用于Residual恢复任务")
+    if args_cli.recovery_residual_warm_start is not None:
+        if (not residual_task or agent_cfg.resume or agent_cfg.algorithm.class_name != "PPO"
+                or args_cli.distributed or args_cli.recovery_protected
+                or args_cli.upright_warm_start or args_cli.vision_teacher_warm_start):
+            raise ValueError("recovery_residual_warm_start只允许单设备新Residual PPO，不能混用其他初始化/resume")
+
     vision_warm_start_enabled = False
     if args_cli.vision_teacher_warm_start is not None:
         from vision_warm_start import validate_vision_warm_start_request
@@ -196,22 +261,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "Please use GPU device (e.g., --device cuda) for distributed training."
         )
 
-    failure_replay_task = bool(args_cli.task and "Recovery-FailureReplay" in args_cli.task)
-    if failure_replay_task:
-        reset_fall_pose = getattr(getattr(env_cfg, "events", None), "reset_fall_pose", None)
-        if reset_fall_pose is None or not hasattr(reset_fall_pose, "params"):
-            raise ValueError("FailureReplay 环境缺少 reset_fall_pose 参数入口")
-        configured_path = reset_fall_pose.params.get("failure_state_path", "")
-        if args_cli.failure_states is None and not configured_path:
-            raise ValueError("FailureReplay 训练必须通过 --failure_states 或 Hydra 指定失败状态池")
-        failure_states_path = Path(args_cli.failure_states or configured_path).expanduser().resolve()
-        if configured_path and Path(configured_path).expanduser().resolve() != failure_states_path:
-            raise ValueError("--failure_states 与 Hydra 失败池路径冲突，拒绝静默覆盖训练来源")
-        if not failure_states_path.is_file():
-            raise FileNotFoundError(f"FailureReplay 失败状态池不存在: {failure_states_path}")
-        reset_fall_pose.params["failure_state_path"] = str(failure_states_path)
-    elif args_cli.failure_states is not None:
-        raise ValueError("--failure_states 只允许用于 Recovery-FailureReplay 任务")
+    configure_failure_replay_env(env_cfg, args_cli.task, args_cli.failure_states)
 
     # multi-gpu training configuration
     if args_cli.distributed:
@@ -247,13 +297,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
-    # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-
-    # convert to single-agent instance if required by the RL algorithm
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
-
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         requested_checkpoint = os.path.expanduser(str(agent_cfg.load_checkpoint))
@@ -262,6 +305,47 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             resume_path = retrieve_file_path(requested_checkpoint)
         else:
             resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+
+    from recovery_contract import (
+        configure_physics, control_contract, is_rover_recovery, save_control_contract,
+        save_physics_evidence, validate_checkpoint_contract,
+    )
+
+    recovery_source = resume_path if agent_cfg.resume else args_cli.recovery_residual_warm_start
+    if residual_task:
+        from recovery_prior import resolve_checkpoint_prior
+
+        if recovery_source is not None:
+            args_cli.recovery_residual_profile = resolve_checkpoint_prior(
+                recovery_source, args_cli.recovery_prior_data,
+                program_id=args_cli.recovery_prior_program_id, task=args_cli.task,
+                residual_profile=args_cli.recovery_residual_profile,
+                allow_task_transfer=True,
+                allow_profile_transfer=args_cli.recovery_residual_warm_start is not None,
+            )
+        elif args_cli.recovery_residual_profile == "auto":
+            args_cli.recovery_residual_profile = "constant"
+
+    recovery_profile = configure_physics(
+        env_cfg, args_cli.task, args_cli.recovery_motor_profile,
+        recovery_source,
+    )
+    recovery_control = control_contract(env_cfg.to_dict(), agent_cfg.to_dict()) if is_rover_recovery(args_cli.task) else None
+    if recovery_control is not None and recovery_source is not None:
+        validate_checkpoint_contract(recovery_source, recovery_control)
+
+    # 在加载/尺度/物理合同确认后才创建环境；与旧行驶/视觉任务完全隔离。
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    if isinstance(env.unwrapped, DirectMARLEnv):
+        env = multi_agent_to_single_agent(env)
+
+    if residual_task:
+        from recovery_prior import attach_recovery_prior
+
+        env = attach_recovery_prior(
+            env, args_cli.recovery_prior_data, program_id=args_cli.recovery_prior_program_id,
+            residual_profile=args_cli.recovery_residual_profile,
+        )
 
     # wrap for video recording
     if args_cli.video:
@@ -292,6 +376,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     warm_start_metadata = None
+    recovery_residual_metadata = None
+    if residual_task and not agent_cfg.resume:
+        from recovery_prior import initialize_residual_policy, warm_start_residual_policy
+
+        if args_cli.recovery_residual_warm_start is not None:
+            recovery_residual_metadata = warm_start_residual_policy(
+                runner.alg.policy, args_cli.recovery_residual_warm_start, std=args_cli.recovery_residual_std,
+            )
+        else:
+            recovery_residual_metadata = initialize_residual_policy(
+                runner.alg.policy, std=args_cli.recovery_residual_std,
+            )
     if args_cli.upright_warm_start is not None:
         from upright_warm_start import load_training_config, validate_upright_motion_contract, warm_start_upright_motion
 
@@ -359,17 +455,45 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner.alg.policy, runner.alg.optimizer, args_cli.resume_noise_scale,
         )
 
+    recovery_protection = None
+    if args_cli.recovery_protected:
+        if not args_cli.resume or args_cli.recovery_demo_data is None:
+            raise ValueError("--recovery_protected 必须与 --resume 和 --recovery_demo_data 一起使用")
+        from recovery_protected import attach_recovery_protection
+
+        recovery_protection = attach_recovery_protection(
+            runner, task=args_cli.task, demo_path=args_cli.recovery_demo_data,
+            env=env_cfg.to_dict(), agent=agent_cfg.to_dict(),
+            source_checkpoint=resume_path,
+            warmup_iterations=args_cli.recovery_warmup_iterations,
+            anchor_coef=args_cli.recovery_anchor_coef,
+            anchor_batch_size=args_cli.recovery_anchor_batch_size,
+            anchor_transition_weight=args_cli.recovery_anchor_transition_weight,
+            anchor_transition_window=args_cli.recovery_anchor_transition_window,
+            seed=agent_cfg.seed,
+        )
+
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+    if recovery_control is not None:
+        save_control_contract(Path(log_dir) / "params", recovery_control)
+        save_physics_evidence(Path(log_dir) / "params", env_cfg, recovery_profile)
     if resume_lineage is not None:
         write_checkpoint_source_metadata(Path(log_dir) / "params", resume_lineage)
+    if recovery_protection is not None:
+        with open(os.path.join(log_dir, "params", "recovery_protection.json"), "w", encoding="utf-8") as stream:
+            json.dump(recovery_protection, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        # 此快照确实在learn之前；model_0是首轮更新后，不可当成BC初始化。
+        runner.logger_type = agent_cfg.logger
+        runner.save(os.path.join(log_dir, "recovery_pre_update.pt"), infos={"snapshot": "before_learn"})
     failure_pool = getattr(env.unwrapped, "_failure_state_pool", None)
     if args_cli.task and "Recovery" in args_cli.task and "Parallelogram-Rover" in args_cli.task:
         from robot_lab.tasks.manager_based.recovery.mdp.failure_states import snapshot_training_pools
 
         # 普通恢复阶段也继承来源；FailureReplay→Grounded→FailureReplay 不得遗忘旧池。
-        source_checkpoint = resume_path if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation" else None
+        source_checkpoint = (resume_path if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation"
+                             else args_cli.recovery_residual_warm_start)
         snapshot_training_pools(Path(log_dir) / "params", failure_pool, source_checkpoint)
     if warm_start_metadata is not None:
         if vision_warm_start_enabled:
@@ -378,6 +502,33 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             warm_start_metadata["initialization_snapshot"] = save_teacher_initialization(runner, log_dir)
         with open(os.path.join(log_dir, "params", "warm_start.json"), "w", encoding="utf-8") as stream:
             json.dump(warm_start_metadata, stream, ensure_ascii=False, indent=2, allow_nan=False)
+    if recovery_residual_metadata is not None:
+        recovery_residual_metadata.update({
+            "prior_data": str(args_cli.recovery_prior_data.expanduser().resolve()),
+            "prior_program_id": args_cli.recovery_prior_program_id,
+            "residual_profile": args_cli.recovery_residual_profile,
+            "task": args_cli.task,
+        })
+        with open(os.path.join(log_dir, "params", "recovery_residual_initialization.json"), "w", encoding="utf-8") as stream:
+            json.dump(recovery_residual_metadata, stream, ensure_ascii=False, indent=2, allow_nan=False)
+    if residual_task:
+        # profile 是动作合同的一部分；play/evaluate 在缺省时从此文件自动恢复，
+        # 避免同一 checkpoint 被错误地用两种 wrapper 回放。
+        from recovery_prior import prior_runtime_contract
+
+        runtime_contract = prior_runtime_contract(
+            args_cli.recovery_prior_data, program_id=args_cli.recovery_prior_program_id,
+            residual_profile=args_cli.recovery_residual_profile, task=args_cli.task,
+        )
+        with open(os.path.join(log_dir, "params", "recovery_residual_runtime.json"), "w", encoding="utf-8") as stream:
+            json.dump(runtime_contract, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        if recovery_residual_metadata is not None:
+            # model_0是第一次PPO更新之后；单独保留真初始化供迁移前后闭环对照。
+            runner.logger_type = agent_cfg.logger
+            runner.save(os.path.join(log_dir, "recovery_pre_update.pt"), infos={
+                "snapshot": "before_learn", "recovery_residual_initialization": recovery_residual_metadata,
+                "recovery_residual_runtime": runtime_contract,
+            })
     if args_cli.task and "Parallelogram-Rover-Vision-Student" in args_cli.task:
         from robot_lab.tasks.manager_based.locomotion.velocity.config.wheeled.parallelogram_rover.vision_env_cfg import vision_depth_contract
 

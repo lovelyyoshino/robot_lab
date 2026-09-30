@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-09-17
-@version v0.2.0
-@last_modified 2026-09-17
+@version v0.3.0
+@last_modified 2026-09-28
 @changelog
+    - v0.3.0 (2026-09-28): 固定程序按倒向镜像并重新校验目标，记录速度及估算功率。
     - v0.2.0 (2026-09-17): 记录真实主动关节行程和执行器估算力矩，区分动作输入与实际响应。
     - v0.1.0 (2026-09-17): 独立RNG采样、物理限位/动作逆变换与严格诊断身份。
 """
@@ -98,8 +99,58 @@ class RecoveryActionProgram:
         self.joint_min = torch.full_like(self.defaults, float("inf"))
         self.joint_max = torch.full_like(self.defaults, -float("inf"))
         self.max_estimated_torque = torch.zeros_like(self.defaults)
+        self.max_joint_velocity = torch.zeros_like(self.defaults)
+        self.max_estimated_power = torch.zeros_like(self.defaults)
+        # 保留未镜像候选；后续诊断可以对每个候选独立按初始倒向镜像，
+        # 不能在已经镜像的 targets 上二次变换。
+        self._candidate_targets = self.targets.detach().clone()
+        self.source_program_ids = list(range(self.num_envs))
+        self.mirrored = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
 
-    def observe_joints(self, positions, estimated_torque, active):
+    def _commit_targets(self, targets, source_program_ids, mirrored):
+        """校验并提交物理目标；任何越界都必须显式失败，不能静默clip。"""
+        if targets.shape != (self.num_envs, self.num_segments, 12):
+            raise ValueError("动作目标必须是[环境数,分段数,12]")
+        if len(source_program_ids) != self.num_envs:
+            raise ValueError("source_program_ids必须逐环境记录")
+        if mirrored.shape != (self.num_envs,) or mirrored.dtype != torch.bool:
+            raise ValueError("镜像选择必须是逐环境bool")
+        raw = (targets - self.defaults[:, None]) / self.scales[:, None]
+        if ((targets[:, :, :8] < self.leg_limits[:, None, :, 0])
+                | (targets[:, :, :8] > self.leg_limits[:, None, :, 1])).any():
+            raise ValueError("固定或镜像目标超过接收环境的腿限位")
+        if (targets[:, :, 8:].abs() > self.wheel_limits[:, None]).any():
+            raise ValueError("固定或镜像目标超过接收环境的轮速限位")
+        if ((targets < self.command_clip[:, None, :, 0])
+                | (targets > self.command_clip[:, None, :, 1])).any():
+            raise ValueError("固定或镜像目标超过action term clip")
+        if self.raw_clip is not None and (raw.abs() > self.raw_clip).any():
+            raise ValueError("固定或镜像原始动作超过wrapper clip")
+        self.targets, self.raw_actions = targets, raw
+        self.source_program_ids = list(source_program_ids)
+        self.mirrored = mirrored.clone()
+
+    def mirror_candidates(self, mirror_mask):
+        """逐环境镜像各自随机候选，供动作搜索使用。"""
+        if mirror_mask.shape != (self.num_envs,) or mirror_mask.dtype != torch.bool:
+            raise ValueError("镜像选择必须是逐环境bool")
+        reflected = self._candidate_targets[:, :, [2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9]].clone()
+        reflected[:, :, 4:8] *= -1
+        targets = torch.where(mirror_mask[:, None, None], reflected, self._candidate_targets)
+        self._commit_targets(targets, list(range(self.num_envs)), mirror_mask)
+
+    def select_program(self, index, mirror_mask=None):
+        """选择一个候选并按真实物理目标镜像：交换左右，只有转向反号。"""
+        if type(index) is not int or not 0 <= index < self.num_envs:
+            raise ValueError("program_id必须落在本次采样环境范围")
+        targets = self._candidate_targets[index:index + 1].expand(self.num_envs, -1, -1).clone()
+        mirrored = torch.zeros_like(self.mirrored) if mirror_mask is None else mirror_mask
+        reflected = targets[:, :, [2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9]].clone()
+        reflected[:, :, 4:8] *= -1
+        targets = torch.where(mirrored[:, None, None], reflected, targets)
+        self._commit_targets(targets, [index] * self.num_envs, mirrored)
+
+    def observe_joints(self, positions, estimated_torque, active, velocities=None):
         """记录实际关节状态；implicit的applied_torque是估算值，不冒充PhysX驱动力测量。"""
         if positions.shape != self.defaults.shape or estimated_torque.shape != self.defaults.shape:
             raise ValueError("诊断关节状态必须为按动作合同排序的[环境数,12]")
@@ -110,6 +161,16 @@ class RecoveryActionProgram:
         self.max_estimated_torque = torch.maximum(
             self.max_estimated_torque, torch.where(valid[:, None], estimated_torque.abs(), 0.),
         )
+        if velocities is not None:
+            if velocities.shape != self.defaults.shape:
+                raise ValueError("诊断速度必须为按动作合同排序的[环境数,12]")
+            valid &= torch.isfinite(velocities).all(-1)
+            self.max_joint_velocity = torch.maximum(
+                self.max_joint_velocity, torch.where(valid[:, None], velocities.abs(), 0.),
+            )
+            self.max_estimated_power = torch.maximum(
+                self.max_estimated_power, torch.where(valid[:, None], (velocities * estimated_torque).abs(), 0.),
+            )
 
     def actions(self, control_steps, active):
         """control_steps是下一步之前的已执行步数；局部接管0从第一段开始。"""
@@ -146,6 +207,9 @@ class RecoveryActionProgram:
                 if torch.isfinite(self.joint_min[index]).all() else None
             ),
             "maximum_actuator_estimated_torque_nm": self.max_estimated_torque[index].cpu().tolist(),
+            "maximum_joint_velocity_rad_s": self.max_joint_velocity[index].cpu().tolist(),
+            "maximum_actuator_estimated_power_w": self.max_estimated_power[index].cpu().tolist(),
+            "response_sampling": "control_step_not_physics_substep_peak",
         }
 
     def mark_diagnostic(self, result):
@@ -158,6 +222,7 @@ class RecoveryActionProgram:
                 "seed": self.seed, "leg_fraction": self.leg_fraction, "wheel_speed_rad_s": self.wheel_speed,
                 "segment_steps": self.segment_steps, "active_steps": self.active_steps, "step_dt": self.dt,
                 "targets_shape": list(self.targets.shape), "targets": self.targets.cpu().tolist(),
+                "source_program_ids": self.source_program_ids, "mirrored": self.mirrored.cpu().tolist(),
                 "default_targets": self.defaults.cpu().tolist(), "action_scales": self.scales.cpu().tolist(),
                 "leg_soft_limits_rad": self.leg_limits.cpu().tolist(),
                 "wheel_velocity_limits_rad_s": self.wheel_limits.cpu().tolist(), "wrapper_raw_clip": self.raw_clip,
@@ -199,4 +264,12 @@ def program_from_environment(env, args, raw_clip):
         leg_fraction=args.program_leg_fraction, wheel_speed=args.program_wheel_speed,
     )
     program.joint_ids = joint_ids
+    if getattr(args, "program_mirror", False):
+        mask = robot.data.projected_gravity_b[:, 1] > 0
+        if getattr(args, "program_id", None) is not None:
+            program.select_program(args.program_id, mask)
+        else:
+            program.mirror_candidates(mask)
+    elif getattr(args, "program_id", None) is not None:
+        program.select_program(args.program_id)
     return program, list(names)

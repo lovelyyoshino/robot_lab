@@ -3,9 +3,16 @@
 
 @author pony
 @date 2026-09-16
-@version v0.13.0
-@last_modified 2026-09-17
+@version v0.20.0
+@last_modified 2026-09-30
 @changelog
+    - v0.20.0 (2026-09-30): 支持保持期闭环profile，拒绝缺谱系时猜测动作合同。
+    - v0.19.0 (2026-09-30): 评测在创建Isaac环境前校验Residual先验NPZ哈希。
+    - v0.18.0 (2026-09-30): 支持FailureReplay-Residual使用同一先验合同进行失败状态微调评测。
+    - v0.17.0 (2026-09-30): 支持 upright_release 先验释放消融并记录 profile。
+    - v0.16.0 (2026-09-30): 评估自动读取训练时 residual profile，阻止 wrapper 配置错配。
+    - v0.15.0 (2026-09-30): 正式评估支持Side-Residual先验与同源动作合同校验。
+    - v0.14.0 (2026-09-28): 侧躺/翻覆独立验收、镜像脚本示范、物理控制合同与响应统计。
     - v0.13.0 (2026-09-17): 可选保存严格成功脚本回合的动作前观测与reset前执行确认示范。
     - v0.12.0 (2026-09-17): 增加受限分段动作诊断，复用Grounded接管与reset前严格终态验收。
     - v0.11.0 (2026-09-17): 倾角课程增加零策略动作/主动PD对照，显式区分策略执行与加载。
@@ -47,7 +54,8 @@ TASKS = {
 def _validate_action_program_args(args):
     """诊断只复用严格Grounded单回合，不允许修改保持门或混用课程。"""
     program_defaults = {"program_seed": 731, "program_segment_s": .5, "program_active_s": 3.,
-                        "program_leg_fraction": 1., "program_wheel_speed": 5.}
+                        "program_leg_fraction": 1., "program_wheel_speed": 5.,
+                        "program_id": None, "program_mirror": False}
     if not getattr(args, "diagnostic_action_program", False):
         if getattr(args, "demonstration_output", None) is not None:
             raise ValueError("demonstration_output只用于显式脚本诊断")
@@ -55,9 +63,18 @@ def _validate_action_program_args(args):
             raise ValueError("program参数必须同时显式启用diagnostic_action_program")
         return
     if (args.skill != "recovery" or args.recovery_protocol != "settled_ground"
-            or args.task != "RobotLab-Isaac-Recovery-Grounded-Parallelogram-Rover-v0"
+            or args.task not in (
+                "RobotLab-Isaac-Recovery-Grounded-Parallelogram-Rover-v0",
+                "RobotLab-Isaac-Recovery-Grounded-Progress-Parallelogram-Rover-v0",
+                "RobotLab-Isaac-Recovery-Side-Parallelogram-Rover-v0",
+                "RobotLab-Isaac-Recovery-Upside-Parallelogram-Rover-v0",
+            )
             or args.episodes_per_env != 1 or args.diagnostic_zero_action or args.hold_time_s is not None):
         raise ValueError("action_program只接受Grounded recovery/settled_ground单回合及默认保持门")
+    if getattr(args, "program_id", None) is not None and not 0 <= args.program_id < args.num_envs:
+        raise ValueError("program_id必须落在本次num_envs范围")
+    if getattr(args, "program_mirror", False) and getattr(args, "scenario", None) != "side_lying":
+        raise ValueError("program_mirror只用于明确side_lying场景")
     output = getattr(args, "output", None)
     if output is not None and output.exists():
         raise ValueError("action_program不会覆盖已有输出，请指定新证据路径")
@@ -82,7 +99,8 @@ def _validate_controlled_tilt_args(args):
         raise ValueError("controlled_tilt 只接受 recovery，不能指定正式 --scenario")
     if (args.settled_initialization != "near_ground" or args.preparation_leg_damping is not None
             or args.takeover_velocity_x or args.takeover_pitch_rate
-            or args.failure_states is not None or args.allow_training_pool_smoke):
+            or args.failure_states is not None or getattr(args, "failure_states_output", None) is not None
+            or args.allow_training_pool_smoke):
         raise ValueError("controlled_tilt 不接受沉降、准备制动、速度注入或失败池参数")
     if args.roll_tilt_range_deg is not None:
         bounds = args.roll_tilt_range_deg
@@ -96,6 +114,24 @@ def _evaluation_actions(policy, obs, action_template, zero_action):
     import torch
 
     return torch.zeros_like(action_template) if zero_action else policy(obs)
+
+
+def _classify_recovery_failure(record):
+    """把终态按姿态分桶，避免只报告一个 success_rate 而看不出失败机制。"""
+    if record.get("success"):
+        return "success"
+    if record.get("initialization_failed"):
+        return "initialization_failure"
+    gravity = record.get("terminal_gravity_b")
+    if not isinstance(gravity, list) or len(gravity) != 3 or not all(math.isfinite(float(v)) for v in gravity):
+        return "nonfinite_or_missing_terminal_state"
+    if gravity[2] > 0.75:
+        return "upside_down"
+    if abs(gravity[1]) > 0.70 and abs(gravity[2]) < 0.70:
+        return "side_lying"
+    if gravity[2] > -0.70:
+        return "not_upright"
+    return "unstable_upright"
 
 
 def _mark_controlled_tilt_diagnostic(result, roll_tilt_range_deg, zero_action=False):
@@ -130,6 +166,16 @@ def parse_args():
     parser.add_argument("--diagnostic_action_program", action="store_true",
                         help="仅Grounded单回合：分段关节目标搜索，不执行加载的策略，结果不作技能验收。")
     parser.add_argument("--program_seed", type=int, default=731)
+    parser.add_argument("--program_id", type=int, help="复用该随机程序；仍在接收环境逐项校验物理目标。")
+    parser.add_argument("--program_mirror", action="store_true", help="side_lying按初始倒向镜像固定程序。")
+    parser.add_argument("--recovery_motor_profile", type=Path, help="实测电机JSON；默认读取checkpoint标定快照。")
+    parser.add_argument("--recovery_prior_data", type=Path,
+                        help="Side-Residual策略的program NPZ；须与训练时先验相同。")
+    parser.add_argument("--recovery_prior_program_id", type=int, default=31)
+    parser.add_argument("--recovery_residual_profile",
+                        choices=("auto", "constant", "launch_protected", "upright_release", "settle_feedback"),
+                        default="auto",
+                        help="Side-Residual residual profile；auto从checkpoint谱系读取。")
     parser.add_argument("--program_segment_s", type=float, default=0.5)
     parser.add_argument("--program_active_s", type=float, default=3.0)
     parser.add_argument("--program_leg_fraction", type=float, default=1.0,
@@ -139,6 +185,10 @@ def parse_args():
     parser.add_argument("--demonstration_output", type=Path,
                         help="仅脚本诊断：保存完整严格成功回合的动作前58维观测/实际12维动作，非策略成绩。")
     parser.add_argument("--failure_states", type=Path, help="failure_replay必须使用独立评测池，不能把训练池成绩当泛化。")
+    parser.add_argument(
+        "--failure_states_output", type=Path,
+        help="普通恢复评测另存失败末态NPZ，供后续FailureReplay-Residual微调；目标必须不存在。",
+    )
     parser.add_argument("--allow_training_pool_smoke", action="store_true",
                         help="允许同池或未知来源的接口诊断，结果强制不作为验收通过。")
     parser.add_argument("--settled_initialization", choices=("near_ground", "drop"), default="near_ground",
@@ -162,12 +212,23 @@ def parse_args():
     except ValueError as exc:
         parser.error(str(exc))
     if args.scenario is None and args.recovery_protocol != "controlled_tilt":
-        args.scenario = "upright_fail"
+        args.scenario = ("side_lying" if "Recovery-Side-" in args.task else
+                         "prone" if "Recovery-Upside-" in args.task else "upright_fail")
     if args.num_envs < 1 or args.episodes_per_env < 1:
         parser.error("num_envs 和 episodes_per_env 必须为正")
     args.checkpoint = Path(args.checkpoint).expanduser().resolve()
     if not args.checkpoint.is_file():
         parser.error(f"checkpoint 不存在：{args.checkpoint}")
+    if args.failure_states_output is not None:
+        args.failure_states_output = args.failure_states_output.expanduser().resolve()
+        if args.failure_states_output.exists():
+            parser.error("failure_states_output 已存在，必须选择新文件保留原始失败证据")
+        if args.output is not None and args.failure_states_output == args.output.expanduser().resolve():
+            parser.error("failure_states_output 不能与 output JSON 相同")
+    if args.recovery_prior_data is not None:
+        args.recovery_prior_data = args.recovery_prior_data.expanduser().resolve()
+        if not args.recovery_prior_data.is_file():
+            parser.error(f"recovery_prior_data 不存在：{args.recovery_prior_data}")
     return args
 
 
@@ -182,6 +243,10 @@ def main(args, simulation_app) -> dict:
     from isaaclab_tasks.utils import load_cfg_from_registry
 
     import robot_lab.tasks  # noqa: F401
+    from recovery_contract import (
+        GROUNDED_TASKS, configure_physics, control_contract,
+        is_residual_recovery_task, validate_checkpoint_contract,
+    )
     from robot_lab.tasks.manager_based.upright.mdp.support import support_masks
 
     expected_task = TASKS[args.skill]
@@ -190,17 +255,24 @@ def main(args, simulation_app) -> dict:
     action_program = None
     action_program_joint_names = None
     demonstration_collector = None
+    failure_state_recorder = None
     replay = args.skill == "recovery" and args.recovery_protocol == "failure_replay"
     controlled_tilt = args.skill == "recovery" and args.recovery_protocol == "controlled_tilt"
+    if args.failure_states_output is not None and (
+            args.skill != "recovery" or args.recovery_protocol != "settled_ground"
+            or replay or controlled_tilt or args.diagnostic_action_program):
+        raise ValueError("failure_states_output只用于settled_ground普通策略评测，不能混入重放或脚本诊断")
     # 此分组共用独立控制时钟；controlled_tilt/replay并未经过被动沉降。
     settled = args.skill == "recovery" and args.recovery_protocol in ("settled_ground", "failure_replay", "controlled_tilt")
-    grounded = replay or controlled_tilt or (settled and args.task in (
-        "RobotLab-Isaac-Recovery-Grounded-Parallelogram-Rover-v0",
-        "RobotLab-Isaac-Recovery-Grounded-Progress-Parallelogram-Rover-v0",
-    ))
+    grounded = replay or controlled_tilt or (settled and args.task in GROUNDED_TASKS)
     if settled:
+        replay_task = (
+            "RobotLab-Isaac-Recovery-FailureReplay-Residual-Parallelogram-Rover-v0"
+            if args.task.endswith("FailureReplay-Residual-Parallelogram-Rover-v0") else
+            "RobotLab-Isaac-Recovery-FailureReplay-Parallelogram-Rover-v0"
+        )
         expected_task = ("RobotLab-Isaac-Recovery-ControlledTilt-Parallelogram-Rover-v0" if controlled_tilt else
-                         "RobotLab-Isaac-Recovery-FailureReplay-Parallelogram-Rover-v0" if replay else
+                         replay_task if replay else
                          args.task if grounded else "RobotLab-Isaac-Recovery-Settled-Parallelogram-Rover-v0")
     if args.task != expected_task:
         raise ValueError(f"当前协议需要任务 {expected_task}，实际为 {args.task}")
@@ -233,6 +305,10 @@ def main(args, simulation_app) -> dict:
         hold_time = args.hold_time_s
     env_cfg = load_cfg_from_registry(args.task, "env_cfg_entry_point")
     agent_cfg = load_cfg_from_registry(args.task, "rsl_rl_cfg_entry_point")
+    configure_physics(env_cfg, args.task, getattr(args, "recovery_motor_profile", None), args.checkpoint)
+    recovery_control = control_contract(env_cfg.to_dict(), agent_cfg.to_dict()) if args.skill == "recovery" else None
+    if recovery_control is not None and not args.diagnostic_action_program:
+        validate_checkpoint_contract(args.checkpoint, recovery_control)
     if args.preparation_leg_damping is None:
         freefall = getattr(env_cfg.events, "freefall_init", None)
         args.preparation_leg_damping = freefall.params.get("preparation_leg_damping", 0.0) if freefall else 0.0
@@ -287,6 +363,14 @@ def main(args, simulation_app) -> dict:
             & torch.isfinite(robot.data.joint_pos).all(dim=1)
             & torch.isfinite(robot.data.joint_vel).all(dim=1)
         )
+        if failure_state_recorder is not None:
+            roots = robot.data.root_state_w.clone()
+            roots[:, :3] -= env.scene.env_origins
+            failure_state_recorder.append(
+                roots.cpu().numpy(), robot.data.joint_pos.cpu().numpy(),
+                robot.data.joint_vel.cpu().numpy(), env.action_manager.action.cpu().numpy(),
+                env.episode_length_buf.cpu().tolist(),
+            )
         # 传感器与 articulation 的 body 顺序不同，所有接触查询以传感器命名为准。
         sensor = env.scene.sensors["contact_forces"]
         base_ids, _ = sensor.find_bodies("base_link")
@@ -320,6 +404,7 @@ def main(args, simulation_app) -> dict:
                 robot.data.joint_pos[:, action_program.joint_ids],
                 robot.data.applied_torque[:, action_program.joint_ids],
                 env._recovery_control_active & (env._recovery_control_steps > 0),
+                velocities=robot.data.joint_vel[:, action_program.joint_ids],
             )
         if settled:
             active = env._recovery_control_active & (env._recovery_control_steps > 0)
@@ -362,18 +447,57 @@ def main(args, simulation_app) -> dict:
             "actor_observation_dim": 58, "critic_observation_dim": 70, "action_dim": 12,
             "step_dt": tracker.dt, "policy_config": agent_cfg.to_dict()["policy"],
             "wrapper_raw_clip": agent_cfg.clip_actions,
+            "control_contract": recovery_control,
             "observation_group": env_cfg.observations.policy.to_dict(),
             "action_config": env_cfg.actions.to_dict(),
             "default_joint_state": {"joint_pos": env_cfg.scene.robot.init_state.joint_pos,
                                     "joint_vel": env_cfg.scene.robot.init_state.joint_vel},
         })
-    env = RslRlVecEnvWrapper(gym.make(args.task, cfg=env_cfg), clip_actions=agent_cfg.clip_actions)
+    residual_profile = None
+    if is_residual_recovery_task(args.task):
+        if args.recovery_prior_data is None:
+            raise ValueError("Residual恢复评测必须提供 --recovery_prior_data")
+        from recovery_prior import resolve_checkpoint_prior
+
+        residual_profile = resolve_checkpoint_prior(
+            args.checkpoint, args.recovery_prior_data,
+            program_id=args.recovery_prior_program_id, task=args.task,
+            residual_profile=args.recovery_residual_profile,
+        )
+    elif args.recovery_prior_data is not None:
+        raise ValueError("--recovery_prior_data 只允许用于Residual恢复评测")
+    raw_env = gym.make(args.task, cfg=env_cfg)
+    if is_residual_recovery_task(args.task):
+        from recovery_prior import attach_recovery_prior
+
+        raw_env = attach_recovery_prior(
+            raw_env, args.recovery_prior_data, program_id=args.recovery_prior_program_id,
+            residual_profile=residual_profile,
+        )
+    env = RslRlVecEnvWrapper(raw_env, clip_actions=agent_cfg.clip_actions)
     try:
         joint_names = list(env.unwrapped.scene["robot"].joint_names)
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         runner.load(str(args.checkpoint), load_optimizer=False)
         policy = runner.get_inference_policy(device=env.unwrapped.device)
         obs, _ = env.reset()
+        if args.failure_states_output is not None:
+            from robot_lab.tasks.manager_based.recovery.mdp.failure_states import FailureStateRecorder, file_sha256
+
+            failure_state_recorder = FailureStateRecorder(
+                args.num_envs, env.unwrapped.scene["robot"].joint_names,
+                {
+                    "task": args.task,
+                    "scenario": args.scenario,
+                    "seed": args.seed,
+                    "checkpoint": str(args.checkpoint),
+                    "checkpoint_sha256": file_sha256(args.checkpoint),
+                    "asset_sha256": file_sha256(env_cfg.scene.robot.spawn.asset_path),
+                    "control_dt_s": env.unwrapped.step_dt,
+                    "terrain": "plane",
+                    "initialization": args.recovery_protocol,
+                },
+            )
         if args.diagnostic_action_program:
             from recovery_action_program import program_from_environment
 
@@ -384,8 +508,8 @@ def main(args, simulation_app) -> dict:
                 from recovery_demonstrations import RecoveryDemonstrationCollector
 
                 manager = env.unwrapped.observation_manager
-                if tuple(manager.group_obs_dim["policy"]) != (58,) or tuple(manager.group_obs_dim["critic"]) != (70,):
-                    raise ValueError("实际manager观测尺寸不符合58/70恢复合同")
+                if manager.group_obs_dim["policy"] != (58,) or manager.group_obs_dim["critic"] != (70,):
+                    raise ValueError("示范采集只支持58/70恢复合同；阶段BC请显式转换")
                 demonstration_contract.update({
                     "observation_order": list(manager.active_terms["policy"]),
                     "observation_term_dims": [list(shape) for shape in manager.group_obs_term_dim["policy"]],
@@ -453,11 +577,24 @@ def main(args, simulation_app) -> dict:
                     }
                     for key in ("terminal_root_state_w", "terminal_joint_vel", "terminal_gravity_b"):
                         record[key] = [value if math.isfinite(value) else None for value in phase[key][index]]
+                    if args.skill == "recovery":
+                        record["failure_state"] = _classify_recovery_failure(record)
                     if action_program is not None:
                         record["action_program_diagnostic"] = action_program.episode_metrics(index)
                         action_program.finished[index] = True
                     if demonstration_collector is not None:
                         demonstration_collector.finish_episode(record)
+                    if failure_state_recorder is not None:
+                        failure_state_recorder.finish(
+                            index, failed=not bool(record["success"]),
+                            label={
+                                "env_id": record["env_id"],
+                                "episode_index": record["episode_index"],
+                                "terminated": record["terminated"],
+                                "truncated": record["truncated"],
+                                "failure_state": record.get("failure_state"),
+                            },
+                        )
             runner.alg.policy.reset(dones)
     finally:
         env.close()
@@ -484,11 +621,14 @@ def main(args, simulation_app) -> dict:
         "preparation_leg_damping_nm_s_rad": args.preparation_leg_damping if settled else None,
         "preparation_control_mode": "immediate_takeover" if replay or controlled_tilt else (
             "leg_damping_brake" if args.preparation_leg_damping else "zero_torque") if settled else None,
+        "recovery_residual_profile": residual_profile,
         "joint_names": joint_names,
         "takeover_velocity_x": args.takeover_velocity_x, "takeover_pitch_rate": args.takeover_pitch_rate,
         "upright_initialization": "urdf_collision_clearance_2mm" if args.skill != "recovery" else None,
         "base_contact_force_threshold_n": 1.0,
         "base_contact_fraction": contact_samples / total_samples if total_samples else None,
+        "control_contract": recovery_control,
+        "hardware_feasibility_verified": False,
     })
     if replay:
         result["evaluation_scope"] = pool_separation["scope"]
@@ -507,6 +647,13 @@ def main(args, simulation_app) -> dict:
             "path": str(args.demonstration_output.resolve()), "requested": True,
             "successful_episodes": sum(record["success"] for record in result["episode_results"]),
         }
+    if failure_state_recorder is not None:
+        result["failure_states_output"] = {
+            "path": str(args.failure_states_output.resolve()),
+            "requested": True,
+            "failed_episodes": sum(not record["success"] for record in result["episode_results"]),
+        }
+        result["failure_states_output"].update(failure_state_recorder.save(args.failure_states_output))
     payload = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
     print(payload)
     if args.output is not None:

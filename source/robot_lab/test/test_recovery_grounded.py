@@ -65,6 +65,49 @@ def test_orientation_has_signal_between_supine_side_and_upright(grounded):
     assert reward[0] == 0 and reward[-1] == 1
 
 
+def test_phase_velocity_costs_separate_legs_wheels_and_preparation(grounded):
+    env = environment([math.pi / 2, 0., 0.])
+    env._recovery_joint_groups["wheel"] = torch.arange(8, 12)
+    env.scene["robot"].data.joint_vel[:, :8] = 2.
+    env.scene["robot"].data.joint_vel[:, 8:12] = 3.
+    env.scene["robot"].data.joint_vel[:, 12:] = 999.
+    env._recovery_control_active[2] = False
+    assert grounded.recovery_leg_velocity(env).tolist() == [32., 160., 0.]
+    assert grounded.recovery_phase_wheel_velocity(env).tolist() == [36., 180., 0.]
+
+
+def test_launch_reward_only_accepts_corrected_roll_and_upward_speed(grounded):
+    env = environment([math.pi / 2, math.pi / 2, math.pi / 2])
+    env.device = "cpu"
+    env.step_dt = .02
+    env._recovery_control_steps = torch.tensor([0, 0, 80])
+    data = env.scene["robot"].data
+    data.root_ang_vel_b = torch.zeros(3, 3)
+    data.root_ang_vel_b[:, 0] = torch.tensor([2.0, -2.0, 2.0])
+    data.root_lin_vel_w[:, 2] = torch.tensor([0.8, 0.8, 0.8])
+    data.projected_gravity_b[:] = torch.tensor([[0., 1., 0.], [0., -1., 0.], [0., 1., 0.]])
+    roll = grounded.recovery_launch_roll_rate(env, duration_s=1.2, max_rate=4.)
+    # g_y*omega_x is positive for the first two rows; third row is outside window.
+    assert roll.tolist() == pytest.approx([.5, .5, 0.])
+    vertical = grounded.recovery_launch_vertical_speed(env, duration_s=1.2, max_speed=1.)
+    assert vertical.tolist() == pytest.approx([.8, .8, 0.])
+
+
+def test_progress_rate_survives_reward_manager_dt_scaling(grounded):
+    totals = []
+    for dt in (.01, .02):
+        env = environment([math.pi / 2])
+        env.step_dt = dt
+        grounded.recovery_orientation_progress(env, gain=1., as_rate=True)
+        total = 0.
+        for step in range(1, round(1 / dt) + 1):
+            env.common_step_counter = step
+            env.scene["robot"].data.projected_gravity_b[:, 2] = -step * dt
+            total += grounded.recovery_orientation_progress(env, gain=1., as_rate=True).item() * 2 * dt
+        totals.append(total)
+    assert totals == pytest.approx([2., 2.], abs=1e-5)
+
+
 def test_side_lying_at_target_height_cannot_collect_standing_rewards(grounded):
     env = environment([math.pi / 2, math.pi, 0.0])
     for func in (grounded.recovery_oriented_height, grounded.recovery_oriented_joints,

@@ -67,7 +67,12 @@ from .method1_deng.rewards import (
     recovery_torques,
     recovery_wheel_velocity,
 )
-from .grounded import recovery_height_progress, recovery_orientation_progress
+from .grounded import (
+    recovery_height_progress,
+    recovery_launch_roll_rate,
+    recovery_launch_vertical_speed,
+    recovery_orientation_progress,
+)
 
 # ── method2 — mujoco_playground getup 风格（消融对照基线）──
 from .method2_getup.events import reset_getup
@@ -126,6 +131,10 @@ __all__ = [
     "recovery_success_rate",
     "recovery_orientation_progress",
     "recovery_height_progress",
+    "recovery_launch_roll_rate",
+    "recovery_launch_vertical_speed",
+    "recovery_leg_velocity",
+    "recovery_phase_wheel_velocity",
     # method2 — 事件
     "reset_getup",
     # method2 — 奖励（9 项固定权重 + gate，无 ED/CW）

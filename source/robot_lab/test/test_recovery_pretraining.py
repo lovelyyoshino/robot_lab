@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # @author pony
 # @date 2026-09-17
-# @version v0.1.0
-# @last_modified 2026-09-17
+# @version v0.3.0
+# @last_modified 2026-09-29
 # @changelog
+#   - v0.3.0 (2026-09-29): 覆盖阶段BC、换段加权和只读时钟初始化。
+#   - v0.2.0 (2026-09-28): 按关节尺度映射与镜像源程序重叠验证。
 #   - v0.1.0 (2026-09-17): 覆盖语义合同、回合泄漏、actor-only 拟合与 RSL 安全重载。
 
 """CPU 上验证行为克隆初始化合同；不启动仿真，也不把离线拟合当作技能验收。"""
@@ -53,6 +55,20 @@ class TinyPolicy(nn.Module):
         self.critic = nn.Sequential(nn.Linear(70, 16), nn.ReLU(), nn.Linear(16, 1))
         self.actor_obs_normalizer = nn.Identity()
         self.critic_obs_normalizer = nn.Identity()
+
+
+def test_phase_open_loop_export_ignores_state_but_keeps_critic(pretraining, arrays, configuration):
+    policy = TinyPolicy()
+    policy.actor[0] = nn.Linear(60, 16)
+    policy.critic[0] = nn.Linear(72, 16)
+    original_critic = copy.deepcopy(policy.critic.state_dict())
+    arrays["observations"] = np.pad(arrays["observations"], ((0, 0), (0, 2)))
+    configuration[2]["contract"]["actor_observation_dim"] = 60
+    result = pretraining.fit_actor(policy, arrays, configuration[2], epochs=1, phase_open_loop=True)
+    assert result["phase_open_loop"] is True
+    assert torch.count_nonzero(policy.actor[0].weight[:, :58]) == 0
+    for key, value in policy.critic.state_dict().items():
+        assert torch.equal(value, original_critic[key])
 
 
 @pytest.fixture
@@ -116,6 +132,30 @@ def test_source_contract_accepts_only_evaluation_corruption_difference(pretraini
     pretraining.validate_source_contract(metadata, env, agent, "b" * 64)
     assert metadata == before
     assert env["observations"]["policy"]["enable_corruption"] is True
+
+
+def test_group_scales_are_resolved_by_joint_name(pretraining, configuration):
+    env, agent, metadata = configuration
+    mapping = {"leg_[0-3]": .6109, "leg_[4-7]": 1.57}
+    env["actions"]["joint_pos"]["scale"] = mapping
+    metadata["contract"]["action_config"]["joint_pos"]["scale"] = mapping
+    metadata["contract"]["action_scales"][:8] = [.6109] * 4 + [1.57] * 4
+    pretraining.validate_source_contract(metadata, env, agent, "b" * 64)
+    env["actions"]["joint_pos"]["scale"] = {"leg_.*": .6, "leg_1": .4}
+    with pytest.raises(ValueError):
+        pretraining._validate_action_vectors(metadata["contract"], env)
+
+
+def test_repeated_program_does_not_look_like_independent_experts(pretraining, configuration):
+    train = configuration[2]
+    validation = copy.deepcopy(train)
+    train["source"]["action_program"] = {"source_program_ids": [31] * 128}
+    validation["source"]["action_program"] = {"source_program_ids": [31] * 128}
+    validation["source"]["seed"] = 842
+    validation["source_evaluation_sha256"] = "c" * 64
+    result = pretraining.validate_dataset_separation(train, validation, "train", "validation")
+    assert result["train_program_ids"] == [31]
+    assert result["program_overlap"] == [31]
 
 
 @pytest.mark.parametrize("mutation", [
@@ -306,3 +346,23 @@ def test_nonfinite_source_checkpoint_is_rejected_before_mutation(pretraining):
         pretraining.load_source_policy(policy, checkpoint)
     for key, tensor in policy.state_dict().items():
         assert torch.equal(tensor, before[key])
+
+
+def test_transition_weights_do_not_cross_episode_boundaries(pretraining, arrays, configuration):
+    weights, groups = pretraining.transition_weights(arrays, configuration[2], weight=8., window=1)
+    for offset in (0, 250):
+        assert weights[offset] == 8 and weights[offset + 1] == 8
+        assert weights[offset + 24:offset + 27].tolist() == [8., 8., 8.]
+        assert weights[offset + 149:offset + 152].tolist() == [8., 8., 8.]
+        assert weights[offset + 249] == 1
+    assert sum(int(mask.sum()) for mask in groups.values()) == 500
+    with pytest.raises(ValueError):
+        pretraining.transition_weights(arrays, configuration[2], weight=float("nan"), window=1)
+
+
+def test_phase_metrics_expose_switch_errors(pretraining, arrays, configuration):
+    result = pretraining.fit_actor(TinyPolicy(), arrays, configuration[2], epochs=1, transition_weight=8.)
+    metrics = result["train_final"]["phase_metrics"]
+    assert metrics["transition_window"]["samples"] > 0
+    assert len(metrics["transition_window"]["physical_rmse_per_action"]) == 12
+    assert result["transition_weight"] == 8.

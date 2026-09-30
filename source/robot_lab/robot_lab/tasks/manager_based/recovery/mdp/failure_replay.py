@@ -3,8 +3,9 @@
 @author pony
 @date 2026-09-17
 @version v0.1.0
-@last_modified 2026-09-17
+@last_modified 2026-09-30
 @changelog
+    - v0.2.0 (2026-09-30): 允许Residual失败微调重放超时失败的运动学末态；旧任务仍默认terminated。
     - v0.1.0 (2026-09-17): 显式数据路径、合同校验、局部复位及首步立即控制。
 """
 
@@ -22,7 +23,7 @@ def validate_replay_limits(positions, hard_limits):
         raise ValueError("失败池关节位置超出当前模型物理硬限位")
 
 
-def reset_failure_state(env, env_ids, failure_state_path: str = ""):
+def reset_failure_state(env, env_ids, failure_state_path: str = "", failure_kind: str = "terminated"):
     """只平移记录的世界水平位置；高度/姿态/根与关节速度不变，不插入沉降。
 
     失败末态可能仍在倾倒途中，正是即时接管需要的分布。数据来自同URDF的
@@ -30,6 +31,8 @@ def reset_failure_state(env, env_ids, failure_state_path: str = ""):
     """
     if not failure_state_path:
         raise ValueError("FailureReplay任务必须显式指定 events.reset_fall_pose.params.failure_state_path")
+    if failure_kind not in ("all", "terminated"):
+        raise ValueError("failure_kind必须为all或terminated")
     if len(env_ids) == 0:
         return
     robot = env.scene["robot"]
@@ -37,9 +40,11 @@ def reset_failure_state(env, env_ids, failure_state_path: str = ""):
         raise ValueError("失败状态重放当前只支持与采集一致的平地")
     cache = getattr(env, "_failure_state_pool", None)
     if cache is None:
-        pool = load_failure_states(failure_state_path, robot.joint_names,
-                                   asset_sha256=file_sha256(robot.cfg.spawn.asset_path), control_dt_s=env.step_dt,
-                                   failure_kind="terminated")
+        pool = load_failure_states(
+            failure_state_path, robot.joint_names,
+            asset_sha256=file_sha256(robot.cfg.spawn.asset_path), control_dt_s=env.step_dt,
+            failure_kind=failure_kind,
+        )
         cache = {key: torch.as_tensor(pool[key], dtype=robot.data.joint_pos.dtype, device=env.device)
                  for key in ("root_state", "joint_pos", "joint_vel")}
         validate_replay_limits(cache["joint_pos"], robot.data.joint_pos_limits[0])
@@ -53,9 +58,10 @@ def reset_failure_state(env, env_ids, failure_state_path: str = ""):
         if (cache["root_state"][:, 2] < minimum_z - .01).any():
             raise ValueError("失败池出现超过1cm的几何穿透，拒绝通过抬高初态隐藏问题")
         cache["path"] = failure_state_path
+        cache["failure_kind"] = failure_kind
         cache["sha256"] = pool["sha256"]
         env._failure_state_pool = cache
-    elif cache["path"] != failure_state_path:
+    elif cache["path"] != failure_state_path or cache.get("failure_kind", "terminated") != failure_kind:
         raise ValueError("不能在局部reset时更换失败状态池")
     selected = torch.randint(len(cache["root_state"]), (len(env_ids),), device=env.device)
     roots = cache["root_state"][selected].clone()

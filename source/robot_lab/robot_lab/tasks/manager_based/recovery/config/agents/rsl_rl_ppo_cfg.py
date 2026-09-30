@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # @author pony
 # @date 2026-08-25
-# @version v0.7.0
-# @last_modified 2026-09-17
+# @version v0.8.0
+# @last_modified 2026-09-28
 # @changelog
+#   - v0.10.0 (2026-09-30): 增加失败末态重放的60/72维 residual 微调 runner。
+#   - v0.9.0 (2026-09-30): 增加program31先验+有界residual的直接PPO runner。
+#   - v0.8.0 (2026-09-28): 侧躺/翻覆专用非ED探索配置；不改变已有任务超参数。
 #   - v0.7.0 (2026-09-17): 连续横滚即时控制预训练独立日志，网络/PPO保持Grounded基线合同。
 #   - v0.6.0 (2026-09-17): Progress沿用基线PPO参数，只改变shaping以隔离实验变量。
 #   - v0.5.0 (2026-09-17): 增加独立 grounded progress shaping 实验 runner。
@@ -122,3 +125,67 @@ class ParallelogramRoverFailureReplayPPORunnerCfg(ParallelogramRoverRecoveryPPOR
 
     experiment_name = "parallelogram_rover_recovery_failure_replay"
     run_name = "failure_replay"
+
+
+@configclass
+class ParallelogramRoverSideRecoveryPPORunnerCfg(ParallelogramRoverRecoveryPPORunnerCfg):
+    """非ED任务的独立探索起点，参数需闭环消融验证，不修改参考EDRS基线。"""
+
+    experiment_name = "parallelogram_rover_recovery_side"
+    run_name = "side_progress"
+
+    def __post_init__(self):
+        self.algorithm.entropy_coef = 0.005
+        self.algorithm.learning_rate = 3.0e-4
+        self.algorithm.schedule = "fixed"
+
+
+@configclass
+class ParallelogramRoverUpsideRecoveryPPORunnerCfg(ParallelogramRoverSideRecoveryPPORunnerCfg):
+    """与侧躺保持控制兼容，隔离尚未验证可达性的翻覆实验产物。"""
+
+    experiment_name = "parallelogram_rover_recovery_upside"
+    run_name = "upside_experimental"
+
+
+@configclass
+class ParallelogramRoverSidePhasePPORunnerCfg(ParallelogramRoverSideRecoveryPPORunnerCfg):
+    """阶段BC的保守微调起点；不把探索噪声奖励当作恢复任务奖励。"""
+
+    experiment_name = "parallelogram_rover_recovery_side_phase"
+    run_name = "side_phase"
+    save_interval = 50
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.algorithm.learning_rate = 3e-5
+        self.algorithm.entropy_coef = 0.0
+
+
+@configclass
+class ParallelogramRoverSideResidualPPORunnerCfg(ParallelogramRoverSidePhasePPORunnerCfg):
+    """program31 先验 + 有界 residual 的直接 PPO 起点。
+
+    该任务不从 BC checkpoint resume：脚本先验在 action wrapper 中执行，Actor 的
+    均值由训练入口置零，PPO 只学习 tanh residual。保留 phase/initial_side 观测，
+    但不再使用 open-loop BC 的状态屏蔽逻辑。
+    """
+
+    experiment_name = "parallelogram_rover_recovery_side_residual"
+    run_name = "side_residual"
+    save_interval = 100
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.algorithm.learning_rate = 3e-4
+        self.algorithm.entropy_coef = 0.001
+        self.algorithm.schedule = "fixed"
+
+
+@configclass
+class ParallelogramRoverFailureReplayResidualPPORunnerCfg(ParallelogramRoverSideResidualPPORunnerCfg):
+    """从真实失败末态继续优化 residual；保持与Side-Residual同一网络合同。"""
+
+    experiment_name = "parallelogram_rover_recovery_failure_replay_residual"
+    run_name = "failure_replay_residual"
+    save_interval = 50

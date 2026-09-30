@@ -1,0 +1,20 @@
+{
+  "schema": "rover_recovery_motor_profile_v1",
+  "status": "unverified",
+  "parameter_frame": "joint_output",
+  "source_evidence": "",
+  "measurement_date": null,
+  "units": {
+    "stiffness": "N*m/rad",
+    "damping": "N*m*s/rad",
+    "effort_limit_nm": "N*m",
+    "saturation_effort_nm": "N*m",
+    "no_load_speed_rad_s": "rad/s",
+    "velocity_limit_rad_s": "rad/s"
+  },
+  "groups": {
+    "suspension": {"stiffness": null, "damping": null, "effort_limit_nm": null, "saturation_effort_nm": null, "no_load_speed_rad_s": null, "velocity_limit_rad_s": null},
+    "steering": {"stiffness": null, "damping": null, "effort_limit_nm": null, "saturation_effort_nm": null, "no_load_speed_rad_s": null, "velocity_limit_rad_s": null},
+    "wheels": {"stiffness": null, "damping": null, "effort_limit_nm": null, "saturation_effort_nm": null, "no_load_speed_rad_s": null, "velocity_limit_rad_s": null}
+  }
+}

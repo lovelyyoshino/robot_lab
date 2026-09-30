@@ -2,9 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # @author pony
 # @date 2026-09-16
-# @version v0.3.0
-# @last_modified 2026-09-16
+# @version v0.10.0
+# @last_modified 2026-09-30
 # @changelog
+#   - v0.10.0 (2026-09-30): 支持settle_feedback，统一校验profile数值与残差门控合同。
+#   - v0.8.0 (2026-09-30): 回放支持FailureReplay-Residual并在创建环境前注入失败池。
+#   - v0.9.0 (2026-09-30): 回放校验Residual先验NPZ哈希，阻止动作表静默漂移。
+#   - v0.7.0 (2026-09-30): 支持 upright_release 先验释放消融并校验 profile。
+#   - v0.6.0 (2026-09-30): 回放自动读取训练时 residual profile，阻止 wrapper 配置错配。
+#   - v0.5.0 (2026-09-30): 回放/导出支持Side-Residual先验动作合成。
+#   - v0.4.0 (2026-09-28): 恢复回放自动加载标定快照并拒绝动作/观测/物理合同错配。
 #   - v0.3.0 (2026-09-16): 深度策略导出携带对应预处理/时间合同，避免4141维变体误用。
 #   - v0.2.0 (2026-09-16): 增加有限步回放、视觉相机自动开启，并关闭正确的推扰事件。
 #   - v0.1.0 (2026-09-16): 兼容无 locomotion 随机化/curriculum 的 recovery 与 upright 任务。
@@ -20,6 +27,7 @@
 
 import argparse
 import sys
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
@@ -36,6 +44,18 @@ parser.add_argument(
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--max_steps", type=int, default=None, help="可选的回放步数，适合无界面导出检查。")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument("--recovery_motor_profile", type=str, default=None,
+                    help="恢复电机实测配置；省略时自动读取checkpoint对应的标定快照。")
+parser.add_argument("--recovery_prior_data", type=str, default=None,
+                    help="Residual恢复回放使用的成功 program NPZ；须与训练时相同。")
+parser.add_argument("--failure_states", type=Path, default=None,
+                    help="FailureReplay-Residual 回放使用的失败状态池 NPZ；须与微调时相同。")
+parser.add_argument("--recovery_prior_program_id", type=int, default=31,
+                    help="Side-Residual 回放使用的固定动作程序编号，默认31。")
+parser.add_argument("--recovery_residual_profile",
+                    choices=("auto", "constant", "launch_protected", "upright_release", "settle_feedback"),
+                    default="auto",
+                    help="Side-Residual residual profile；auto从checkpoint的params/recovery_residual_runtime.json读取。")
 parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
@@ -176,8 +196,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     log_dir = os.path.dirname(resume_path)
 
+    from recovery_contract import configure_failure_replay_env, is_residual_recovery_task
+
+    residual_task = is_residual_recovery_task(args_cli.task)
+    configure_failure_replay_env(env_cfg, args_cli.task, args_cli.failure_states)
+    residual_profile = args_cli.recovery_residual_profile
+    if residual_task:
+        if args_cli.recovery_prior_data is None:
+            raise ValueError("Residual恢复回放必须提供 --recovery_prior_data")
+        from recovery_prior import resolve_checkpoint_prior
+
+        residual_profile = resolve_checkpoint_prior(
+            resume_path, args_cli.recovery_prior_data,
+            program_id=args_cli.recovery_prior_program_id, task=args_cli.task,
+            residual_profile=residual_profile,
+        )
+
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
+
+    from recovery_contract import configure_physics, control_contract, is_rover_recovery, validate_checkpoint_contract
+
+    configure_physics(env_cfg, args_cli.task, args_cli.recovery_motor_profile, resume_path)
+    recovery_control = control_contract(env_cfg.to_dict(), agent_cfg.to_dict()) if is_rover_recovery(args_cli.task) else None
+    if recovery_control is not None:
+        validate_checkpoint_contract(resume_path, recovery_control)
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -185,6 +228,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
+
+    if residual_task:
+        from recovery_prior import attach_recovery_prior
+
+        env = attach_recovery_prior(
+            env, args_cli.recovery_prior_data, program_id=args_cli.recovery_prior_program_id,
+            residual_profile=residual_profile,
+        )
+    elif args_cli.recovery_prior_data is not None:
+        raise ValueError("--recovery_prior_data 只允许用于Residual恢复任务")
 
     # wrap for video recording
     if args_cli.video:
@@ -216,6 +269,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # export the trained policy to JIT and ONNX formats
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+    if recovery_control is not None:
+        os.makedirs(export_model_dir, exist_ok=True)
+        with open(os.path.join(export_model_dir, "recovery_control_contract.json"), "w", encoding="utf-8") as stream:
+            json.dump({"contract": recovery_control, "deployment_verified": False,
+                       "warning": "新动作尺度不可配旧rl_sar YAML；需独立runtime和sim2sim验收。"},
+                      stream, ensure_ascii=False, indent=2, allow_nan=False)
 
     if version.parse(installed_version) >= version.parse("4.0.0"):
         # use the new export functions for rsl-rl >= 4.0.0

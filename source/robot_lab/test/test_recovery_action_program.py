@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-09-17
-@version v0.2.0
-@last_modified 2026-09-17
+@version v0.3.0
+@last_modified 2026-09-28
 @changelog
+    - v0.3.0 (2026-09-28): 镜像物理符号、接收限位、速度功率与CLI防误用回归。
     - v0.2.0 (2026-09-17): 实际关节响应统计须排除准备、非有限值和已结束样本。
     - v0.1.0 (2026-09-17): 覆盖分段动作生成与正式技能验收隔离。
 """
@@ -126,6 +127,56 @@ def test_zero_amplitude_program_is_default_pd_not_zero_torque():
     result = {"passed": False}
     program.mark_diagnostic(result)
     assert result["action_program"]["hold_mode"] == "zero_raw_action_default_pose_active_pd"
+
+
+def test_fixed_program_mirror_uses_physical_targets_then_inverse_scales():
+    program = make_program(scales=torch.tensor([.6] * 4 + [1.2] * 4 + [10.] * 4))
+    original = program.targets[1].clone()
+    mask = torch.tensor([False, True, False])
+    program.select_program(1, mask)
+    reflected = original[:, [2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9]].clone()
+    reflected[:, 4:8] *= -1
+    torch.testing.assert_close(program.targets[0], original)
+    torch.testing.assert_close(program.targets[1], reflected)
+    torch.testing.assert_close(program.raw_actions * program.scales[:, None] + program.defaults[:, None], program.targets)
+    result = {"passed": True}
+    program.mark_diagnostic(result)
+    assert result["action_program"]["source_program_ids"] == [1, 1, 1]
+    assert result["action_program"]["mirrored"] == [False, True, False]
+    assert result["passed"] is False
+
+
+def test_each_random_candidate_can_be_mirrored_without_changing_program_identity():
+    program = make_program()
+    original = program._candidate_targets.clone()
+    mask = torch.tensor([False, True, True])
+    program.mirror_candidates(mask)
+    reflected = original[:, :, [2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9]].clone()
+    reflected[:, :, 4:8] *= -1
+    torch.testing.assert_close(program.targets[0], original[0])
+    torch.testing.assert_close(program.targets[1:], reflected[1:])
+    assert program.source_program_ids == [0, 1, 2]
+    assert program.mirrored.tolist() == [False, True, True]
+
+
+def test_mirror_cannot_bypass_target_limits():
+    program = make_program()
+    program.leg_limits[1, 0] = torch.tensor([-.001, .001])
+    before = program.targets.clone()
+    with pytest.raises(ValueError, match="限位"):
+        program.select_program(0, torch.tensor([False, True, False]))
+    torch.testing.assert_close(program.targets, before)
+
+
+def test_joint_velocity_and_power_are_model_estimates_at_control_rate():
+    program = make_program()
+    program.observe_joints(torch.zeros(3, 12), torch.ones(3, 12) * 4,
+                           torch.tensor([True, False, True]), velocities=torch.ones(3, 12) * -3)
+    report = program.episode_metrics(0)
+    assert report["maximum_joint_velocity_rad_s"] == [3.] * 12
+    assert report["maximum_actuator_estimated_power_w"] == [12.] * 12
+    assert report["response_sampling"] == "control_step_not_physics_substep_peak"
+    assert program.episode_metrics(1)["maximum_joint_velocity_rad_s"] == [0.] * 12
 
 
 def test_joint_response_statistics_exclude_preparation_finished_and_nonfinite():

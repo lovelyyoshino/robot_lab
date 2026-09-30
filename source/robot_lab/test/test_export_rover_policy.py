@@ -30,9 +30,57 @@ def exporter_module():
 
 @pytest.fixture
 def real_config(exporter_module):
-    safe_yaml = exporter_module._module(exporter_module.WARM_START, "export_test_safe_yaml")
-    run_dir = Path(__file__).parents[3] / "logs/rsl_rl/parallelogram_rover_upright_motion/2026-09-17_00-21-54_geometry_support_motion_validation"
-    return safe_yaml.load_training_config(run_dir / "params/agent.yaml"), safe_yaml.load_training_config(run_dir / "params/env.yaml")
+    """Return a self-contained motion contract instead of a deleted run artifact.
+
+    The exporter tests exercise the semantic validator, not a particular training
+    run.  Keeping the fixture in the test makes it reproducible after old logs are
+    cleaned and prevents a missing experiment directory from masking regressions.
+    """
+    def term(name, *, params=None):
+        if name in ("pitch_command", "motion_command"):
+            func = "isaaclab.envs.mdp.observations:generated_commands"
+            params = {"command_name": name}
+        elif name == "last_action":
+            func = "isaaclab.envs.mdp.observations:last_action"
+            params = {}
+        elif name == "priv_wheel_contact":
+            func = "robot_lab.tasks.manager_based.upright.mdp.observations:priv_wheel_contact"
+            params = {"sensor_cfg": {"name": "contact_forces", "body_names": "^(fl|rl|fr|rr)_wheel$"}}
+        else:
+            func = exporter_module.ASSET_FUNCTIONS[name]
+            params = {"asset_cfg": {"name": "robot", "preserve_order": False}}
+        return {
+            "func": func, "params": params, "modifiers": None, "noise": None,
+            "clip": None, "scale": None, "history_length": 0, "flatten_history_dim": True,
+        }
+
+    policy_terms = {name: term(name) for name in exporter_module.POLICY_TERMS}
+    critic_terms = {name: term(name) for name in exporter_module.CRITIC_TERMS}
+    agent = {
+        "class_name": "OnPolicyRunner",
+        "empirical_normalization": None,
+        "obs_groups": {},
+        "policy": {
+            "class_name": "ActorCritic", "init_noise_std": 1.0, "noise_std_type": "scalar",
+            "actor_obs_normalization": False, "critic_obs_normalization": False,
+            "actor_hidden_dims": [128, 128, 128], "critic_hidden_dims": [128, 128, 128],
+            "activation": "elu",
+        },
+    }
+    actions = {
+        "joint_pos": {"joint_names": list(exporter_module.JOINT_POS), "scale": 0.25, "offset": 0.0},
+        "joint_vel": {"joint_names": list(exporter_module.JOINT_VEL), "scale": 0.8, "offset": 0.0},
+    }
+    default = {"joint_pos": dict(exporter_module.DEFAULT_JOINT_STATE),
+               "joint_vel": dict(exporter_module.DEFAULT_JOINT_STATE)}
+    env = {
+        "observations": {"policy": policy_terms, "critic": critic_terms},
+        "actions": actions,
+        "scene": {"robot": {"init_state": default}},
+        "sim": {"dt": 0.005},
+        "decimation": 4,
+    }
+    return agent, env
 
 
 def test_contract_accepts_real_motion_yaml(exporter_module, real_config):
