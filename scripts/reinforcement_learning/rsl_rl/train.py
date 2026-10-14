@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # @author pony
 # @date 2026-09-16
-# @version v0.22.0
-# @last_modified 2026-09-30
+# @version v0.24.0
+# @last_modified 2026-10-09
 # @changelog
+#   - v0.24.0 (2026-10-09): 识别DaggerDistillation为蒸馏算法，续训时对齐其衰减进度。
+#   - v0.23.0 (2026-09-30): Preview视觉任务在创建环境前验证teacher/student语义并保存合同。
 #   - v0.22.0 (2026-09-30): 续训校验先验语义；显式权重迁移支持settle_feedback新实验。
 #   - v0.20.0 (2026-09-30): 允许FailureReplay-Residual使用同一先验和60/72维Actor微调。
 #   - v0.21.0 (2026-09-30): Residual先验谱系记录NPZ哈希，阻止回放时静默替换动作表。
@@ -188,6 +190,9 @@ from experiment_lineage import (
 # import logger
 logger = logging.getLogger(__name__)
 
+# DaggerDistillation 只改变采样驱动者，仍需加载teacher并走蒸馏谱系/合同校验。
+DISTILLATION_ALGORITHMS = {"Distillation", "DaggerDistillation"}
+
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -298,7 +303,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.log_dir = log_dir
 
     # save resume path before creating a new log_dir
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+    if agent_cfg.resume or agent_cfg.algorithm.class_name in DISTILLATION_ALGORITHMS:
         requested_checkpoint = os.path.expanduser(str(agent_cfg.load_checkpoint))
         if os.path.isfile(requested_checkpoint):
             # 起立第二阶段与视觉蒸馏需要跨 experiment 加载教师/前一阶段权重。
@@ -333,6 +338,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     recovery_control = control_contract(env_cfg.to_dict(), agent_cfg.to_dict()) if is_rover_recovery(args_cli.task) else None
     if recovery_control is not None and recovery_source is not None:
         validate_checkpoint_contract(recovery_source, recovery_control)
+
+    from vision_contract import contract_for_cfg, save_contract, validate_checkpoint
+
+    preview_contract = contract_for_cfg(args_cli.task, env_cfg, agent_cfg)
+    if preview_contract is not None and (agent_cfg.resume or agent_cfg.algorithm.class_name in DISTILLATION_ALGORITHMS):
+        validate_checkpoint(resume_path, preview_contract, teacher_source=not agent_cfg.resume)
 
     # 在加载/尺度/物理合同确认后才创建环境；与旧行驶/视觉任务完全隔离。
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -429,7 +440,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print("[INFO]: Initialized teacher actor 45→232 and unchanged critic235; optimizer/iteration remain new.")
     resume_lineage = None
     # load the checkpoint
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+    if agent_cfg.resume or agent_cfg.algorithm.class_name in DISTILLATION_ALGORITHMS:
         resume_lineage = checkpoint_source_metadata(
             resume_path,
             load_mode="resume" if agent_cfg.resume else "distillation_teacher",
@@ -439,6 +450,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+        if agent_cfg.resume and agent_cfg.algorithm.class_name == "DaggerDistillation":
+            # checkpoint保存的是从0计数的已完成迭代；从下一轮继续，驱动比例和学习率不重启。
+            runner.current_learning_iteration += 1
+            runner.alg.num_updates = runner.current_learning_iteration
     if args_cli.resume_learning_rate is not None and (
         not agent_cfg.resume or agent_cfg.algorithm.class_name != "PPO"
     ):
@@ -476,6 +491,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+    save_contract(Path(log_dir) / "params", preview_contract)
     if recovery_control is not None:
         save_control_contract(Path(log_dir) / "params", recovery_control)
         save_physics_evidence(Path(log_dir) / "params", env_cfg, recovery_profile)
@@ -492,7 +508,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         from robot_lab.tasks.manager_based.recovery.mdp.failure_states import snapshot_training_pools
 
         # 普通恢复阶段也继承来源；FailureReplay→Grounded→FailureReplay 不得遗忘旧池。
-        source_checkpoint = (resume_path if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation"
+        source_checkpoint = (resume_path if agent_cfg.resume or agent_cfg.algorithm.class_name in DISTILLATION_ALGORITHMS
                              else args_cli.recovery_residual_warm_start)
         snapshot_training_pools(Path(log_dir) / "params", failure_pool, source_checkpoint)
     if warm_start_metadata is not None:

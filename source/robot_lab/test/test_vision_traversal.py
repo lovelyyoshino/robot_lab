@@ -3,8 +3,10 @@
 @author pony
 @date 2026-09-17
 @version v0.4.0
-@last_modified 2026-09-17
+@last_modified 2026-10-14
 @changelog
+    - (2026-10-14): 验证实际登顶高度、连续稳定截断、世界路线和失败重置隔离。
+    - (2026-10-10): 检查评测入口在关闭Kit前打印错误，并区分通过、能力失败和执行失败退出码。
     - v0.4.0 (2026-09-17): 覆盖 v4 地形过滤归属、真实质量、轮承重、非轮/无支撑失败关闭。
     - v0.3.0 (2026-09-17): 区分窄沟合法全正无穷未命中与损坏扫描，禁止把跨沟直接判失败。
     - v0.2.0 (2026-09-17): 增加单射线失效、派生状态失效、平台偏置与通行边界回归。
@@ -23,7 +25,9 @@ import torch
 def evaluator(monkeypatch):
     directory = Path(__file__).parents[3] / "scripts/reinforcement_learning/rsl_rl"
     monkeypatch.syspath_prepend(str(directory))
-    spec = importlib.util.spec_from_file_location("vision_traversal_test", directory / "evaluate_parallelogram_vision.py")
+    spec = importlib.util.spec_from_file_location(
+        "vision_traversal_test", directory / "evaluate_parallelogram_vision.py",
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -57,8 +61,10 @@ def make_env(*, ground_z=0.0, origin_z=1.0, root_z=0.33):
             body_names=[name], cfg=SimpleNamespace(filter_prim_paths_expr=["/World/ground/terrain/mesh"]),
             contact_physx_view=SimpleNamespace(filter_count=1), data=SimpleNamespace(force_matrix_w=force),
         )
-    cfg = SimpleNamespace(sim=SimpleNamespace(gravity=(0.0, 0.0, -9.81)),
-                          scene=SimpleNamespace(terrain=SimpleNamespace(terrain_type="generator", prim_path="/World/ground")))
+    cfg = SimpleNamespace(
+        sim=SimpleNamespace(gravity=(0.0, 0.0, -9.81)),
+        scene=SimpleNamespace(terrain=SimpleNamespace(terrain_type="generator", prim_path="/World/ground")),
+    )
     return SimpleNamespace(scene=scene, cfg=cfg, num_envs=1)
 
 
@@ -125,6 +131,37 @@ def test_progress_and_lane_gates_still_apply_on_descending_terrain(evaluator, x,
 def test_unknown_terrain_cannot_silently_disable_the_height_gate(evaluator):
     with pytest.raises(ValueError, match="未知视觉评测地形"):
         evaluator.capture_traversal(make_env(), scenario="gap")
+
+
+def test_preview_stairs_require_real_top_and_confirm_before_success_reset(evaluator):
+    env = make_env(origin_z=0., ground_z=0.0)
+    env.scene["robot"].data.root_quat_w = torch.tensor([[1., 0., 0., 0.]])
+    env.scene["robot"].data.root_lin_vel_w = torch.tensor([[.3, 0., 0.]])
+    env.cfg.vision_evaluation_protocol = {"target_distance_m": 2.6, "command_velocity_m_s": .3,
+                                          "total_height_m": .36, "hold_time_s": .5}
+    env.episode_length_buf = torch.tensor([2])
+    env.step_dt = .02
+    evaluator.capture_traversal(env, scenario="pyramid_stairs_inv")
+    assert env._vision_eval_sample[0] == [False]
+    env.scene.sensors["height_scanner_base"].data.ray_hits_w[..., 2] = .36
+    for _ in range(24):
+        evaluator.capture_traversal(env, scenario="pyramid_stairs_inv")
+    assert not evaluator.traversal_complete(env).item()
+    evaluator.capture_traversal(env, scenario="pyramid_stairs_inv")
+    assert evaluator.traversal_complete(env).item()
+    env.episode_length_buf.fill_(1)
+    evaluator.capture_traversal(env, scenario="pyramid_stairs_inv")
+    assert not evaluator.traversal_complete(env).item()
+    env.scene["robot"].data.root_quat_w = torch.tensor([[0., 0., 0., 1.]])
+    evaluator.capture_traversal(env, scenario="pyramid_stairs_inv")
+    assert env._vision_eval_sample[0] == [False]
+
+
+def test_step_scenarios_select_obstructed_front_wheels(evaluator):
+    assert evaluator.STEP_FRONT_WHEELS == {
+        "single_step": (0, 1), "single_step_left": (0,), "single_step_right": (1,),
+    }
+    assert set(evaluator.STEP_FRONT_WHEELS).issubset(evaluator.SCENARIOS)
 
 
 def test_gap_allows_geometric_no_return_without_allowing_fall_or_corrupt_scan(evaluator):
@@ -290,7 +327,8 @@ def test_sensor_configuration_is_one_body_to_exact_terrain_not_self(evaluator, m
     asset = tmp_path / "rover.urdf"
     names = ["base_link", "fl_wheel", "rl_wheel", "fr_wheel", "rr_wheel", "fixed_payload"]
     asset.write_text('<robot>' + ''.join(f'<link name="{name}"/>' for name in names)
-                     + '<joint name="mount" type="fixed"><parent link="base_link"/><child link="fixed_payload"/></joint>'
+                     + '<joint name="mount" type="fixed"><parent link="base_link"/>'
+                     + '<child link="fixed_payload"/></joint>'
                      + '</robot>')
     cfg = SimpleNamespace(scene=SimpleNamespace(
         robot=SimpleNamespace(spawn=SimpleNamespace(asset_path=str(asset), activate_contact_sensors=True,
@@ -314,3 +352,39 @@ def test_all_body_mass_shape_is_required_not_only_wheel_mass(evaluator):
     env.scene["robot"].root_physx_view.get_masses = lambda: torch.ones(1, 4)
     with pytest.raises(ValueError, match="全部机器人刚体"):
         evaluator.capture_traversal(env, scenario="boxes")
+
+
+@pytest.mark.parametrize("outcome,exit_code", [(True, 0), (False, 1), ("error", 2)])
+def test_evaluator_entrypoint_reports_errors_before_shutdown(monkeypatch, capsys, outcome, exit_code):
+    import ast
+    import sys
+    import traceback
+    from types import ModuleType
+
+    path = Path(__file__).parents[3] / "scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py"
+    tree = ast.parse(path.read_text())
+    entrypoint = next(node for node in tree.body if isinstance(node, ast.If))
+    stopped = []
+
+    def close():
+        stopped.append(capsys.readouterr().err)
+
+    app = SimpleNamespace(app=SimpleNamespace(post_quit=stopped.append), close=close)
+    app_module = ModuleType("isaaclab.app")
+    app_module.AppLauncher = lambda args: SimpleNamespace(app=app)
+    monkeypatch.setitem(sys.modules, "isaaclab", ModuleType("isaaclab"))
+    monkeypatch.setitem(sys.modules, "isaaclab.app", app_module)
+
+    def evaluate(args, simulation):
+        if outcome == "error":
+            raise RuntimeError("checkpoint contract mismatch")
+        return {"passed": outcome}
+
+    # 执行真实入口的控制流，但替换仿真启动，避免关闭测试进程或占用GPU。
+    namespace = {"parse_args": lambda: None, "main": evaluate, "sys": sys, "traceback": traceback}
+    with pytest.raises(SystemExit) as stopped_process:
+        exec(compile(ast.Module(body=entrypoint.body, type_ignores=[]), str(path), "exec"), namespace)
+    assert stopped_process.value.code == exit_code
+    assert stopped[0] == exit_code
+    assert len(stopped) == 2
+    assert ("RuntimeError: checkpoint contract mismatch" in stopped[1]) is (outcome == "error")

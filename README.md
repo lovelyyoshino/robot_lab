@@ -256,6 +256,220 @@ BeyondMimic for Unitree G1:
   python scripts/reinforcement_learning/rsl_rl/play.py --task=RobotLab-Isaac-BeyondMimic-Flat-Unitree-G1-v0 --num_envs 2
   ```
 
+<a id="rover-vision-preview"></a>
+
+### 平行四边形轮式车：视觉前瞻抬轮与楼梯攀爬（实验性）
+
+当前目标是保持前进方向、接近障碍后主动抬轮并稳定越过。全宽允许左或右前轮先主动抬起，另一轮主动或被动滚上；左右窄障碍仍检查对应侧，不固定左先，不训练跳跃。真正起抬偏好为轮胎前缘距障碍约10cm（有效8–14cm）；65cm用于感知，25cm内允许接地减载准备。
+
+Teacher为232维高度扫描策略；Student为4141维本体信息＋深度历史策略。流程为Teacher PPO → 单障碍动作验收和8/12/16cm楼梯验收 → Student DAgger动作蒸馏 → 独立Student评测与深度消融。一个Teacher网络自动训练多个阶段，8000轮是总预算。
+
+| 阶段 | 地形行 | 每级高度／级数 | 楼梯抽样占比 |
+|---|---|---|---|
+| stage1 | 0–2 | 8cm／2级 | 20% |
+| stage2 | 3–5 | 12cm／3级 | 40% |
+| stage3 | 6–8 | 16cm／4级 | 55% |
+
+每阶段同时包含全宽、左右窄障碍、楼梯、方块及少量平地。晋级要求两次合格的稳定通行；跨stage必须通过本档楼梯，平地不晋级。全宽不再用双侧主动动作卡住课程。楼梯有1.2m接近段、40cm踏面及顶端平台，每一级重新识别前缘并提供一次动作机会，禁止同阶跺脚重复领奖。
+
+当前课程、奖励和终止条件与旧合同不同，旧合同模型需要重新训练；保留原模型与报告。2026-10-14已完成当前合同的8000轮Teacher：8cm楼梯通行100%、12cm为75%、16cm为0%，单障碍提前主动动作仍未达标。16cm仍是探索目标。训练继续使用原来的Preview任务名，不增加功能版本。
+
+先在已能启动Isaac Lab的终端执行Teacher训练：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/train.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Teacher-Preview-v0 \
+  --experiment_name /media/bigdisk/robot_lab/logs/vision_preview/teacher \
+  --run_name stairs_climb \
+  --num_envs 1024 --max_iterations 8000 --seed 42 --headless
+```
+
+训练启动时记录打印的时间戳目录。检查 `Curriculum/terrain_levels/stage_1/2/3`、各档 `stairs_*cm_fraction`、`Metrics/prelift/route_stable_success_rate` 和楼梯机会／事件数，不能只看reward。各环境独立晋级，不按固定迭代数硬切阶段。
+
+8000轮完成后，下方表达式只选择本次 `*_stairs_climb/model_7999.pt`，不会选旧 `active_prelift` 模型；没有文件时先等训练完成。正式对比请将表达式替换为选定的真实绝对路径，保证所有报告使用同一checkpoint和SHA256。
+
+按8、12、16cm依次评测：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py \
+  --policy teacher-preview --scenario pyramid_stairs_inv --difficulty 0.0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/vision_preview/teacher -mindepth 2 -maxdepth 2 -type f -path '*_stairs_climb/model_7999.pt' -print | sort | tail -n 1)" \
+  --num_envs 16 --episodes_per_env 2 --seed 142 --headless \
+  --output /media/bigdisk/robot_lab/logs/vision_preview/eval/teacher_stairs_8cm_seed142.json
+```
+
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py \
+  --policy teacher-preview --scenario pyramid_stairs_inv --difficulty 0.5 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/vision_preview/teacher -mindepth 2 -maxdepth 2 -type f -path '*_stairs_climb/model_7999.pt' -print | sort | tail -n 1)" \
+  --num_envs 16 --episodes_per_env 2 --seed 142 --headless \
+  --output /media/bigdisk/robot_lab/logs/vision_preview/eval/teacher_stairs_12cm_seed142.json
+```
+
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py \
+  --policy teacher-preview --scenario pyramid_stairs_inv --difficulty 1.0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/vision_preview/teacher -mindepth 2 -maxdepth 2 -type f -path '*_stairs_climb/model_7999.pt' -print | sort | tail -n 1)" \
+  --num_envs 16 --episodes_per_env 2 --seed 142 --headless \
+  --output /media/bigdisk/robot_lab/logs/vision_preview/eval/teacher_stairs_16cm_seed142.json
+```
+
+可视化12cm楼梯；查看8cm或16cm时将difficulty改为0.0或1.0：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/play.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Teacher-Preview-v0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/vision_preview/teacher -mindepth 2 -maxdepth 2 -type f -path '*_stairs_climb/model_7999.pt' -print | sort | tail -n 1)" \
+  --num_envs 4 --max_steps 1000 \
+  --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5 --preview_debug
+```
+
+1–4台车的GUI回放自动显示各车实时深度图；Teacher面板是显示相机，Teacher策略仍读取高度扫描。大于4台或headless不显示角落面板。楼梯评测要求真正登顶、保持方向、三轮承重且稳定0.5秒；70%为开发门，不是硬件安全或16cm能力保证。
+
+#### Student：训练、独立评测与续训
+
+Student接收4141维输入：45维本体／路线命令＋8帧16×32深度历史（4096维，约0.7秒跨度），网络为MLP，隐藏层1024／512／256，输出12维动作。Teacher固定为监督来源，通过RSL-RL `DistillationRunner`＋`DaggerDistillation`训练Student；当前没有CNN＋GRU、共享Actor或同轮交替PPO，也不需要恢复示范、AMP或单独BC初始化。
+
+**1. 确认Teacher能力，再开始Student训练。** 当前Teacher可用于低障碍通行基线实验；如果目标是约10cm前主动抬轮及16cm楼梯，先继续改善Teacher，不能把动作蒸馏当成补足缺失技能的方法。以下使用已经评测过的明确Teacher路径：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/train.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Student-Temporal-Preview-v0 \
+  --checkpoint /media/bigdisk/robot_lab/logs/vision_preview/teacher/2026-10-14_11-31-31_stairs_climb/model_7999.pt \
+  --experiment_name /media/bigdisk/robot_lab/logs/vision_preview/student \
+  --run_name stairs_depth \
+  --num_envs 128 --max_iterations 8000 --seed 42 --headless
+```
+
+首次Student训练不加 `--resume`，此时checkpoint是Teacher。任务自动开启相机；显存不足可将128降为64／32，但每轮样本量会改变。每台车每回合选择驱动者，Teacher驱动概率前4000轮从75%降到10%，之后保留10%；动作标签始终由同一状态的固定Teacher提供。每轮24步、4个epoch、每4步累计更新一次，学习率在8000轮内从5e−4降至1e−4。训练reward和课程比例含Teacher驱动回合，不能当作Student独立能力。
+
+**2. 选择Student模型，再分别评测全宽、左右窄障碍。** 以下模型表达式只选择跑满8000轮后的 `*_stairs_depth/model_7999.pt`。没有文件时不要执行；中途评测请填写已保存模型的真实绝对路径。多个run时最后时间戳不代表最佳模型，同一组评测固定同一文件并核对 `checkpoint_sha256`。
+
+全宽8cm：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py \
+  --policy student-preview --scenario single_step --difficulty 0.0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/vision_preview/student -mindepth 2 -maxdepth 2 -type f -path '*_stairs_depth/model_7999.pt' -print | sort | tail -n 1)" \
+  --num_envs 16 --episodes_per_env 2 --seed 142 --headless --depth_mode live \
+  --output /media/bigdisk/robot_lab/logs/vision_preview/eval/student_full_live_seed142.json
+```
+
+左侧窄障碍8cm：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py \
+  --policy student-preview --scenario single_step_left --difficulty 0.0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/vision_preview/student -mindepth 2 -maxdepth 2 -type f -path '*_stairs_depth/model_7999.pt' -print | sort | tail -n 1)" \
+  --num_envs 16 --episodes_per_env 2 --seed 142 --headless --depth_mode live \
+  --output /media/bigdisk/robot_lab/logs/vision_preview/eval/student_left_live_seed142.json
+```
+
+右侧窄障碍8cm：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py \
+  --policy student-preview --scenario single_step_right --difficulty 0.0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/vision_preview/student -mindepth 2 -maxdepth 2 -type f -path '*_stairs_depth/model_7999.pt' -print | sort | tail -n 1)" \
+  --num_envs 16 --episodes_per_env 2 --seed 142 --headless --depth_mode live \
+  --output /media/bigdisk/robot_lab/logs/vision_preview/eval/student_right_live_seed142.json
+```
+
+先看 `complete=True` 和32回合，再看 `success_rate`（稳定通行）、`prelift.success_rate`（目标轮提前动作完整且通行）及 `passed`（综合验收）。当前开发门槛70%；能滚过障碍不等于已学会提前抬轮。评测正常完成但未达技能门时，脚本退出码为1，需看JSON判断，不能只据此认定运行异常。
+
+**3. 楼梯逐档评测。** 下例为12cm×3级；8cm／16cm按表修改难度和输出文件名，分别运行：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py \
+  --policy student-preview --scenario pyramid_stairs_inv --difficulty 0.5 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/vision_preview/student -mindepth 2 -maxdepth 2 -type f -path '*_stairs_depth/model_7999.pt' -print | sort | tail -n 1)" \
+  --num_envs 16 --episodes_per_env 2 --seed 142 --headless --depth_mode live \
+  --output /media/bigdisk/robot_lab/logs/vision_preview/eval/student_stairs12_live_seed142.json
+```
+
+| 楼梯 | `--difficulty` | 输出文件名（同一eval目录） |
+|---|---|---|
+| 8cm×2级 | `0.0` | `student_stairs8_live_seed142.json` |
+| 12cm×3级 | `0.5` | `student_stairs12_live_seed142.json` |
+| 16cm×4级 | `1.0` | `student_stairs16_live_seed142.json` |
+
+楼梯评测验证真正登顶与稳定性，暂未独立验收每一级的提前抬轮时刻。补测seed314／942时同时修改输出文件名，保留每次报告。
+
+**4. 实时／空白／冻结深度对照。** 第2步全宽 `live` 为基线；保持同一模型、场景、难度、seed和回合数，再执行：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py \
+  --policy student-preview --scenario single_step --difficulty 0.0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/vision_preview/student -mindepth 2 -maxdepth 2 -type f -path '*_stairs_depth/model_7999.pt' -print | sort | tail -n 1)" \
+  --num_envs 16 --episodes_per_env 2 --seed 142 --headless --depth_mode blank \
+  --output /media/bigdisk/robot_lab/logs/vision_preview/eval/student_full_blank_seed142.json
+```
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py \
+  --policy student-preview --scenario single_step --difficulty 0.0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/vision_preview/student -mindepth 2 -maxdepth 2 -type f -path '*_stairs_depth/model_7999.pt' -print | sort | tail -n 1)" \
+  --num_envs 16 --episodes_per_env 2 --seed 142 --headless --depth_mode frozen \
+  --output /media/bigdisk/robot_lab/logs/vision_preview/eval/student_full_frozen_seed142.json
+```
+
+`blank`将全部4096维深度替换为归一化最远距离值+1；`frozen`在每个回合固定初始8帧历史，reset后刷新。45维本体／命令始终实时。默认评测关闭训练中的观测扰动；额外验证延迟／丢帧／噪声时加 `--camera_corruption`，三种对照须保持该设置一致。报告里的 `depth_probe`读取实际相机，即使blank／frozen也可能显示正常图像，不代表Student收到了实时深度。
+
+实时成功而空白／冻结明显下降，支持策略利用视觉；三种都成功时视觉依赖尚未证明，可能存在固定动作或本体反馈；三种都失败时先检查Student独立控制能力。固定场景和异常深度输入也有判读限制，需在左右窄障碍及楼梯上重复对照、增加seed，不能仅凭深度截图宣称视觉决策完成。
+
+**5. Student回放。** 下例展示12cm楼梯；单障碍可将scenario改为 `single_step`、`single_step_left` 或 `single_step_right`，difficulty改为0.0：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/play.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Student-Temporal-Preview-v0 \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/vision_preview/student -mindepth 2 -maxdepth 2 -type f -path '*_stairs_depth/model_7999.pt' -print | sort | tail -n 1)" \
+  --num_envs 4 --max_steps 1000 \
+  --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5 --preview_debug
+```
+
+play／eval均由Student独立控制。GUI下1–4台车显示角落深度面板；原始画面不等于裁剪后的8帧网络输入。`takeoff_lead_m`为真实离地时的轮胎前缘距离，目标8–14cm；`height_lead_m`为抬高达标时的距离，不能混用。逐步打印较稀疏，动作时刻以完整评测时序为准。此次GUI面板未实测。
+
+**6. Student续训。** 完成8000轮后追加1000轮；加载Student checkpoint并加 `--resume`：
+
+```bash
+python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/train.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Student-Temporal-Preview-v0 \
+  --resume \
+  --checkpoint "$(find /media/bigdisk/robot_lab/logs/vision_preview/student -mindepth 2 -maxdepth 2 -type f -path '*_stairs_depth/model_7999.pt' -print | sort | tail -n 1)" \
+  --experiment_name /media/bigdisk/robot_lab/logs/vision_preview/student_resume \
+  --run_name stairs_depth_resume \
+  --num_envs 128 --max_iterations 1000 --seed 42 --headless
+```
+
+恢复Student、内置Teacher、优化器和训练进度；不能再传Teacher模型充当Student续训。后续评测改用 `student_resume` 下的新模型，不能继续搜索首轮目录。当前地形课程状态不保存在checkpoint中，重建环境从stage1重新晋级，策略权重仍保留。合同必须一致，不修改JSON绕过检查。
+
+**7. 日志与当前验证边界。** 查看Student日志：
+
+```bash
+tensorboard --logdir /media/bigdisk/robot_lab/logs/vision_preview/student
+```
+
+关注 `Loss/behavior`、`Loss/teacher_drive_probability`、`Loss/teacher_driven_fraction`、`Loss/learning_rate` 和 `Curriculum/terrain_levels/stage_1/2/3`。模仿损失下降表示动作更接近Teacher；混合训练reward上涨不等于Student独立成功。最终以分场景评测及视觉对照为准。
+
+2026-10-14当前Teacher `2026-10-14_11-31-31_stairs_climb/model_7999.pt` 的固定场景评测（seed142，每场景16环境×2回合）：
+
+| 场景 | 稳定通行率 | 提前主动动作并通行 | 综合验收 |
+|---|---|---|---|
+| 全宽8cm | 100% | 18.75% | 未通过 |
+| 左窄8cm | 100% | 0% | 未通过 |
+| 右窄8cm | 96.875% | 6.25% | 未通过 |
+| 8cm×2级楼梯 | 100% | 未单独验收逐级提前动作 | 通过通行门 |
+| 12cm×3级楼梯 | 75% | 未单独验收逐级提前动作 | 通过通行门 |
+| 16cm×4级楼梯 | 0% | 未单独验收逐级提前动作 | 未通过 |
+
+以上6份JSON均完整且使用同一Teacher SHA256，报告目录为 `/media/bigdisk/robot_lab/logs/vision_preview_diagnostics/final_7999_review.TbdtwP/`。这说明低障碍通行已有基线，约10cm主动抬轮和16cm楼梯仍未完成，单seed的32回合不能代表部署可靠性。
+
+Student本次193项相关测试通过，4环境新训2轮＋续训1轮正常，Teacher权重保持不变；实时／空白／冻结各完成4回合，通行率均0%，无非有限数回合。短训只证明输入、监督、续训和评测链路能运行，尚无全量Student成绩或视觉依赖结论。相机探针确认被测全宽场景能看到障碍，未证明所有场景可见或策略实际利用视觉。证据目录为 `/media/bigdisk/robot_lab/logs/vision_preview_diagnostics/student_access.T8MpL4/`；Student全量训练、GUI面板、实车迁移仍需验证。
+
+Teacher完整步骤、Student左右窄／三档楼梯独立命令、日志判读和历史证据见 [视觉训练与楼梯流程](docs/vision_preview_workflow.md)。
+
 ### 平行四边形轮式车：从零训练侧躺恢复（实验性）
 
 本流程按**旧模型、旧示范和旧日志都已删除**编写，不依赖任何历史 checkpoint，

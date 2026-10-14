@@ -2,9 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # @author pony
 # @date 2026-09-16
-# @version v0.10.0
-# @last_modified 2026-09-30
+# @version v0.13.0
+# @last_modified 2026-10-12
 # @changelog
+#   - (2026-10-12): 先冻结训练合同再调整回放地形，删除与场景配置重复的课程开关。
+#   - (2026-10-12): Preview混合回放明确排布全宽、左右窄障碍、楼梯和方块；四车含楼梯。
+#   - (2026-10-11): 只读输出首次真实离地/高度达标距离和承重，避免把瞬时几何当起抬时机。
+#   - (2026-10-10): 显示真实前缘距离与10cm动作窗口，增加已有低楼梯/方块固定回放。
+#   - (2026-10-10): Preview回放支持固定场景/难度与低频抬轮诊断，区分预瞄动作和窗口外跺脚。
+#   - (2026-10-09): Preview回放保留可追溯地形列分类，关闭回放中的地形晋级。
+#   - v0.12.0 (2026-09-30): 1–4 台视觉车回放自动显示角落深度，teacher 相机仅供显示。
+#   - v0.11.0 (2026-09-30): Preview回放/导出校验相机、扫描与模型角色，拒绝同维度误加载。
 #   - v0.10.0 (2026-09-30): 支持settle_feedback，统一校验profile数值与残差门控合同。
 #   - v0.8.0 (2026-09-30): 回放支持FailureReplay-Residual并在创建环境前注入失败池。
 #   - v0.9.0 (2026-09-30): 回放校验Residual先验NPZ哈希，阻止动作表静默漂移。
@@ -33,6 +41,9 @@ from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
+from vision_depth_overlay import (  # isort: skip
+    DEFAULT_PLAY_ENVS, configure_display_camera, create_depth_overlay, depth_overlay_requested,
+)
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
@@ -43,6 +54,24 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--max_steps", type=int, default=None, help="可选的回放步数，适合无界面导出检查。")
+parser.add_argument(
+    "--preview_scenario",
+    choices=("mixed", "single_step", "single_step_left", "single_step_right", "pyramid_stairs_inv", "boxes"),
+    default="mixed",
+    help="Preview回放地形；可固定全宽/左右窄障碍、低楼梯或方块，mixed保留混合课程。",
+)
+parser.add_argument(
+    "--preview_difficulty",
+    type=float,
+    default=0.0,
+    help="固定Preview难度[0,1]；单障碍8–12cm，低楼梯/方块6–12cm。mixed忽略此参数。",
+)
+parser.add_argument(
+    "--preview_debug",
+    action="store_true",
+    help="每5步打印最多4车的前缘距离、10cm动作窗口、抬升量和净空；只读诊断。",
+)
+parser.add_argument("--disable_depth_overlay", action="store_true", help="关闭 1–4 台视觉车的自动深度角落面板。")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--recovery_motor_profile", type=str, default=None,
                     help="恢复电机实测配置；省略时自动读取checkpoint对应的标定快照。")
@@ -73,8 +102,9 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
-# always enable cameras to record video
-if args_cli.video or (args_cli.task and "Vision-Student" in args_cli.task):
+# teacher 仅在小规模 GUI 回放补显示相机；student 无论是否显示都需要相机进行策略推理。
+show_depth_overlay = depth_overlay_requested(args_cli)
+if args_cli.video or (args_cli.task and "Vision-Student" in args_cli.task) or show_depth_overlay:
     args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
@@ -128,6 +158,124 @@ from rl_utils import camera_follow
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
+_PREVIEW_TASK_SUFFIXES = (
+    "Parallelogram-Rover-Vision-Teacher-Preview-v0",
+    "Parallelogram-Rover-Vision-Student-Temporal-Preview-v0",
+)
+_PREVIEW_SCENARIOS = {"single_step", "single_step_left", "single_step_right", "pyramid_stairs_inv", "boxes"}
+
+
+def _is_preview_task(task: str | None) -> bool:
+    """识别前瞻任务，避免把回放专用地形参数误套到旧视觉任务。"""
+    name = (task or "").split(":")[-1]
+    return any(name.endswith(suffix) for suffix in _PREVIEW_TASK_SUFFIXES)
+
+
+def _configure_preview_play_terrain(env_cfg, task: str | None, scenario: str, difficulty: float, num_envs: int, seed):
+    """配置Preview回放的可复现场景；不参与checkpoint合同或训练配置。"""
+    if not _is_preview_task(task):
+        if scenario != "mixed" or difficulty != 0.0:
+            raise ValueError("--preview_scenario/--preview_difficulty 只适用于 Vision-*Preview-v0 任务")
+        return
+    if not 0.0 <= difficulty <= 1.0:
+        raise ValueError("--preview_difficulty 必须位于[0,1]")
+    terrain = env_cfg.scene.terrain.terrain_generator
+    if scenario == "mixed":
+        # 4车时前4列覆盖全宽、左右窄障碍及楼梯；第5车显示方块。
+        names = ("single_step", "single_step_left", "single_step_right", "pyramid_stairs_inv", "boxes")
+        terrain.sub_terrains = {name: terrain.sub_terrains[name].copy() for name in names}
+        for item in terrain.sub_terrains.values():
+            item.proportion = 0.2
+        terrain.num_rows = 3
+        terrain.num_cols = 5
+        terrain.difficulty_range = (0.25, 0.75)
+        terrain.curriculum = True
+        terrain.seed = seed
+        env_cfg.scene.terrain.max_init_terrain_level = 1
+        if env_cfg.curriculum is not None and hasattr(env_cfg.curriculum, "terrain_levels"):
+            env_cfg.curriculum.terrain_levels = None
+        print("[INFO] Preview play terrain: mixed=full/left/right/stairs/boxes, difficulty=0.25..0.75")
+        return
+    if scenario not in _PREVIEW_SCENARIOS or scenario not in terrain.sub_terrains:
+        raise ValueError(f"Preview任务不包含可选地形：{scenario}")
+    selected = terrain.sub_terrains[scenario].copy()
+    selected.proportion = 1.0
+    terrain.sub_terrains = {scenario: selected}
+    terrain.num_rows = 1
+    terrain.num_cols = max(int(num_envs), 1)
+    terrain.difficulty_range = (difficulty, difficulty)
+    terrain.curriculum = False
+    terrain.seed = seed
+    env_cfg.scene.terrain.max_init_terrain_level = 0
+    if env_cfg.curriculum is not None and hasattr(env_cfg.curriculum, "terrain_levels"):
+        env_cfg.curriculum.terrain_levels = None
+    if scenario == "pyramid_stairs_inv":
+        from robot_lab.tasks.manager_based.locomotion.velocity.config.wheeled.parallelogram_rover.vision_preview import stairs_profile
+        profile = stairs_profile(difficulty, selected.height_levels, selected.step_counts,
+                                 selected.first_edge_m, selected.step_width)
+        print(f"[INFO] Preview play terrain: stairs={profile['step_height_m']:.2f}m × "
+              f"{profile['num_steps']}, target={profile['target_distance_m']:.2f}m, num_envs={num_envs}")
+        return
+    heights = selected.grid_height_range if scenario == "boxes" else selected.step_height_range
+    print(
+        f"[INFO] Preview play terrain: scenario={scenario}, difficulty={difficulty:.3f}, "
+        f"height={heights[0] + difficulty * (heights[1] - heights[0]):.3f}m, "
+        f"num_envs={num_envs}"
+    )
+
+
+def _emit_preview_debug(env, task: str | None, step: int):
+    """读取当前步的几何预瞄状态；不调用奖励状态机，避免诊断改变训练语义。"""
+    if not _is_preview_task(task):
+        return
+    from robot_lab.tasks.manager_based.locomotion.velocity.config.wheeled.parallelogram_rover.vision_preview import (
+        collect_preview,
+    )
+
+    sample = collect_preview(env)
+    labels = {0: "single_step", 1: "single_step_left", 2: "single_step_right", 3: "stairs", -1: "unknown"}
+    kinds = sample["terrain_kind"].detach().cpu().tolist()
+    preview = sample["preview"].detach().cpu().tolist()
+    eligible = sample["eligible"].detach().cpu().tolist()
+    advance = sample["unbounded_advance_m"].detach().cpu().tolist()
+    lift = sample["articulation_lift_m"].detach().cpu().tolist()
+    clearance = sample["clearance_m"].detach().cpu().tolist()
+    prelift = sample["prelift"].detach().cpu().tolist()
+    edge = sample["edge_distance_m"].detach().cpu().tolist()
+    edge_valid = sample["edge_distance_valid"].detach().cpu().tolist()
+    force = sample["wheel_support_force_n"].detach().cpu().tolist()
+    state = env.reward_manager.get_term_cfg("anticipatory_wheel_lift").func.state
+    takeoff = state.takeoff_lead.detach().cpu().tolist()
+    height = state.height_lead.detach().cpu().tolist()
+    cfg = env.cfg.vision_preview
+    print(f"[PreviewDebug] step={step} (fl,fr; target=0.10m, action_window=0.08–0.14m; scan_advance仅为栅格估计)")
+    for env_id in range(min(env.num_envs, 4)):
+        phases = []
+        for wheel in (0, 2):
+            distance = edge[env_id][wheel]
+            if not edge_valid[env_id][wheel]:
+                phases.append("unknown")
+            elif distance > cfg["action_max_advance_m"]:
+                phases.append("too_early")
+            elif distance >= cfg["min_advance_m"]:
+                phases.append("lift_window")
+            else:
+                phases.append("hold_or_pass")
+        print(
+            f"  env_{env_id}: terrain={labels.get(int(kinds[env_id]), 'unknown')} "
+            f"eligible={bool(eligible[env_id])} "
+            f"edge_lead_m=({edge[env_id][0]:.3f},{edge[env_id][2]:.3f}) phase={tuple(phases)} "
+            f"scan_advance_m=({advance[env_id][0]:.3f},{advance[env_id][2]:.3f}) "
+            f"preview=({bool(preview[env_id][0])},{bool(preview[env_id][2])}) "
+            f"prelift=({bool(prelift[env_id][0])},{bool(prelift[env_id][2])}) "
+            f"lift_m=({lift[env_id][0]:.3f},{lift[env_id][2]:.3f}) "
+            f"clearance_m=({clearance[env_id][0]:.3f},{clearance[env_id][2]:.3f}) "
+            f"support_N=({force[env_id][0]:.1f},{force[env_id][2]:.1f}) "
+            f"takeoff_lead_m=({takeoff[env_id][0]:.3f},{takeoff[env_id][2]:.3f}) "
+            f"height_lead_m=({height[env_id][0]:.3f},{height[env_id][2]:.3f})"
+        )
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -136,7 +284,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
-    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else 64
+    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else DEFAULT_PLAY_ENVS
 
     # handle deprecated configurations
     agent_cfg = cli_args.handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
@@ -145,6 +293,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+
+    from vision_contract import contract_for_cfg, save_contract, validate_checkpoint
+
+    # 训练布局属于模型来源；须先冻结合同，回放的行列数/难度与课程开关不能污染校验。
+    preview_contract = contract_for_cfg(args_cli.task, env_cfg, agent_cfg)
 
     # spawn the robot randomly in the grid (instead of their terrain levels)
     env_cfg.scene.terrain.max_init_terrain_level = None
@@ -165,6 +318,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         for curriculum_name in ("command_levels_lin_vel", "command_levels_ang_vel"):
             if hasattr(env_cfg.curriculum, curriculum_name):
                 setattr(env_cfg.curriculum, curriculum_name, None)
+
+    if preview_contract is not None:
+        # 混合/固定场景统一负责地形排列和关闭晋级，不重复改课程开关。
+        _configure_preview_play_terrain(
+            env_cfg,
+            args_cli.task,
+            args_cli.preview_scenario,
+            args_cli.preview_difficulty,
+            env_cfg.scene.num_envs,
+            args_cli.seed if args_cli.seed is not None else env_cfg.seed,
+        )
+    elif args_cli.preview_scenario != "mixed" or args_cli.preview_difficulty != 0.0:
+        raise ValueError("--preview_scenario/--preview_difficulty 只适用于 Vision-*Preview-v0 任务")
 
     if args_cli.keyboard:
         env_cfg.scene.num_envs = 1
@@ -195,6 +361,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     log_dir = os.path.dirname(resume_path)
+    validate_checkpoint(resume_path, preview_contract)
 
     from recovery_contract import configure_failure_replay_env, is_residual_recovery_task
 
@@ -221,6 +388,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     recovery_control = control_contract(env_cfg.to_dict(), agent_cfg.to_dict()) if is_rover_recovery(args_cli.task) else None
     if recovery_control is not None:
         validate_checkpoint_contract(resume_path, recovery_control)
+
+    if show_depth_overlay:
+        configure_display_camera(env_cfg, args_cli.task)
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -269,6 +439,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # export the trained policy to JIT and ONNX formats
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+    save_contract(export_model_dir, preview_contract)
     if recovery_control is not None:
         os.makedirs(export_model_dir, exist_ok=True)
         with open(os.path.join(export_model_dir, "recovery_control_contract.json"), "w", encoding="utf-8") as stream:
@@ -310,42 +481,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset environment
     obs = env.get_observations()
     timestep = 0
-    # simulate environment
-    while simulation_app.is_running():
-        start_time = time.time()
-        # run everything in inference mode
-        with torch.inference_mode():
-            # agent stepping
-            actions = policy(obs)
-            # env stepping
-            obs, _, dones, _ = env.step(actions)
-            # reset recurrent states for episodes that have terminated
-            if version.parse(installed_version) >= version.parse("4.0.0"):
-                policy.reset(dones)
-            else:
-                policy_nn.reset(dones)
-        timestep += 1
-        if args_cli.max_steps is not None and timestep >= args_cli.max_steps:
-            break
-        if args_cli.video:
-            # Exit the play loop after recording one video
-            if timestep == args_cli.video_length:
+    depth_overlay = None
+    try:
+        depth_overlay = create_depth_overlay(env.unwrapped, args_cli.task, enabled=show_depth_overlay)
+        while simulation_app.is_running():
+            start_time = time.time()
+            # 在自动reset前采样，避免已终止环境丢失碰撞前的时序状态。
+            if args_cli.preview_debug and (timestep + 1) % 5 == 0:
+                _emit_preview_debug(env.unwrapped, args_cli.task, timestep + 1)
+            # run everything in inference mode
+            with torch.inference_mode():
+                actions = policy(obs)
+                obs, _, dones, _ = env.step(actions)
+                if depth_overlay is not None:
+                    depth_overlay.update()
+                if version.parse(installed_version) >= version.parse("4.0.0"):
+                    policy.reset(dones)
+                else:
+                    policy_nn.reset(dones)
+            timestep += 1
+            if args_cli.max_steps is not None and timestep >= args_cli.max_steps:
                 break
-
-        if args_cli.keyboard:
-            camera_follow(env)
-
-        # time delay for real-time evaluation
-        sleep_time = dt - (time.time() - start_time)
-        if args_cli.real_time and sleep_time > 0:
-            time.sleep(sleep_time)
-
-    # close the simulator
-    env.close()
+            if args_cli.video and timestep == args_cli.video_length:
+                break
+            if args_cli.keyboard:
+                camera_follow(env)
+            sleep_time = dt - (time.time() - start_time)
+            if args_cli.real_time and sleep_time > 0:
+                time.sleep(sleep_time)
+    finally:
+        if depth_overlay is not None:
+            depth_overlay.close()
+        env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
     simulation_app.close()
