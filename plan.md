@@ -345,6 +345,22 @@ v5 的 8 cm 94% 是唯一亮点，但 12 cm 退化太多，整体不如 v3。
 `wheel_heading` / `lateral_pos` / `riser_anchor` 代码保留但默认关闭，实验结论见上。
 v3 相对 Teacher：12 cm 70%→98%，8 cm 100%→86%，16 cm 都是 0%。
 
+## 4.7 方案 D：从零训练（2026-10-28，训练中）
+
+依据 go2w-supermimic（见上文分析）：Go2W 从零 40000 轮、37850 次 actor 更新、稠密共用奖励、接触头 + 事件优先回放、2 cm 起步课程。
+我们的对应实现（`train_terrain.py --from_scratch`，任务 `Scratch-Stairs`）：
+
+| 项 | 设置 |
+|---|---|
+| 课程 | 9 行，台阶 2→16 cm 连续，4 级、40 cm 踏面；越过 3.4 m、直立、|y|≤0.5 m 升级；翻车 / |y|>1 m / 前进 <0.8 m 降级 |
+| actor | 随机初始化，tanh 输出，lr 1e-4，无 Teacher 锚定，无 Teacher 驾驶 |
+| 奖励 | 回放里的奖励用 `PreviewTask.reward` 在真实转移上重算（与想象同一函数），翻车 −20（想象里为 1−软存活） |
+| 回放 | priority_fraction 0.25：世界模型窗口与想象起点优先取轮前有 ≥3 cm 台阶 / 轮底离地 >2 cm / 翻车的片段（未加接触头） |
+| critic | 拟合真实 λ-return（共用奖励后与想象目标一致） |
+| 规模 | 2048 env × 12000 轮，每 1000 轮存档 |
+
+冒烟（256 env × 60 轮）：想象观测与 env 观测误差 1.9e-6，共用奖励从 −0.18 升到 +0.07，无非有限数。
+
 运行命令（均先 `conda activate env_isaaclab; unset PYTHONPATH; source /media/bigdisk/IsaacLab/_isaac_sim/setup_conda_env.sh`）：
 
 ```bash

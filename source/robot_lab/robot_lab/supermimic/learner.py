@@ -13,9 +13,10 @@ learner.py — SuperMimic 训练器：世界模型多步拟合 + 想象 BPTT act
 
 @author pony
 @date 2026-10-26
-@version v0.6.0
-@last_modified 2026-10-27
+@version v0.7.0
+@last_modified 2026-10-28
 @changelog
+    - v0.7.0 (2026-10-28): priority_fraction（事件优先回放），observe 透传 priority。
     - v0.6.0 (2026-10-27): 锚定损失支持 task.anchor_weight 按状态加权；文档补充与论文的差异。
     - v0.5.0 (2026-10-26): critic 可改用真实回报（critic_real_returns）；actor 信赖域 anchor_coef。
     - v0.4.1 (2026-10-26): 新增 critic_warmup_iterations（热启动时先只训 critic），记录 actor 梯度范数。
@@ -79,6 +80,8 @@ class SuperMimicCfg:
     real_return_batch: int = 2048
     # 信赖域：actor 动作向冻结的参考策略（热启动来源）回归，系数为 0 时关闭。
     anchor_coef: float = 0.0
+    # 世界模型窗口 / 想象起点中按事件优先级抽取的比例（0 = 均匀；从零越障训练用 0.25，见 replay._pick）
+    priority_fraction: float = 0.0
     # 预热期 actor 近似输出 0（静止），只靠 0.1 噪声采不到行驶数据；预热期加大探索。
     warmup_action_noise: float = 0.5
     reward: rover_task.RoverRewardCfg = field(default_factory=rover_task.RoverRewardCfg)
@@ -120,8 +123,8 @@ class SuperMimicLearner:
         return action
 
     def observe(self, state, action, prev_action, command, done, context=None, aux=None, reward=None,
-                terminated=None) -> None:
-        self.replay.add(state, action, prev_action, command, done, context, aux, reward, terminated)
+                terminated=None, priority=None) -> None:
+        self.replay.add(state, action, prev_action, command, done, context, aux, reward, terminated, priority)
 
     def wm_context(self, state, context):
         """世界模型实际吃的上下文 = 固定 ξ ⊕ extra_fn(state)。"""
@@ -140,7 +143,7 @@ class SuperMimicLearner:
         cfg, wm = self.cfg, self.world_model
         logs = {"wm_loss": 0.0, "wm_err_1step": 0.0, "wm_err_last": 0.0, "wm_aux_loss": 0.0}
         for _ in range(cfg.wm_updates):
-            batch = self.replay.sample_windows(cfg.wm_batch, cfg.wm_window)
+            batch = self.replay.sample_windows(cfg.wm_batch, cfg.wm_window, cfg.priority_fraction)
             states, actions, ctx, valid = batch["state"], batch["action"], batch["context"], batch["valid"]
             # 归一化统计只取单步有效转移，跨回合样本的"增量"是 reset 跳变，会撑大方差。
             mask0 = valid[:, 0] > 0
@@ -245,7 +248,7 @@ class SuperMimicLearner:
 
     def update_actor_critic(self, update_actor: bool = True) -> dict[str, float]:
         cfg = self.cfg
-        start = self.replay.sample_states(cfg.imag_batch)
+        start = self.replay.sample_states(cfg.imag_batch, cfg.priority_fraction)
         with torch.no_grad():
             self.critic.norm.update(self.critic.inputs(start["state"], start["command"], start["prev_action"],
                                                        self.critic_context(start["state"], start["context"])))

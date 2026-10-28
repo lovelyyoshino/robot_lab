@@ -800,6 +800,26 @@ run 目录的 `params/lane_offset_obs.json` 是标记，`play.py --supermimic_te
 
 2026-10-28 结果：lateral_pos −5 为 81% / 42% / 0%，−20 为 34% / 19% / 0%（v3 为 86% / 98% / 0%）。16 cm 侧漂只从 −0.57 m 压到 −0.38 m，8/12 cm 退化，暂不采用。
 
+#### 方案 D（训练中）：不用 Teacher，从零训练楼梯
+
+参考 [go2w-supermimic](https://github.com/uwvwko-zzz/go2w-supermimic)（Go2W 轮足从零用 SuperMimic 训到 20 cm 楼梯）的做法：
+
+| 改动 | 内容 |
+|---|---|
+| 任务 | `RobotLab-Isaac-SuperMimic-Scratch-Stairs-Parallelogram-Rover-v0`：9 行课程，台阶 2→16 cm 连续变化（4 级、40 cm 踏面），从 2 cm 起步；越过终点、直立、0.5 m 车道内升级 |
+| 起点 | actor 随机初始化，不加载、不锚定 Teacher，没有 Teacher 驾驶 |
+| 奖励 | 真实回报和想象目标用同一个 `PreviewTask.reward`（含抬轮塑形与航向/横向/平地平稳项），加翻车惩罚 −20 |
+| 回放 | 25% 的世界模型窗口和想象起点优先取"轮子前方有台阶 / 正在越级 / 翻车"的片段 |
+
+```bash
+bash scripts/supermimic/run_scratch.sh scratch_d1 2048 12000      # nohup 后台，日志 logs/supermimic_terrain/scratch_d1.log
+tail -f logs/supermimic_terrain/scratch_d1.log | grep "^\[it"       # 看 terrain_level_mean / step_height_cm_mean 是否上升
+python scripts/supermimic/export_ckpt.py --load_run scratch_d1 --iterations 4000
+python scripts/supermimic/accept_terrain.py --checkpoint logs/supermimic_terrain/scratch_d1/ckpt_eval/it4000/exported/policy.pt
+```
+
+产物观测/动作与 Teacher-Preview 相同（232 → 12），验收、回放、转 Student 老师的命令都不变。
+
 #### 其他可选流程
 
 不在上面主线上，按需使用。

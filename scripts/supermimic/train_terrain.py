@@ -14,9 +14,10 @@ train_terrain.py — SuperMimic 越障训练：从 Teacher-Preview 热启动，�
 
 @author pony
 @date 2026-10-26
-@version v0.7.0
+@version v0.8.0
 @last_modified 2026-10-28
 @changelog
+    - v0.8.0 (2026-10-28): --from_scratch（方案 D：从零、共用奖励、翻车惩罚、事件优先回放、2→16 cm 课程）。
     - v0.7.0 (2026-10-28): --lane_obs（方案 B：actor 追加车道横向偏移观测，新列 0 初始化）。
     - v0.6.0 (2026-10-28): --max_iterations 默认 6000→1000（长训退化）；默认开启平地平稳惩罚 --smooth_flat_arm -0.5 / --smooth_flat_ang -5.0。
     - v0.5.0 (2026-10-27): 导出同时写 policy.onnx；新增 --lateral_pos、--riser_anchor、--anchor_final（PPO 约束衰减）；--wheel_heading 默认 0（v4 实测有害）；默认值回到 v3 基线。
@@ -32,6 +33,11 @@ import sys
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="SuperMimic terrain (stairs) training")
+# 方案 D：不用 Teacher，从零在 2→16 cm 课程上训练（参考 go2w-supermimic）。下列默认值只在未显式传参时生效。
+parser.add_argument("--from_scratch", action="store_true",
+                    help="不热启动、不锚定 Teacher、无 Teacher 驾驶；任务改为 Scratch-Stairs，奖励两边共用同一实现")
+parser.add_argument("--terminated", type=float, default=None, help="翻车惩罚权重（想象与真实同口径）；从零默认 −20")
+parser.add_argument("--priority_fraction", type=float, default=None, help="事件优先回放比例；从零默认 0.25")
 parser.add_argument("--task", default="RobotLab-Isaac-SuperMimic-Terrain-Preview-Parallelogram-Rover-v0")
 parser.add_argument("--teacher", default="logs/vision_preview/teacher/2026-10-14_11-31-31_stairs_climb/model_7999.pt")
 parser.add_argument("--num_envs", type=int, default=2048)
@@ -90,7 +96,18 @@ parser.add_argument("--lateral_pos", type=float, default=0.0,
                     help="× 相对车道中心线横向偏移²，惩罚取负；非 0 时 critic 额外看到偏移量")
 parser.add_argument("--tilt_soft_start_deg", type=float, default=25.0)
 AppLauncher.add_app_launcher_args(parser)
+_explicit = {a.split("=")[0].lstrip("-") for a in sys.argv[1:] if a.startswith("--")}
 args_cli, hydra_args = parser.parse_known_args()
+SCRATCH_TASK = "RobotLab-Isaac-SuperMimic-Scratch-Stairs-Parallelogram-Rover-v0"
+# 从零：task / 地形起点 / Teacher 驾驶 / 塑形的默认值改掉；用户显式传的参数一律保留
+SCRATCH_ARG_DEFAULTS = {"task": SCRATCH_TASK, "init_terrain_level": 0, "driver_fraction": 0.0,
+                        "tilt_soft": 0.0, "terminated": -20.0, "priority_fraction": 0.25}
+if args_cli.from_scratch:
+    for _k, _v in SCRATCH_ARG_DEFAULTS.items():
+        if _k not in _explicit:
+            setattr(args_cli, _k, _v)
+    if args_cli.lane_obs or args_cli.riser_anchor or args_cli.anchor_final is not None:
+        parser.error("--from_scratch 不与 --lane_obs / --riser_anchor / --anchor_final 组合（它们依赖 Teacher 起点）")
 sys.argv = [sys.argv[0]] + hydra_args
 simulation_app = AppLauncher(args_cli).app
 
@@ -119,6 +136,7 @@ from robot_lab.supermimic.kinematics import RoverKinematics  # noqa: E402
 from robot_lab.supermimic.lane_offset import add_lane_offset_term, pad_first_layer, write_marker  # noqa: E402
 from robot_lab.supermimic.learner import SuperMimicCfg, SuperMimicLearner  # noqa: E402
 from robot_lab.supermimic.preview_task import PreviewRewardCfg, PreviewTask  # noqa: E402
+from robot_lab.supermimic.rover_task import CONTROL_DT  # noqa: E402
 from robot_lab.supermimic.quat import quat_apply  # noqa: E402
 from robot_lab.supermimic.state import LIN, QUAT  # noqa: E402
 
@@ -130,8 +148,15 @@ TERRAIN_DEFAULTS = dict(buffer_len=600, imag_batch=2048, wm_batch=2048, wm_updat
                         real_return_window=64, anchor_coef=1.0)
 
 
+# 从零（go2w 配方）：tanh 输出、无 Teacher 锚定、无 critic 预热；探索加大；事件优先回放；actor lr 介于平地 2e-4 与微调 5e-5 之间
+SCRATCH_DEFAULTS = dict(TERRAIN_DEFAULTS, imag_batch=4096, warmup_iterations=200, critic_warmup_iterations=0,
+                        actor_lr=1e-4, action_noise=0.1, warmup_action_noise=0.3, action_squash="tanh", anchor_coef=0.0)
+
+
 def build_cfg() -> SuperMimicCfg:
-    cfg = SuperMimicCfg(num_envs=args_cli.num_envs, **TERRAIN_DEFAULTS)
+    cfg = SuperMimicCfg(num_envs=args_cli.num_envs, **(SCRATCH_DEFAULTS if args_cli.from_scratch else TERRAIN_DEFAULTS))
+    if args_cli.priority_fraction is not None:
+        cfg.priority_fraction = args_cli.priority_fraction
     for f in fields(cfg):
         value = getattr(args_cli, f.name, None)
         if value is not None:
@@ -189,6 +214,13 @@ def warm_start(learner: SuperMimicLearner, teacher_ckpt: str) -> None:
 def curriculum_stats(uenv) -> dict:
     t = uenv.scene.terrain
     levels = t.terrain_levels.float()
+    if args_cli.from_scratch:
+        from robot_lab.tasks.manager_based.supermimic.scratch_env_cfg import SCRATCH_HEIGHT_RANGE
+        lo, hi = SCRATCH_HEIGHT_RANGE
+        rows = t.cfg.terrain_generator.num_rows
+        return {"terrain_level_mean": levels.mean().item(), "terrain_level_max": levels.max().item(),
+                "step_height_cm_mean": ((lo + (levels + 0.5) / rows * (hi - lo)).mean() * 100).item(),
+                "top_level_fraction": (levels >= rows - 1).float().mean().item()}
     return {"terrain_level_mean": levels.mean().item(), "stage_1": (levels < 3).float().mean().item(),
             "stage_2": ((levels >= 3) & (levels < 6)).float().mean().item(), "stage_3": (levels >= 6).float().mean().item()}
 
@@ -209,7 +241,7 @@ def main():
     pattern = scan_pattern_base(env)
     reward_cfg = PreviewRewardCfg(**{k: getattr(args_cli, k) for k in ("wheel_lift", "idle_lift", "heading",
                                                                        "lateral_vel", "tilt_soft", "wheel_heading", "lateral_pos", "riser_anchor",
-                                                                       "smooth_flat_arm", "smooth_flat_ang")
+                                                                       "smooth_flat_arm", "smooth_flat_ang", "terminated")
                                      if getattr(args_cli, k) is not None})
     reward_cfg.tilt_soft_start = math.radians(args_cli.tilt_soft_start_deg)
     lane_center_y = None
@@ -225,12 +257,15 @@ def main():
     if resume_path:
         learner.load_state_dict(torch.load(resume_path, map_location=device, weights_only=False))
         print(f"[SuperMimic-Terrain] 续训 {resume_path} @ iteration {learner.iteration}")
-    else:
+    elif not args_cli.from_scratch:
         warm_start(learner, args_cli.teacher)
-    # 信赖域参考 = Teacher 本身（续训时也锚定 Teacher，而不是上一个 checkpoint）
-    anchor = copy.deepcopy(learner.actor)
-    anchor.load_state_dict(teacher_actor_state(args_cli.teacher, task.obs_dim))
-    learner.set_anchor(anchor)
+    if not args_cli.from_scratch:
+        # 信赖域参考 = Teacher 本身（续训时也锚定 Teacher，而不是上一个 checkpoint）
+        anchor = copy.deepcopy(learner.actor)
+        anchor.load_state_dict(teacher_actor_state(args_cli.teacher, task.obs_dim))
+        learner.set_anchor(anchor)
+    else:
+        print("[SuperMimic-Terrain] 从零训练：actor 随机初始化，不加载、不锚定 Teacher", flush=True)
 
     # 续训未给 --run_name 时写回原 run，与 rsl_rl 续训习惯一致
     run = args_cli.run_name or (Path(resume_path).parent.name if resume_path else datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
@@ -255,7 +290,8 @@ def main():
     n_driver = int(round(args_cli.driver_fraction * n))
     actor_mask = torch.ones(n, dtype=torch.bool, device=device)
     actor_mask[:n_driver] = False
-    teacher = torch.jit.load(str(Path(args_cli.teacher).parent / "exported" / "policy.pt"), map_location=device).eval()
+    teacher = (torch.jit.load(str(Path(args_cli.teacher).parent / "exported" / "policy.pt"), map_location=device).eval()
+               if n_driver else None)
     bound = cfg.action_bound
     obs, _ = env.reset()
     min_rows = cfg.wm_window + 2
@@ -287,12 +323,29 @@ def main():
             # 用步前状态 s：步后状态在 reset 环境里已被重置；与想象里用 next_state 差一步，可忽略。
             with torch.no_grad():
                 shaping = task.shaping_reward(s)
+                priority = task.event_priority(s) if cfg.priority_fraction > 0 else None
+                if priority is not None:
+                    priority = torch.maximum(priority, terminated.float())
+                if args_cli.from_scratch:
+                    # go2w：真实回报与想象目标用同一个奖励函数，critic 与 actor 不再各看一套。
+                    # done 的 env 步后状态已被 reset，没有物理后继，用步前状态代替（该步只剩翻车惩罚有意义）。
+                    s_next = reader.state()
+                    s_next = torch.where(done[:, None], s, s_next)
+                    env_rew = rew
+                    rew = task.reward(s, s_next, cmd, action, prev)
+                    if reward_cfg.terminated != 0.0:
+                        rew = rew + reward_cfg.terminated * CONTROL_DT * terminated.float()
             sim["shaping_reward"] += shaping[actor_mask].mean().item() / args_cli.steps_per_iter
-            rew = rew + shaping
-            learner.observe(s, action, prev, cmd, done, ctx, reward=rew, terminated=terminated)
+            if not args_cli.from_scratch:
+                env_rew = rew
+                rew = rew + shaping
+            if priority is not None:
+                sim["priority_rate"] = sim.get("priority_rate", 0.0) + priority.mean().item() / args_cli.steps_per_iter
+            sim["shared_reward"] = sim.get("shared_reward", 0.0) + rew[actor_mask].mean().item() / args_cli.steps_per_iter
+            learner.observe(s, action, prev, cmd, done, ctx, reward=rew, terminated=terminated, priority=priority)
             a = actor_mask
             v_w = quat_apply(s[a][:, QUAT], s[a][:, LIN])
-            sim["env_reward"] += (rew - shaping)[a].mean().item() / args_cli.steps_per_iter
+            sim["env_reward"] += env_rew[a].mean().item() / args_cli.steps_per_iter
             sim["route_vel_err"] += (cmd[a, 0] - v_w[:, 0]).abs().mean().item() / args_cli.steps_per_iter
             # terminated 只剩 bad_orientation（成功/超时/出界都是 truncated），即翻车率
             sim["terminated"] += terminated[a].float().mean().item() / args_cli.steps_per_iter

@@ -15,7 +15,7 @@ preview_task.py — Teacher-Preview 越障任务在想象中的可导版本：23
 @version v0.4.0
 @last_modified 2026-10-28
 @changelog
-    - v0.4.0 (2026-10-28): 新增 lane_obs（方案 B 车道横向偏移观测）、smooth_flat_arm / smooth_flat_ang（平地 arm 摆动与俯仰抖动惩罚）。
+    - v0.4.0 (2026-10-28): 新增 terminated 翻车惩罚、event_priority（事件优先回放）、lane_obs（方案 B 车道横向偏移观测）、smooth_flat_arm / smooth_flat_ang（平地 arm 摆动与俯仰抖动惩罚）。
     - v0.3.0 (2026-10-27): 新增 riser_anchor（后轮贴立面时加重 Teacher 锚定）、lateral_pos（critic 可见车道偏移）；新增 wheel_heading（轮子世界系朝向偏离路线），针对蟹行导致的台阶侧漂。
     - v0.2.0 (2026-10-26): 新增航向/横向速度/倾角软惩罚 shaping_terms（默认关闭）。
     - v0.1.0 (2026-10-26): 初始创建
@@ -83,6 +83,9 @@ class PreviewRewardCfg:
     # 车体上下 2.7 cm、俯仰角速度 24°/s；原有 lin_vel_z −0.5 / ang_vel_xy −0.05 太弱压不住。台阶前后不罚，不影响抬轮。
     smooth_flat_arm: float = 0.0
     smooth_flat_ang: float = 0.0
+    # × 翻车：想象里是 1 − 软存活概率，真实里是 terminated（train_terrain 同口径补上）。go2w 用 −20；
+    # 热启动任务原来没有翻车惩罚，默认 0。
+    terminated: float = 0.0
     riser_gap: tuple[float, float] = (0.06, 0.16)  # 后轮心到前方立面的水平距离窗口（半径 0.1085）
 
 
@@ -177,6 +180,13 @@ class PreviewTask:
         return y - nearest
 
     # ---------------- 奖励 ----------------
+    @torch.no_grad()
+    def event_priority(self, state) -> torch.Tensor:
+        """[B] 0/1：任一轮前方 lookahead 内有 ≥ min_step 的台阶，或轮底已离开轮下地面（正在越级）。
+        这些是世界模型最难、从零训练又最稀少的片段，供回放优先采样。"""
+        step, clearance = self.step_ahead(state)
+        return ((step >= self.cfg.min_step) | (clearance > 0.02)).any(-1).float()
+
     def anchor_weight(self, state):
         """[B] 锚定权重：后轮（rl, rr）前方 riser_gap 内有 ≥ min_step 的立面且轮底仍贴地时为 1 + riser_anchor。"""
         cfg = self.cfg
@@ -235,6 +245,7 @@ class PreviewTask:
             "yaw_rate": cfg.yaw_rate * ang_w[..., 2].square(),
             "wheel_lift": cfg.wheel_lift * (has_step * lift_frac).mean(-1) * upright,
             "idle_lift": cfg.idle_lift * ((1.0 - has_step) * idle).sum(-1),
+            **({"terminated": cfg.terminated * (1.0 - self.survival(next_state))} if cfg.terminated != 0.0 else {}),
             **self.shaping_terms(next_state),
         }
 

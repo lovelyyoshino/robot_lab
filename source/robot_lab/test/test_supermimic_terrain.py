@@ -419,3 +419,40 @@ def test_lane_marker_round_trip(tmp_path):
     lane_offset.write_marker(run, 232)
     assert lane_offset.policy_uses_lane_offset(run / "exported" / "policy.pt")
     assert lane_offset.policy_uses_lane_offset(run / "ckpt_001000.pt")
+
+
+# ---------------- 方案 D：从零训练 ----------------
+from supermimic.replay import ReplayBuffer  # noqa: E402
+
+
+def test_replay_priority_sampling_prefers_flagged_rows():
+    torch.manual_seed(0)
+    rb = ReplayBuffer(50, 8, "cpu")
+    for t in range(50):
+        flag = (torch.rand(8) < 0.05).float()  # 约 5% 的行是关键事件
+        rb.add(torch.zeros(8, state.STATE_DIM), torch.zeros(8, 12), torch.zeros(8, 12), torch.zeros(8, 3),
+               torch.zeros(8, dtype=torch.bool), priority=flag)
+    assert rb.sample_windows(400, 4, priority_fraction=0.5)["state"].shape[0] == 400
+
+    def window_priority(fraction):
+        start, env = rb._pick(2000, rb.size - 4, 4, fraction)
+        rows = rb._physical(start[:, None] + torch.arange(4)[None, :])
+        return rb.priority[rows, env[:, None].expand_as(rows)].amax(-1).mean().item()
+    # 均匀时约 1−0.95⁴≈19% 的窗口含事件；优先那一半从 4 倍候选里取前 1/4，候选中含事件的约 19%，
+    # 所以优先样本里约 0.19×4≈76% 含事件，整体约 (76%+19%)/2，即至少翻倍
+    assert window_priority(0.5) > 2.0 * window_priority(0.0)
+    assert rb.sample_states(64, priority_fraction=0.25)["state"].shape == (64, state.STATE_DIM)
+
+
+def test_terminated_penalty_and_event_priority():
+    task, _, kin = _preview(terminated=-20.0)
+    upright, cmd, zero = _flat_state(0.0, 0.37), torch.tensor([[0.3, 0.0, 0.0]]), torch.zeros(1, 12)
+    tipped = state.make_state(torch.tensor([[0.0, 0.0, 0.37]]), quat.axis_angle_to_quat(torch.tensor([[0.0, 1.5, 0.0]])),
+                              torch.zeros(1, 3), torch.zeros(1, 3), torch.zeros(1, 12), torch.zeros(1, 12))
+    assert task.reward_terms(upright, upright, cmd, zero, zero)["terminated"].abs().item() < 0.1
+    assert task.reward_terms(upright, tipped, cmd, zero, zero)["terminated"].item() < -19.0
+    plain, _, _ = _preview()
+    assert "terminated" not in plain.reward_terms(upright, upright, cmd, zero, zero)
+    front_x = kin.wheel_centers_base(torch.zeros(1, 4), torch.zeros(1, 4))[0, 0, 0].item()
+    near = _flat_state(1.5 - front_x - 0.10, 0.37)
+    assert task.event_priority(torch.cat((upright, near))).tolist() == [0.0, 1.0]
