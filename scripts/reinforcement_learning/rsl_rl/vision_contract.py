@@ -3,8 +3,9 @@
 @author pony
 @date 2026-09-30
 @version v0.2.0
-@last_modified 2026-10-14
+@last_modified 2026-10-26
 @changelog
+    - (2026-10-26): 新增 validate_scan_student，play/评测共用的扫描学生深度合同校验。
     - (2026-10-14): 保存直楼梯及方块完整几何，防止高度/级数变化后静默续训。
     - (2026-10-12): 速度奖励由reward_terms统一记录，删除重复的velocity_tracking合同字段。
     - (2026-10-12): 保存全部有效奖励配置，裁剪或调整基础奖励也会拒绝不兼容续训。
@@ -182,3 +183,38 @@ def save_contract(directory, contract):
         path = Path(directory) / "vision_contract.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(contract, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def validate_scan_student(policy_path, current_depth_contract) -> Path:
+    """supermimic 深度→扫描学生（TorchScript）不带 rsl_rl 的 params/；改核对其 run 目录的深度合同。
+
+    policy_path 约定为 <run>/exported/policy.pt。corruption_enabled 是运行开关（训练开、回放/评测关），
+    不属于输入语义，比较时剔除；其余字段任一不同都拒绝加载。
+    """
+    path = Path(policy_path)
+    contract_path = path.parent.parent / "depth_contract.json"
+    if not contract_path.is_file():
+        raise ValueError(f"缺少扫描学生的深度合同：{contract_path}")
+    trained = json.loads(contract_path.read_text(encoding="utf-8"))
+    current = json.loads(json.dumps(current_depth_contract))
+    trained.pop("corruption_enabled", None)
+    current.pop("corruption_enabled", None)
+    if trained != current:
+        raise ValueError("扫描学生训练时的深度合同与当前任务不一致")
+    return contract_path
+
+
+def validate_supermimic_terrain(policy_path, target) -> Path:
+    """supermimic 越障策略（TorchScript，232→12）：核对 run 目录 params/vision_contract.json 与当前 Teacher-Preview 合同。
+
+    policy_path 约定为 <run>/exported/policy.pt；该 JSON 由 train_terrain.py 从热启动 Teacher 复制而来，
+    权重格式不是 rsl_rl，因此只比 JSON，不查 actor.0.weight。
+    """
+    path = Path(policy_path)
+    contract_path = path.parent.parent / "params" / "vision_contract.json"
+    if not contract_path.is_file():
+        raise ValueError(f"缺少越障策略的训练合同：{contract_path}")
+    if target is None or target.get("role") != "teacher":
+        raise ValueError("--supermimic_terrain 只适用于 teacher-preview 任务")
+    validate_contract(json.loads(contract_path.read_text(encoding="utf-8")), target)
+    return contract_path

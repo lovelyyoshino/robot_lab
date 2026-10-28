@@ -4,8 +4,12 @@
 @author pony
 @date 2026-09-16
 @version v0.8.0
-@last_modified 2026-10-14
+@last_modified 2026-10-28
 @changelog
+    - (2026-10-28): --supermimic_terrain 自动识别方案 B 策略并追加车道偏移观测。
+    - (2026-10-27): 楼梯途中跌倒按 stairs_acceptance.CLIMB_TILT_DEG（16 cm 45°），终点稳定仍 31.8°；--climb_tilt_deg 覆盖。
+    - (2026-10-26): 新增 --supermimic_terrain，评测 supermimic 越障策略（TorchScript 232→12）。
+    - (2026-10-26): 新增 --scan_student，评测 supermimic 深度→扫描学生的 TorchScript，按其 depth_contract.json 校验。
     - (2026-10-14): Preview楼梯按8/12/16cm真实登顶验收，连续稳定后截断，并允许全宽单侧主动。
     - (2026-10-13): 独立评测使用稳定接近基线配置，不放宽10cm起抬或完整通过标准。
     - (2026-10-11): 全宽保留阻挡碰撞检查，分别输出真实离地和高度达标距离。
@@ -79,6 +83,14 @@ def parse_args():
     parser.add_argument("--camera_corruption", action="store_true", help="开启Temporal深度的延迟/丢帧/冻结测试。")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--depth_snapshot", type=Path, help="可选：保存初始裁剪深度PNG，非Actor能力证明。")
+    parser.add_argument("--supermimic_terrain", action="store_true",
+                        help="checkpoint 是 scripts/supermimic/train_terrain.py 导出的 TorchScript（232→12），"
+                             "仅用于 teacher-preview；按 run 目录 params/vision_contract.json 校验。")
+    parser.add_argument("--scan_student", action="store_true",
+                        help="checkpoint 是 scripts/supermimic/train_scan_student.py 导出的 TorchScript（4141→12），"
+                             "仅用于 student-preview；按 run 目录的 depth_contract.json 校验，不走 rsl_rl runner。")
+    parser.add_argument("--climb_tilt_deg", type=float, default=None,
+                        help="覆盖楼梯途中倾角门；默认按 stairs_acceptance.CLIMB_TILT_DEG（8/12 cm 31.8°，16 cm 45°）。")
     AppLauncher.add_app_launcher_args(parser)
     checkpoint_arg.required = True
     args = parser.parse_args()
@@ -97,6 +109,10 @@ def parse_args():
         parser.error("camera_corruption只适用于时序student")
     if args.scenario in STEP_FRONT_WHEELS and not args.policy.endswith("-preview"):
         parser.error("single_step提前抬轮协议需要Preview任务")
+    if args.scan_student and args.policy != "student-preview":
+        parser.error("--scan_student 只适用于 --policy student-preview")
+    if args.supermimic_terrain and args.policy != "teacher-preview":
+        parser.error("--supermimic_terrain 只适用于 --policy teacher-preview")
     if args.policy.startswith("student"):
         args.enable_cameras = True
     return args
@@ -138,10 +154,13 @@ def capture_traversal(env, *, scenario: str):
         finite &= torch.isfinite(robot.data.root_lin_vel_w).all(-1)
         quat = robot.data.root_quat_w
         alignment = 1.0 - 2.0 * (quat[:, 2].square() + quat[:, 3].square())
-        upright = robot.data.projected_gravity_b[:, 2] <= -0.85
+        cos_tilt = -robot.data.projected_gravity_b[:, 2]
+        upright = cos_tilt >= 0.85
+        # 途中跌倒按楼梯档位的倾角门（16 cm 放宽）；终点稳定仍要求 31.8° 内，顶端平台是平地。
+        climb_upright = cos_tilt >= math.cos(math.radians(protocol.get("climb_tilt_deg", 31.8)))
         in_lane = (relative[:, 1].abs() <= 0.75) & (relative[:, 0] <= 3.75)
-        fallen = ~finite | ~upright | ~in_lane
-        stable = (relative[:, 0] >= protocol["target_distance_m"]) & ~fallen
+        fallen = ~finite | ~climb_upright | ~in_lane
+        stable = (relative[:, 0] >= protocol["target_distance_m"]) & ~fallen & upright
         stable &= (relative[:, 1].abs() <= 0.15) & (alignment >= 0.8)
         stable &= hit_finite.all(-1) & support["supported"]
         if "total_height_m" in protocol:
@@ -342,7 +361,21 @@ def main(args, simulation_app):
     agent_cfg = load_cfg_from_registry(task, "rsl_rl_cfg_entry_point")
     # 三种策略在相同摩擦和地形下比较；blind 训练时的特殊摩擦不带入验收。
     preview_contract = contract_for_cfg(task, cfg, agent_cfg)
-    validate_checkpoint(args.checkpoint, preview_contract)
+    if args.scan_student:
+        from vision_contract import validate_scan_student
+
+        validate_scan_student(args.checkpoint, vision_depth_contract(cfg))
+    elif args.supermimic_terrain:
+        from vision_contract import validate_supermimic_terrain
+
+        validate_supermimic_terrain(args.checkpoint, preview_contract)
+        from robot_lab.supermimic.lane_offset import add_lane_offset_term, policy_uses_lane_offset
+
+        if policy_uses_lane_offset(args.checkpoint):
+            # 方案 B 策略：合同之外追加第 233 维车道偏移（run 目录 params/lane_offset_obs.json）
+            add_lane_offset_term(cfg)
+    else:
+        validate_checkpoint(args.checkpoint, preview_contract)
     if preview_contract is None:
         _configure_vision_terrain(cfg)
     cfg.scene.num_envs = args.num_envs
@@ -394,6 +427,8 @@ def main(args, simulation_app):
             evaluation_protocol.update(stairs_profile(
                 args.difficulty, selected.height_levels, selected.step_counts, selected.first_edge_m, selected.step_width,
             ))
+            from robot_lab.tasks.manager_based.locomotion.velocity.config.wheeled.parallelogram_rover.stairs_acceptance import climb_tilt_deg
+            evaluation_protocol["climb_tilt_deg"] = climb_tilt_deg(evaluation_protocol, args.climb_tilt_deg)
         cfg.vision_evaluation_protocol = evaluation_protocol
         cfg.terminations.preview_success = None
     support_sensors = configure_support_sensors(cfg)
@@ -440,10 +475,16 @@ def main(args, simulation_app):
         ground_prim = get_current_stage().GetPrimAtPath(support_sensors["terrain_filter"])
         if not ground_prim.IsValid() or not ground_prim.HasAPI(UsdPhysics.CollisionAPI):
             raise RuntimeError("视觉承重过滤路径不存在或不具有 CollisionAPI")
-        runner_class = DistillationRunner if args.policy.startswith("student") else OnPolicyRunner
-        runner = runner_class(env, agent_cfg.to_dict(), log_dir=None, device=args.device)
-        runner.load(str(args.checkpoint), load_optimizer=False)
-        policy = runner.get_inference_policy(device=env.unwrapped.device)
+        if args.scan_student or args.supermimic_terrain:
+            scripted = torch.jit.load(str(args.checkpoint), map_location=env.unwrapped.device).eval()
+
+            def policy(observation):
+                return scripted(observation["policy"])
+        else:
+            runner_class = DistillationRunner if args.policy.startswith("student") else OnPolicyRunner
+            runner = runner_class(env, agent_cfg.to_dict(), log_dir=None, device=args.device)
+            runner.load(str(args.checkpoint), load_optimizer=False)
+            policy = runner.get_inference_policy(device=env.unwrapped.device)
         obs, _ = env.reset()
         depth_probe_initial = (capture_depth_probe(env.unwrapped, args, save_snapshot=False)
                                if args.policy.startswith("student") else None)
@@ -491,7 +532,9 @@ def main(args, simulation_app):
             tracker.update(stable, terminated, truncated, finite)
             if prelift is not None:
                 prelift.update(env.unwrapped._vision_prelift_sample, tracker)
-            runner.alg.policy.reset(dones)
+            if not (args.scan_student or args.supermimic_terrain):
+                # 扫描学生的 GRU 只在 8 帧窗口内展开、跨步无状态，无需 reset。
+                runner.alg.policy.reset(dones)
             if frozen_depth is not None:
                 reset_ids = dones.bool()
                 frozen_depth[reset_ids] = obs["policy"][reset_ids, 45:]

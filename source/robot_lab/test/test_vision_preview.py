@@ -82,6 +82,21 @@ def test_stairs_have_three_height_stages_and_clear_top_targets(preview):
     assert all(p["first_edge_m"] - 0.34724 - 0.1085 > 0.65 for p in profiles)
 
 
+def test_stairs_climb_tilt_gate_only_relaxed_at_16cm(preview):
+    # 倾角门放在独立文件：vision_preview.py 受 vision_contract sha256 保护，改它会让旧 checkpoint 失配
+    path = Path(preview.__file__).with_name("stairs_acceptance.py")
+    spec = importlib.util.spec_from_file_location("stairs_acceptance_under_test", path)
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    profiles = [preview.stairs_profile(d) for d in (0.0, 0.5, 1.0)]
+    # 8/12 cm 与全局直立门 31.8°（−g_z≥0.85）一致，只有 16 cm 放宽
+    assert [gate.climb_tilt_deg(p) for p in profiles] == [31.8, 31.8, 45.0]
+    assert gate.min_climb_cos(profiles[0]) == pytest.approx(0.85, abs=1e-3)
+    assert gate.climb_tilt_deg(profiles[2], 55.0) == 55.0
+    with pytest.raises(ValueError):
+        gate.climb_tilt_deg(profiles[2], 95.0)
+
+
 def test_all_stages_expose_stairs_and_no_dual_active_gate(preview):
     assert all(weights.get("pyramid_stairs_inv", 0) > 0 for weights in preview.PREVIEW_STAGE_WEIGHTS)
     columns = ("single_step", "single_step_left", "single_step_right", "pyramid_stairs_inv", "flat")

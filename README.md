@@ -262,7 +262,7 @@ BeyondMimic for Unitree G1:
 
 当前目标是保持前进方向、接近障碍后主动抬轮并稳定越过。全宽允许左或右前轮先主动抬起，另一轮主动或被动滚上；左右窄障碍仍检查对应侧，不固定左先，不训练跳跃。真正起抬偏好为轮胎前缘距障碍约10cm（有效8–14cm）；65cm用于感知，25cm内允许接地减载准备。
 
-Teacher为232维高度扫描策略；Student为4141维本体信息＋深度历史策略。流程为Teacher PPO → 单障碍动作验收和8/12/16cm楼梯验收 → Student DAgger动作蒸馏 → 独立Student评测与深度消融。一个Teacher网络自动训练多个阶段，8000轮是总预算。
+Teacher为232维高度扫描策略；Student为4141维本体信息＋深度历史策略。这里的深度是仿真相机测距经过裁剪和时间堆叠，不是单独训练的深度网络。相机、0.7秒历史、合同号和仍在注册的旧任务见 [深度观测入口](docs/vision_preview_workflow.md#depth-observation)。流程为Teacher PPO → 单障碍动作验收和8/12/16cm楼梯验收 → Student DAgger动作蒸馏 → 独立Student评测与深度消融。一个Teacher网络自动训练多个阶段，8000轮是总预算。
 
 | 阶段 | 地形行 | 每级高度／级数 | 楼梯抽样占比 |
 |---|---|---|---|
@@ -273,6 +273,52 @@ Teacher为232维高度扫描策略；Student为4141维本体信息＋深度历�
 每阶段同时包含全宽、左右窄障碍、楼梯、方块及少量平地。晋级要求两次合格的稳定通行；跨stage必须通过本档楼梯，平地不晋级。全宽不再用双侧主动动作卡住课程。楼梯有1.2m接近段、40cm踏面及顶端平台，每一级重新识别前缘并提供一次动作机会，禁止同阶跺脚重复领奖。
 
 当前课程、奖励和终止条件与旧合同不同，旧合同模型需要重新训练；保留原模型与报告。2026-10-14已完成当前合同的8000轮Teacher：8cm楼梯通行100%、12cm为75%、16cm为0%，单障碍提前主动动作仍未达标。16cm仍是探索目标。训练继续使用原来的Preview任务名，不增加功能版本。
+
+#### 完整流程总览：Teacher → Student → 回放
+
+所有命令在 `/media/bigdisk/robot_lab` 下、已能启动 Isaac Lab 的终端执行（`conda activate env_isaaclab; unset PYTHONPATH; source /media/bigdisk/IsaacLab/_isaac_sim/setup_conda_env.sh`）。本节两步都用 rsl_rl：Teacher 是 PPO，Student 是 DAgger 动作蒸馏。
+
+| 步骤 | 做什么 | 产物 |
+|---|---|---|
+| 1. Teacher | 232 维高度扫描策略，8/12/16 cm 课程，PPO 8000 轮 | `logs/vision_preview/teacher/<时间戳>_stairs_climb/model_7999.pt` |
+| 2. Student | 4141 维深度历史策略，DAgger 蒸馏 Teacher 8000 轮 | `logs/vision_preview/student/<时间戳>_stairs_depth/model_7999.pt` |
+| 3. 验收 / 回放 | 楼梯逐档评测、单障碍评测、深度消融、GUI 回放 | `logs/vision_preview/eval/*.json` |
+
+```bash
+# 1. Teacher：记下训练打印的时间戳目录
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Teacher-Preview-v0 \
+  --experiment_name /media/bigdisk/robot_lab/logs/vision_preview/teacher --run_name stairs_climb \
+  --num_envs 1024 --max_iterations 8000 --seed 42 --headless
+TEACHER=logs/vision_preview/teacher/2026-10-14_11-31-31_stairs_climb/model_7999.pt   # 换成你的
+python scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py --headless \
+  --policy teacher-preview --scenario pyramid_stairs_inv --difficulty 0.5 \
+  --checkpoint $TEACHER --num_envs 16 --episodes_per_env 2 --seed 142
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Teacher-Preview-v0 \
+  --checkpoint $TEACHER --num_envs 4 --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5
+
+# 2. Student：首次不加 --resume（--checkpoint 是 Teacher）
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Student-Temporal-Preview-v0 \
+  --checkpoint $TEACHER \
+  --experiment_name /media/bigdisk/robot_lab/logs/vision_preview/student --run_name stairs_depth \
+  --num_envs 128 --max_iterations 8000 --seed 42 --headless
+STUDENT=logs/vision_preview/student/<时间戳>_stairs_depth/model_7999.pt              # 换成你的
+
+# 3. Student 验收与回放（difficulty 0.0/0.5/1.0 = 8/12/16 cm）
+python scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py --headless \
+  --policy student-preview --scenario pyramid_stairs_inv --difficulty 0.5 --depth_mode live \
+  --checkpoint $STUDENT --num_envs 16 --episodes_per_env 2 --seed 142
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Student-Temporal-Preview-v0 \
+  --checkpoint $STUDENT --num_envs 4 --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5
+```
+
+- 当前 Teacher 楼梯成绩（64 回合/档）：8/12/16 cm 为 100% / 70% / 0%。
+- 评测脚本退出码 1 表示"跑完但未达验收门"，2 才是执行出错。
+- 每一步的细节（日志判读、单障碍与深度消融、续训）见下文 Teacher / Student 小节。
+- 想在 Teacher 基础上继续提升楼梯能力，见独立的 [SuperMimic 越障优化一节](#rover-supermimic)，它不改动本节的任何训练与产物。
 
 先在已能启动Isaac Lab的终端执行Teacher训练：
 
@@ -330,7 +376,7 @@ python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/play.py \
 
 #### Student：训练、独立评测与续训
 
-Student接收4141维输入：45维本体／路线命令＋8帧16×32深度历史（4096维，约0.7秒跨度），网络为MLP，隐藏层1024／512／256，输出12维动作。Teacher固定为监督来源，通过RSL-RL `DistillationRunner`＋`DaggerDistillation`训练Student；当前没有CNN＋GRU、共享Actor或同轮交替PPO，也不需要恢复示范、AMP或单独BC初始化。
+Student接收4141维输入：45维本体／路线命令＋8帧16×32深度历史（4096维，约0.7秒跨度），网络为MLP，隐藏层1024／512／256，输出12维动作。Teacher固定为监督来源，通过RSL-RL `DistillationRunner`＋`DaggerDistillation`训练Student；本流程没有CNN＋GRU、共享Actor或同轮交替PPO，也不需要恢复示范、AMP或单独BC初始化。另一条深度扫描学生属于 SuperMimic 实验，见 [SuperMimic 越障优化一节](#rover-supermimic) 的「其他可选流程」。
 
 **1. 确认Teacher能力，再开始Student训练。** 当前Teacher可用于低障碍通行基线实验；如果目标是约10cm前主动抬轮及16cm楼梯，先继续改善Teacher，不能把动作蒸馏当成补足缺失技能的方法。以下使用已经评测过的明确Teacher路径：
 
@@ -343,7 +389,7 @@ python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/train.py \
   --num_envs 128 --max_iterations 8000 --seed 42 --headless
 ```
 
-首次Student训练不加 `--resume`，此时checkpoint是Teacher。任务自动开启相机；显存不足可将128降为64／32，但每轮样本量会改变。每台车每回合选择驱动者，Teacher驱动概率前4000轮从75%降到10%，之后保留10%；动作标签始终由同一状态的固定Teacher提供。每轮24步、4个epoch、每4步累计更新一次，学习率在8000轮内从5e−4降至1e−4。训练reward和课程比例含Teacher驱动回合，不能当作Student独立能力。
+首次Student训练不加 `--resume`，此时checkpoint是Teacher。任务自动开启相机，并把预处理合同写到该run的 `params/depth_contract.json`；显存不足可将128降为64／32，但每轮样本量会改变。每台车每回合选择驱动者，Teacher驱动概率前4000轮从75%降到10%，之后保留10%；动作标签始终由同一状态的固定Teacher提供。每轮24步、4个epoch、每4步累计更新一次，学习率在8000轮内从5e−4降至1e−4。训练reward和课程比例含Teacher驱动回合，不能当作Student独立能力。
 
 **2. 选择Student模型，再分别评测全宽、左右窄障碍。** 以下模型表达式只选择跑满8000轮后的 `*_stairs_depth/model_7999.pt`。没有文件时不要执行；中途评测请填写已保存模型的真实绝对路径。多个run时最后时间戳不代表最佳模型，同一组评测固定同一文件并核对 `checkpoint_sha256`。
 
@@ -415,7 +461,6 @@ python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_p
   --output /media/bigdisk/robot_lab/logs/vision_preview/eval/student_full_frozen_seed142.json
 ```
 
-`blank`将全部4096维深度替换为归一化最远距离值+1；`frozen`在每个回合固定初始8帧历史，reset后刷新。45维本体／命令始终实时。默认评测关闭训练中的观测扰动；额外验证延迟／丢帧／噪声时加 `--camera_corruption`，三种对照须保持该设置一致。报告里的 `depth_probe`读取实际相机，即使blank／frozen也可能显示正常图像，不代表Student收到了实时深度。
 
 实时成功而空白／冻结明显下降，支持策略利用视觉；三种都成功时视觉依赖尚未证明，可能存在固定动作或本体反馈；三种都失败时先检查Student独立控制能力。固定场景和异常深度输入也有判读限制，需在左右窄障碍及楼梯上重复对照、增加seed，不能仅凭深度截图宣称视觉决策完成。
 
@@ -468,7 +513,6 @@ tensorboard --logdir /media/bigdisk/robot_lab/logs/vision_preview/student
 
 Student本次193项相关测试通过，4环境新训2轮＋续训1轮正常，Teacher权重保持不变；实时／空白／冻结各完成4回合，通行率均0%，无非有限数回合。短训只证明输入、监督、续训和评测链路能运行，尚无全量Student成绩或视觉依赖结论。相机探针确认被测全宽场景能看到障碍，未证明所有场景可见或策略实际利用视觉。证据目录为 `/media/bigdisk/robot_lab/logs/vision_preview_diagnostics/student_access.T8MpL4/`；Student全量训练、GUI面板、实车迁移仍需验证。
 
-Teacher完整步骤、Student左右窄／三档楼梯独立命令、日志判读和历史证据见 [视觉训练与楼梯流程](docs/vision_preview_workflow.md)。
 
 ### 平行四边形轮式车：从零训练侧躺恢复（实验性）
 
@@ -659,6 +703,123 @@ python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_p
 合格稳态需连续延伸到 5 秒终点，持续至少 0.5 秒，且该稳态段开始不晚于 4 秒。
 通过有限样本测试也不意味着任意姿态或真机成功率有保证。
 
+<a id="rover-supermimic"></a>
+
+### 平行四边形轮式车：SuperMimic 越障优化（实验性）
+
+本节以越障优化为主线：先用 PPO 训 Teacher，再用 SuperMimic 世界模型梯度在楼梯上优化，最后把优化后的策略蒸馏给深度 Student。
+不改动上面视觉前瞻一节的训练与产物。命令在 `/media/bigdisk/robot_lab` 下、已能启动 Isaac Lab 的终端执行
+（`conda activate env_isaaclab; unset PYTHONPATH; source /media/bigdisk/IsaacLab/_isaac_sim/setup_conda_env.sh`）。
+
+#### 完整流程（6 步）
+
+| 步骤 | 做什么 | 训练方法 | 产物 |
+|---|---|---|---|
+| 1. Teacher | 232 维高度扫描策略，8/12/16 cm 课程 | PPO | `logs/vision_preview/teacher/<时间戳>_stairs_climb/model_7999.pt` |
+| 2. 越障优化 | 从 Teacher 热启动，在楼梯上继续优化 | SuperMimic 世界模型梯度 | `logs/supermimic_terrain/<run>/` |
+| 3. 验收与回放 | 8/12/16 cm 评测 + 汇总表，GUI 回放 | — | `<run>/acceptance/summary.md` |
+| 4. 转换 | 把越障策略转成 rsl_rl 格式的 Teacher | — | `<run>/rsl_rl_teacher/model_1000.pt` |
+| 5. Student | 4141 维深度策略，蒸馏第 4 步的老师 | DAgger | `logs/vision_preview/student_v3/<时间戳>_stairs_depth/model_7999.pt` |
+| 6. Student 验收与回放 | 楼梯逐档评测、深度消融、GUI 回放 | — | `eval/*.json` |
+
+```bash
+# 1. Teacher（PPO 8000 轮）；已有可跳过
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Teacher-Preview-v0 \
+  --experiment_name /media/bigdisk/robot_lab/logs/vision_preview/teacher --run_name stairs_climb \
+  --num_envs 1024 --max_iterations 8000 --seed 42 --headless
+TEACHER=logs/vision_preview/teacher/2026-10-14_11-31-31_stairs_climb/model_7999.pt   # 换成你的
+
+# 2. 越障优化（默认参数即当前采用的 v3，1024 env × 1000 轮约 1 小时；不要加大轮数，2000 轮后 8/12 cm 会退化到 0–6%）
+python scripts/supermimic/train_terrain.py --headless --teacher $TEACHER \
+  --num_envs 1024 --max_iterations 1000 --run_name terrain_v3
+# 续训（不给 --run_name 时写回原 run）
+python scripts/supermimic/train_terrain.py --headless --resume --load_run terrain_v3 --max_iterations 3000
+
+# 3. 验收（约 40 分钟）与回放
+python scripts/supermimic/accept_terrain.py --load_run terrain_v3
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Teacher-Preview-v0 \
+  --supermimic_terrain --load_run terrain_v3 --num_envs 4 --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5
+
+# 4. 转换（几秒，不启动 Isaac）
+python scripts/supermimic/export_terrain_teacher.py --load_run terrain_v3
+
+# 5. Student（DAgger 8000 轮；首次不加 --resume）
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Student-Temporal-Preview-v0 \
+  --checkpoint logs/supermimic_terrain/terrain_v3/rsl_rl_teacher/model_1000.pt \
+  --experiment_name /media/bigdisk/robot_lab/logs/vision_preview/student_v3 --run_name stairs_depth \
+  --num_envs 128 --max_iterations 8000 --seed 42 --headless
+STUDENT=logs/vision_preview/student_v3/<时间戳>_stairs_depth/model_7999.pt          # 换成你的
+
+# 6. Student 验收与回放（difficulty 0.0/0.5/1.0 = 8/12/16 cm；depth_mode 换 blank/frozen 做消融）
+python scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py --headless \
+  --policy student-preview --scenario pyramid_stairs_inv --difficulty 0.5 --depth_mode live \
+  --checkpoint $STUDENT --num_envs 16 --episodes_per_env 2 --seed 142
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Student-Temporal-Preview-v0 \
+  --checkpoint $STUDENT --num_envs 4 --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5
+```
+
+#### 当前进度与成品
+
+| 步骤 | 状态 | 位置 |
+|---|---|---|
+| 1. Teacher | 完成；8/12/16 cm 为 100% / 70% / 0% | `logs/vision_preview/teacher/2026-10-14_11-31-31_stairs_climb/model_7999.pt` |
+| 2–3. 越障优化与验收 | 完成，采用 v3；8/12/16 cm 为 86% / 98% / 0% | `logs/supermimic_terrain/probe_v3` |
+| 4. 转换 | 完成；转换后按普通 Teacher 评测，8/12 cm 与 v3 逐回合一致 | `logs/supermimic_terrain/probe_v3/rsl_rl_teacher/model_1000.pt` |
+| 5–6. Student | 未开始全量训练（只跑过 2 轮冒烟） | — |
+
+用现成的 v3 时，上面命令里的 `terrain_v3` 换成 `probe_v3`，可以直接从第 5 步开始。
+
+#### 说明
+
+- 第 2 步的方案：世界模型在楼梯回放上拟合，actor 在世界模型里想象 32 步（0.64 s），回报梯度穿过世界模型更新 actor；
+  PPO Teacher 提供起点、不能偏离太远的约束和 15% 的采样数据；critic 用真实回报拟合。
+- 16 cm 仍是 0%：车能登顶，但每级右侧先上，累计向一侧偏约 0.5 m，越线横向超差；策略观测里没有横向位置，靠调奖励改不了。原因与各版本实验见 plan.md 4.5–4.6。
+- 越障策略部署时动作限幅 ±2π，rsl_rl Teacher 不限幅；v3 在 16 cm 楼梯上只有 0.009% 的动作超出，对蒸馏没有实际影响。
+- 同一时刻只启动一个 Isaac 进程导入机器人，并行训练请错开启动，否则会报 mimic 关节缺失。
+
+#### 方案 B（已试，未达标）：给越障策略加车道横向偏移观测
+
+16 cm 失败是爬台阶时侧漂、策略又看不到自己的横向位置。方案 B 不动 Teacher，只给 SuperMimic actor 多 1 维"离车道中线多远"
+（第 233 维，权重从 0 开始，起点与 Teacher 完全相同），再在想象里罚偏移，让世界模型梯度学会纠偏：
+
+```bash
+python scripts/supermimic/train_terrain.py --headless --teacher $TEACHER --num_envs 1024 --max_iterations 1000 \
+  --lane_obs --lateral_pos -5 --run_name laneB_p5
+python scripts/supermimic/accept_terrain.py --load_run laneB_p5         # 评测/回放自动识别并追加第 233 维
+# 中间存档也要验收（训练中可能退化）：导出到 <run>/ckpt_eval/itXXXX/ 再验收
+python scripts/supermimic/export_ckpt.py --load_run laneB_p5 --iterations 500
+python scripts/supermimic/accept_terrain.py --checkpoint logs/supermimic_terrain/laneB_p5/ckpt_eval/it500/exported/policy.pt
+```
+
+run 目录的 `params/lane_offset_obs.json` 是标记，`play.py --supermimic_terrain`、验收和诊断据此自动追加观测，命令不变。
+部署需要车载定位提供"离路线中线多远"；Student 观测还没有这一项，方案 B 的策略暂不能转换成 Student 老师。
+
+2026-10-28 结果：lateral_pos −5 为 81% / 42% / 0%，−20 为 34% / 19% / 0%（v3 为 86% / 98% / 0%）。16 cm 侧漂只从 −0.57 m 压到 −0.38 m，8/12 cm 退化，暂不采用。
+
+#### 其他可选流程
+
+不在上面主线上，按需使用。
+
+平地 SuperMimic（45 → 12，纯平地速度跟踪，没有地形）：
+
+```bash
+python scripts/supermimic/train_rover.py --headless --num_envs 4096 --iterations 10000 --steps_per_iter 2 --run_name flat_v1
+python scripts/supermimic/play_rover.py --load_run flat_v1              # 加 --keyboard 遥控，--video --headless 录像
+```
+
+深度扫描学生（第 5 步的另一种做法：深度预测高度扫描，再交给冻结的 Teacher actor；目前只支持 rsl_rl 格式 Teacher）：
+
+```bash
+python scripts/supermimic/train_scan_student.py --headless --teacher $TEACHER --num_envs 512 --iterations 4000 --run_name scan_v1
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Student-Temporal-Preview-v0 \
+  --scan_student --checkpoint logs/supermimic_scan/scan_v1/exported/policy.pt \
+  --num_envs 4 --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5
+```
 
 ### 其他实验示例
 

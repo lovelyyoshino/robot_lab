@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # @author pony
 # @date 2026-09-16
-# @version v0.13.0
-# @last_modified 2026-10-12
+# @version v0.16.0
+# @last_modified 2026-10-28
 # @changelog
+#   - v0.16.0 (2026-10-28): --supermimic_terrain 自动识别方案 B 策略并追加车道偏移观测。
+#   - v0.15.0 (2026-10-27): 新增 --supermimic_terrain 回放 supermimic 越障策略（与 --scan_student 同一路径）。
+#   - v0.14.0 (2026-10-26): 新增 --scan_student 回放 supermimic 深度→扫描学生；主循环抽为 _play_loop 共用。
 #   - (2026-10-12): 先冻结训练合同再调整回放地形，删除与场景配置重复的课程开关。
 #   - (2026-10-12): Preview混合回放明确排布全宽、左右窄障碍、楼梯和方块；四车含楼梯。
 #   - (2026-10-11): 只读输出首次真实离地/高度达标距离和承重，避免把瞬时几何当起抬时机。
@@ -72,6 +75,12 @@ parser.add_argument(
     help="每5步打印最多4车的前缘距离、10cm动作窗口、抬升量和净空；只读诊断。",
 )
 parser.add_argument("--disable_depth_overlay", action="store_true", help="关闭 1–4 台视觉车的自动深度角落面板。")
+parser.add_argument("--scan_student", action="store_true",
+                    help="回放 scripts/supermimic/train_scan_student.py 的深度→扫描学生；--checkpoint 指向其 "
+                         "exported/policy.pt，省略时取 logs/supermimic_scan 下最新 run。仅用于 Student-Temporal-Preview。")
+parser.add_argument("--supermimic_terrain", action="store_true",
+                    help="回放 scripts/supermimic/train_terrain.py 的越障策略；--checkpoint 指向其 exported/policy.pt，"
+                         "省略时取 --load_run（或最新 run）。仅用于 Vision-Teacher-Preview。")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--recovery_motor_profile", type=str, default=None,
                     help="恢复电机实测配置；省略时自动读取checkpoint对应的标定快照。")
@@ -357,11 +366,48 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             return
     elif args_cli.checkpoint:
         resume_path = retrieve_file_path(args_cli.checkpoint)
+    elif args_cli.scan_student or args_cli.supermimic_terrain:
+        resume_path = None  # 下方在 logs/supermimic_scan / logs/supermimic_terrain 里找导出
     else:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
-    log_dir = os.path.dirname(resume_path)
-    validate_checkpoint(resume_path, preview_contract)
+    if args_cli.scan_student:
+        # 扫描学生是 TorchScript，没有 rsl_rl 的 params/；改核对它训练时写下的深度合同。
+        from robot_lab.tasks.manager_based.locomotion.velocity.config.wheeled.parallelogram_rover.vision_env_cfg import vision_depth_contract
+        from vision_contract import validate_scan_student
+
+        if not args_cli.task.endswith("Vision-Student-Temporal-Preview-v0"):
+            raise ValueError("--scan_student 只适用于 Vision-Student-Temporal-Preview-v0")
+        if not args_cli.checkpoint:
+            runs = sorted(p for p in Path("logs/supermimic_scan").glob("*/exported/policy.pt"))
+            if not runs:
+                raise FileNotFoundError("logs/supermimic_scan 下没有已导出的扫描学生")
+            resume_path = str(max(runs, key=lambda p: p.stat().st_mtime).resolve())
+        validate_scan_student(resume_path, vision_depth_contract(env_cfg))
+        log_dir = os.path.dirname(os.path.dirname(resume_path))
+    elif args_cli.supermimic_terrain:
+        # 越障策略是 TorchScript（232→12），观测/动作合同与热启动 Teacher 相同，按 run 目录的 vision_contract.json 校验。
+        from vision_contract import validate_supermimic_terrain
+
+        if args_cli.scan_student:
+            raise ValueError("--supermimic_terrain 与 --scan_student 不能同时使用")
+        if not args_cli.checkpoint:
+            root = Path("logs/supermimic_terrain")
+            runs = [root / agent_cfg.load_run / "exported/policy.pt"] if agent_cfg.load_run not in (None, ".*") \
+                else list(root.glob("*/exported/policy.pt"))
+            runs = [p for p in runs if p.is_file()]
+            if not runs:
+                raise FileNotFoundError(f"{root} 下没有已导出的越障策略（--load_run={agent_cfg.load_run}）")
+            resume_path = str(max(runs, key=lambda p: p.stat().st_mtime).resolve())
+        validate_supermimic_terrain(resume_path, preview_contract)
+        from robot_lab.supermimic.lane_offset import add_lane_offset_term, policy_uses_lane_offset
+
+        if policy_uses_lane_offset(resume_path):
+            add_lane_offset_term(env_cfg)  # 方案 B 策略：追加第 233 维车道偏移
+        log_dir = os.path.dirname(os.path.dirname(resume_path))
+    else:
+        log_dir = os.path.dirname(resume_path)
+        validate_checkpoint(resume_path, preview_contract)
 
     from recovery_contract import configure_failure_replay_env, is_residual_recovery_task
 
@@ -425,6 +471,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+    if args_cli.scan_student or args_cli.supermimic_terrain:
+        # 两者都是无状态 TorchScript，直接吃 policy 观测，不走 rsl_rl runner
+        _play_loop(env, _scan_student_policy(resume_path, env.unwrapped.device), lambda dones: None)
+        return
     # load previously trained model
     if agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
@@ -476,6 +526,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         with open(os.path.join(export_model_dir, "depth_contract.json"), "w", encoding="utf-8") as stream:
             json.dump(vision_depth_contract(env_cfg), stream, ensure_ascii=False, indent=2, allow_nan=False)
 
+    reset = policy.reset if version.parse(installed_version) >= version.parse("4.0.0") else policy_nn.reset
+    _play_loop(env, policy, reset)
+
+
+def _scan_student_policy(path, device):
+    """无状态 TorchScript：扫描学生 4141→12（GRU 只在 8 帧窗口内展开）或越障策略 232→12，都不需要 reset。"""
+    scripted = torch.jit.load(path, map_location=device).eval()
+
+    def policy(obs):
+        return scripted(obs["policy"])
+
+    return policy
+
+
+def _play_loop(env, policy, reset):
     dt = env.unwrapped.step_dt
 
     # reset environment
@@ -495,10 +560,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 obs, _, dones, _ = env.step(actions)
                 if depth_overlay is not None:
                     depth_overlay.update()
-                if version.parse(installed_version) >= version.parse("4.0.0"):
-                    policy.reset(dones)
-                else:
-                    policy_nn.reset(dones)
+                reset(dones)
             timestep += 1
             if args_cli.max_steps is not None and timestep >= args_cli.max_steps:
                 break
@@ -513,7 +575,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if depth_overlay is not None:
             depth_overlay.close()
         env.close()
-
 
 if __name__ == "__main__":
     main()

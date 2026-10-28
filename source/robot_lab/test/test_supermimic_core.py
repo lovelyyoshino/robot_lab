@@ -1,0 +1,462 @@
+"""SuperMimic 核心（四元数、状态增量、观测合同、奖励、回放、世界模型、learner、扫描学生）回归，不依赖仿真器。
+
+@author pony
+@date 2026-10-26
+@version v0.2.0
+@last_modified 2026-10-26
+@changelog
+    - v0.2.0 (2026-10-26): 覆盖 ξ 上下文、aux 头、奖励偏差诊断与 actor 更新间隔。
+    - v0.1.0 (2026-10-26): 初始创建
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+# 把 robot_lab/ 加到路径，以顶层包 supermimic 导入，避开 robot_lab/__init__ 对 Isaac Sim 的依赖。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "robot_lab"))
+
+from supermimic import quat, rover_task, scan_student, state  # noqa: E402
+from supermimic.learner import SuperMimicCfg, SuperMimicLearner  # noqa: E402
+from supermimic.networks import RunningNorm, WorldModel  # noqa: E402
+from supermimic.replay import ReplayBuffer  # noqa: E402
+
+
+def random_quat(n):
+    return quat.quat_normalize(torch.randn(n, 4))
+
+
+def random_state(n, scale=1.0):
+    return state.make_state(
+        torch.randn(n, 3), random_quat(n), torch.randn(n, 3) * scale, torch.randn(n, 3) * scale,
+        torch.randn(n, 12) * 0.3, torch.randn(n, 12) * scale,
+    )
+
+
+# ---------------- 四元数 ----------------
+def test_axis_angle_round_trip_and_small_angle_gradient():
+    rotvec = torch.randn(64, 3)
+    rotvec = rotvec / rotvec.norm(dim=-1, keepdim=True) * torch.rand(64, 1) * 3.0
+    assert torch.allclose(quat.quat_to_axis_angle(quat.axis_angle_to_quat(rotvec)), rotvec, atol=1e-5)
+    zero = torch.zeros(1, 3, requires_grad=True)
+    quat.axis_angle_to_quat(zero).sum().backward()
+    assert torch.isfinite(zero.grad).all()
+
+
+def test_projected_gravity_matches_isaac_convention():
+    identity = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    assert torch.allclose(quat.projected_gravity(identity), torch.tensor([[0.0, 0.0, -1.0]]))
+    # 绕 +Y 转 90°（机头朝下）后，重力在机体系指向 +X。
+    pitch = quat.axis_angle_to_quat(torch.tensor([[0.0, torch.pi / 2, 0.0]]))
+    assert torch.allclose(quat.projected_gravity(pitch), torch.tensor([[1.0, 0.0, 0.0]]), atol=1e-6)
+
+
+# ---------------- 状态增量 ----------------
+def test_integrate_inverts_compute_delta():
+    s0, s1 = random_state(128), random_state(128)
+    s1[:, state.QUAT] = quat.quat_mul(s0[:, state.QUAT], quat.axis_angle_to_quat(torch.randn(128, 3) * 0.5))
+    rebuilt = state.integrate(s0, state.compute_delta(s0, s1))
+    assert torch.allclose(rebuilt, s1, atol=1e-5)
+    assert torch.allclose(state.state_error(rebuilt, s1), torch.zeros(128, state.DELTA_DIM), atol=1e-5)
+
+
+def test_features_and_delta_are_heading_and_translation_invariant():
+    s0, s1 = random_state(32), random_state(32)
+    yaw = quat.axis_angle_to_quat(torch.tensor([[0.0, 0.0, 1.3]])).expand(32, 4)
+    shift = torch.tensor([5.0, -2.0, 0.0])
+
+    def transform(s):
+        out = s.clone()
+        out[:, state.POS] = quat.quat_apply(yaw, s[:, state.POS]) + shift
+        out[:, state.QUAT] = quat.quat_mul(yaw, s[:, state.QUAT])
+        return out
+
+    assert torch.allclose(state.features(transform(s0)), state.features(s0), atol=1e-5)
+    assert torch.allclose(state.compute_delta(transform(s0), transform(s1)), state.compute_delta(s0, s1), atol=1e-4)
+
+
+def test_wheel_positions_never_enter_state():
+    s = random_state(4)
+    assert torch.count_nonzero(s[:, state.JPOS][:, state.NUM_LEG_JOINTS:]) == 0
+
+
+# ---------------- 观测与奖励 ----------------
+def test_open_loop_errors_zero_for_exact_model_and_constant_velocity_baseline():
+    """常速度轨迹上：真动力学和常速度基线开环误差都应为 0；跨 done 的起点不计入。"""
+    from supermimic.diagnostics import open_loop_errors
+
+    dt, T, N = rover_task.CONTROL_DT, 12, 4
+    s = random_state(N, 0.5)
+    s[:, state.JVEL] = 0.0
+    states = [s]
+    for _ in range(T - 1):
+        states.append(state.constant_velocity_step(states[-1], dt))
+    S, A = torch.stack(states), torch.zeros(T, N, 12)
+    D = torch.zeros(T, N, dtype=torch.bool)
+    D[5, 0] = True
+    step = lambda x, a, c: state.constant_velocity_step(x, dt)  # noqa: E731
+    err = open_loop_errors(S, A, D, step, horizons=(1, 4))
+    for k in ("k1", "k4"):
+        assert all(v < 1e-4 for name, v in err[k].items() if name != "samples")
+    # k=4：env0 在起点 2..5 跨过 done[5]，共 8 个起点里少 4 个。
+    assert err["k4"]["samples"] == 8 * N - 4
+
+
+def test_policy_observation_layout_matches_45d_contract():
+    s = random_state(3)
+    cmd, last = torch.randn(3, 3), torch.randn(3, 12)
+    obs = rover_task.policy_observation(s, cmd, last)
+    assert obs.shape == (3, 45)
+    assert torch.allclose(obs[:, 0:3], s[:, state.ANG] * 0.25)
+    assert torch.allclose(obs[:, 3:6], quat.projected_gravity(s[:, state.QUAT]))
+    assert torch.allclose(obs[:, 6:9], cmd)
+    assert torch.allclose(obs[:, 9:17], s[:, state.JPOS][:, :8])
+    assert torch.count_nonzero(obs[:, 17:21]) == 0
+    assert torch.allclose(obs[:, 21:33], s[:, state.JVEL] * 0.05)
+    assert torch.allclose(obs[:, 33:45], last)
+
+
+def _upright_state(lin_vel, ang_z=0.0):
+    s = state.make_state(torch.zeros(1, 3), torch.tensor([[1.0, 0, 0, 0]]), torch.tensor([lin_vel]),
+                         torch.tensor([[0.0, 0.0, ang_z]]), torch.zeros(1, 12), torch.zeros(1, 12))
+    return s
+
+
+def test_reward_prefers_tracking_and_gates_when_flipped():
+    cfg = rover_task.RoverRewardCfg()
+    cmd, zero = torch.tensor([[0.8, 0.0, 0.0]]), torch.zeros(1, 12)
+    good = rover_task.reward(_upright_state([0.8, 0.0, 0.0]), _upright_state([0.8, 0.0, 0.0]), cmd, zero, zero, cfg)
+    bad = rover_task.reward(_upright_state([0.0, 0.0, 0.0]), _upright_state([0.0, 0.0, 0.0]), cmd, zero, zero, cfg)
+    assert good > bad
+    flipped = _upright_state([0.8, 0.0, 0.0])
+    flipped[:, state.QUAT] = quat.axis_angle_to_quat(torch.tensor([[torch.pi, 0.0, 0.0]]))
+    terms = rover_task.reward_terms(flipped, flipped, cmd, zero, zero, cfg)
+    assert terms["track_lin_vel"].item() == pytest.approx(0.0)
+
+
+def test_survival_is_soft_and_consistent_with_hard_termination():
+    cfg = rover_task.RoverRewardCfg()
+    s = _upright_state([0.0, 0.0, 0.0]).repeat(3, 1)
+    angles = torch.tensor([0.2, cfg.tilt_limit, 2.0])
+    s[:, state.QUAT] = quat.axis_angle_to_quat(torch.stack((angles, 0 * angles, 0 * angles), -1))
+    p = rover_task.survival(s, cfg)
+    assert p[0] > 0.99 and p[1] == pytest.approx(0.5, abs=1e-3) and p[2] < 0.01
+    assert rover_task.hard_terminated(s, cfg).tolist() == [False, False, True]
+
+
+# ---------------- 回放 ----------------
+def test_replay_windows_mask_episode_boundaries_and_wrap():
+    buf = ReplayBuffer(capacity=6, num_envs=1, device="cpu")
+    for t in range(9):  # 写满后再绕回 3 行
+        s = torch.full((1, state.STATE_DIM), float(t))
+        buf.add(s, torch.zeros(1, 12), torch.zeros(1, 12), torch.zeros(1, 3), torch.tensor([t == 5]))
+    assert buf.size == 6
+    torch.manual_seed(0)
+    batch = buf.sample_windows(256, 2)
+    first = batch["state"][:, 0, 0]
+    assert first.min() >= 3 and first.max() <= 6  # 逻辑最旧行是 t=3，最后起点 t=6
+    # 起点 t=5 的第一个转移跨过 done → 全部无效；起点 t=4 第二个转移无效。
+    assert (batch["valid"][first == 5] == 0).all()
+    assert (batch["valid"][first == 4] == torch.tensor([1.0, 0.0])).all()
+    assert (batch["valid"][first == 3] == 1).all()
+
+
+# ---------------- 网络 ----------------
+def test_running_norm_matches_full_batch_statistics():
+    norm, data = RunningNorm(4, eps=0.0), torch.randn(1000, 4) * 3 + 2
+    for chunk in data.split(137):
+        norm.update(chunk)
+    assert torch.allclose(norm.mean, data.mean(0), atol=1e-4)
+    assert torch.allclose(norm.var, data.var(0, unbiased=False), atol=1e-3)
+
+
+def test_world_model_fits_simple_dynamics():
+    """合成动力学：关节速度 ← 动作，其余静止。世界模型应能把单步误差压到很低。"""
+    torch.manual_seed(0)
+    wm = WorldModel(hidden=(128, 128))
+    opt = torch.optim.Adam(wm.parameters(), lr=3e-3)
+    s0 = random_state(2048, 0.3)
+
+    def true_step(s, a):
+        nxt = s.clone()
+        nxt[:, state.JVEL] = 0.5 * s[:, state.JVEL] + a
+        return nxt
+
+    a = torch.randn(2048, 12)
+    target = true_step(s0, a)
+    wm.update_normalizers(s0, a, state.compute_delta(s0, target))
+    for _ in range(400):
+        loss = (state.state_error(wm(s0, a), target) / wm.delta_norm.std).square().mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    assert loss.item() < 0.02
+
+
+# ---------------- learner ----------------
+def _tiny_learner(**overrides):
+    params = dict(num_envs=8, buffer_len=40, wm_hidden=(32,), actor_hidden=(32,), critic_hidden=(32,),
+                  wm_window=4, wm_batch=16, wm_updates=2, horizon=5, imag_batch=16, warmup_iterations=0,
+                  context_dim=5, aux_dim=rover_task.AUX_DIM)
+    params.update(overrides)
+    return SuperMimicLearner(SuperMimicCfg(**params), "cpu")
+
+
+def _fill(learner, steps=30):
+    n = learner.cfg.num_envs
+    s = random_state(n, 0.3)
+    prev = torch.zeros(n, 12)
+    ctx = torch.rand(n, learner.cfg.context_dim)
+    for _ in range(steps):
+        a = torch.randn_like(prev)
+        learner.observe(s, a, prev, torch.rand(n, 3), torch.rand(n) < 0.05, ctx,
+                        torch.rand(n, learner.cfg.aux_dim) * 1e4)
+        s = state.integrate(s, torch.randn(n, state.DELTA_DIM) * 0.01)
+        prev = a
+
+
+def test_actor_update_changes_only_actor_and_critic():
+    torch.manual_seed(0)
+    learner = _tiny_learner()
+    _fill(learner)
+    learner.update_world_model()
+    wm_before = {k: v.clone() for k, v in learner.world_model.state_dict().items()}
+    actor_before = [p.clone() for p in learner.actor.parameters()]
+    logs = learner.update_actor_critic()
+    assert all(torch.equal(wm_before[k], v) for k, v in learner.world_model.state_dict().items())
+    assert any(not torch.equal(a, b) for a, b in zip(actor_before, learner.actor.parameters()))
+    assert all(p.requires_grad for p in learner.world_model.parameters())
+    assert all(math.isfinite(v) for v in logs.values())
+
+
+def test_world_model_uses_context_to_resolve_hidden_dynamics():
+    """隐藏增益 ξ 决定关节速度响应；有 ξ 的模型应明显优于无 ξ 的模型（对应 randomize_actuator_gains）。"""
+    torch.manual_seed(0)
+    n = 4096
+    s0 = random_state(n, 0.3)
+    a = torch.randn(n, 12)
+    gain = torch.rand(n, 1) * 1.5 + 0.5
+
+    def true_step(s):
+        nxt = s.clone()
+        nxt[:, state.JVEL] = gain * a
+        return nxt
+
+    target = true_step(s0)
+    losses = {}
+    for ctx_dim in (0, 1):
+        torch.manual_seed(1)
+        wm = WorldModel(hidden=(128, 128), context_dim=ctx_dim)
+        ctx = gain if ctx_dim else None
+        opt = torch.optim.Adam(wm.parameters(), lr=3e-3)
+        wm.update_normalizers(s0, a, state.compute_delta(s0, target), ctx)
+        for _ in range(300):
+            loss = (state.state_error(wm(s0, a, ctx), target) / wm.delta_norm.std).square().mean()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        losses[ctx_dim] = loss.item()
+    assert losses[1] < 0.3 * losses[0]
+
+
+def test_world_model_requires_declared_context():
+    wm = WorldModel(hidden=(8,), context_dim=3)
+    with pytest.raises(ValueError):
+        wm(random_state(2), torch.zeros(2, 12))
+
+
+def test_aux_head_learns_conditional_mean_and_feeds_reward():
+    """aux 头用 MSE 回归 Σacc²，应收敛到条件均值；reward 使用 acc_sq 时三项等于权重×输入。"""
+    torch.manual_seed(0)
+    wm = WorldModel(hidden=(16,), aux_dim=3, aux_hidden=(64,))
+    s0, a = random_state(4096, 0.3), torch.randn(4096, 12)
+    target = torch.stack((a[:, 0].square(), a[:, 4].abs(), a[:, 8].square() * 10), -1) * 1e4
+    wm.update_normalizers(s0, a, torch.zeros(4096, state.DELTA_DIM), aux=target)
+    opt = torch.optim.Adam(wm.aux_net.parameters(), lr=3e-3)
+    for _ in range(600):
+        loss = (wm.aux_normalized(s0, a) - wm.aux_norm.normalize(target)).square().mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    pred = wm.aux(s0, a)
+    assert torch.allclose(pred.mean(0), target.mean(0), rtol=0.05)
+    assert (pred >= 0).all()
+    cfg = rover_task.RoverRewardCfg()
+    acc = torch.tensor([[1e4, 2e4, 3e4]])
+    s = _upright_state([0.0, 0.0, 0.0])
+    terms = rover_task.reward_terms(s, s, torch.zeros(1, 3), torch.zeros(1, 12), torch.zeros(1, 12), cfg, acc)
+    assert terms["suspension_acc"].item() == pytest.approx(cfg.suspension_acc * 1e4)
+    assert terms["steering_acc"].item() == pytest.approx(cfg.steering_acc * 2e4)
+    assert terms["wheel_acc"].item() == pytest.approx(cfg.wheel_acc * 3e4)
+
+
+def test_world_model_update_reports_reward_gap_and_aux_loss():
+    torch.manual_seed(0)
+    for ctx_dim in (5, 0):  # context_dim=0 曾在 aux 展平时因空张量 reshape(-1, 0) 报错
+        learner = _tiny_learner(context_dim=ctx_dim)
+        _fill(learner)
+        logs = learner.update_world_model()
+        for key in ("wm_aux_loss", "wm_reward_bias", "wm_reward_abs_gap"):
+            assert math.isfinite(logs[key])
+        assert logs["wm_reward_abs_gap"] >= abs(logs["wm_reward_bias"]) - 1e-9
+
+
+def test_actor_update_every_skips_intermediate_iterations():
+    torch.manual_seed(0)
+    learner = _tiny_learner(actor_update_every=3)
+    _fill(learner)
+    updated = ["actor_loss" in learner.update() for _ in range(6)]
+    assert updated == [True, False, False, True, False, False]
+
+
+def test_lambda_returns_reduce_to_discounted_sum_when_lambda_is_one():
+    learner = _tiny_learner(lam=1.0, gamma=0.5)
+    reward, survival = torch.ones(3, 1), torch.ones(3, 1)
+    values = torch.tensor([[0.0], [0.0], [0.0], [8.0]])
+    returns = learner.lambda_returns(reward, survival, values)
+    assert returns[0].item() == pytest.approx(1 + 0.5 + 0.25 + 0.125 * 8)
+
+
+def test_bptt_gradient_finite_from_exact_upright_rest():
+    """回归：reset 后状态精确正立静止；survival 曾用 acos，cos=1 处梯度 -inf 使 actor 变 NaN。"""
+    torch.manual_seed(0)
+    learner = _tiny_learner()
+    n = learner.cfg.num_envs
+    rest = state.make_state(torch.zeros(n, 3), torch.tensor([[1.0, 0, 0, 0]]).repeat(n, 1), torch.zeros(n, 3),
+                            torch.zeros(n, 3), torch.zeros(n, 12), torch.zeros(n, 12))
+    for _ in range(10):
+        learner.observe(rest, torch.zeros(n, 12), torch.zeros(n, 12), torch.rand(n, 3), torch.zeros(n, dtype=torch.bool),
+                        torch.ones(n, learner.cfg.context_dim), torch.zeros(n, learner.cfg.aux_dim))
+    learner.update_world_model()
+    # 世界模型清零输出层后预测增量 = 归一化均值 ≈ 0，rollout 停在精确正立点上。
+    torch.nn.init.zeros_(learner.world_model.net[-1].weight)
+    torch.nn.init.zeros_(learner.world_model.net[-1].bias)
+    learner.update_actor_critic()
+    assert learner.skipped_actor_updates == 0
+    assert all(torch.isfinite(p).all() for p in learner.actor.parameters())
+
+
+def test_checkpoint_and_export_round_trip(tmp_path):
+    torch.manual_seed(0)
+    learner = _tiny_learner()
+    _fill(learner)
+    learner.update()
+    other = _tiny_learner()
+    other.load_state_dict(learner.state_dict())
+    obs = torch.randn(5, 45)
+    assert torch.allclose(other.act(obs, explore=False), learner.act(obs, explore=False))
+    learner.export_actor(tmp_path / "policy.pt")
+    scripted = torch.jit.load(str(tmp_path / "policy.pt"))
+    assert torch.allclose(scripted(obs), learner.act(obs, explore=False), atol=1e-6)
+    assert scripted(obs * 1e3).abs().max() <= learner.cfg.action_bound + 1e-5
+
+
+# ---------------- 扫描学生 ----------------
+def _fake_teacher_state_dict():
+    actor = scan_student.mlp(scan_student.TEACHER_OBS_DIM, (512, 256, 128), 12)
+    return {f"actor.{k}": v for k, v in actor.state_dict().items()} | {"std": torch.ones(12)}
+
+
+def test_scan_student_shapes_and_frozen_teacher():
+    torch.manual_seed(0)
+    teacher = scan_student.teacher_actor_from_rsl_rl(_fake_teacher_state_dict())
+    policy = scan_student.ScanStudentPolicy(scan_student.DepthScanEncoder(latent_dim=32), teacher)
+    student_obs = torch.rand(6, scan_student.STUDENT_OBS_DIM) * 2 - 1
+    teacher_obs = torch.cat((student_obs[:, :45], torch.rand(6, 187) * 2 - 1), dim=-1)
+    assert policy(student_obs).shape == (6, 12)
+    loss, scan_loss, action_loss = scan_student.student_losses(policy, student_obs, teacher_obs,
+                                                               scan_student.ScanStudentCfg())
+    loss.backward()
+    assert all(p.grad is None for p in teacher.parameters())
+    assert all(p.grad is not None for p in policy.encoder.parameters())
+    # 预测扫描等于真值时，动作项应为 0。
+    class ExactEncoder(torch.nn.Module):
+        def forward(self, obs):
+            return teacher_obs[:, 45:]
+
+    exact = scan_student.ScanStudentPolicy(ExactEncoder(), teacher)
+    _, s_loss, a_loss = scan_student.student_losses(exact, student_obs, teacher_obs, scan_student.ScanStudentCfg())
+    assert s_loss.item() == pytest.approx(0.0) and a_loss.item() == pytest.approx(0.0, abs=1e-10)
+
+
+def test_scan_student_exports_to_torchscript(tmp_path):
+    torch.manual_seed(0)
+    teacher = scan_student.teacher_actor_from_rsl_rl(_fake_teacher_state_dict())
+    policy = scan_student.ScanStudentPolicy(scan_student.DepthScanEncoder(latent_dim=16), teacher).eval()
+    torch.jit.script(policy).save(str(tmp_path / "student.pt"))
+    scripted = torch.jit.load(str(tmp_path / "student.pt"))
+    obs = torch.rand(3, scan_student.STUDENT_OBS_DIM) * 2 - 1
+    assert torch.allclose(scripted(obs), policy(obs), atol=1e-6)
+
+
+def test_depth_reshape_is_oldest_to_newest_row_major():
+    """第 f 帧第 (r,c) 像素必须在 45 + f*512 + r*32 + c，与 DepthTemporalBuffer 输出一致。"""
+    enc = scan_student.DepthScanEncoder(latent_dim=8)
+    captured = {}
+    # hook 返回非 None 会替换模块输出，这里必须显式返回 None。
+    def hook(module, inputs, output):
+        captured["x"] = inputs[0]
+
+    enc.cnn.register_forward_hook(hook)
+    obs = torch.zeros(1, scan_student.STUDENT_OBS_DIM)
+    obs[0, 45 + 3 * 512 + 5 * 32 + 7] = 1.0
+    enc(obs)
+    frames = captured["x"].reshape(8, 16, 32)
+    assert frames[3, 5, 7] == 1.0 and frames.sum() == 1.0
+
+
+def test_critic_warmup_freezes_actor_but_trains_critic():
+    torch.manual_seed(0)
+    learner = _tiny_learner(warmup_iterations=1, critic_warmup_iterations=2)
+    _fill(learner)
+    actor0 = [p.clone() for p in learner.actor.parameters()]
+    critic0 = [p.clone() for p in learner.critic.parameters()]
+    logs = [learner.update() for _ in range(3)]  # it0: 只世界模型；it1、it2: 只 critic
+    assert "actor_loss" not in logs[0] and "critic_loss" in logs[1] and "critic_loss" in logs[2]
+    assert all(torch.equal(a, b) for a, b in zip(actor0, learner.actor.parameters()))
+    assert any(not torch.equal(a, b) for a, b in zip(critic0, learner.critic.parameters()))
+    learner.update()  # it3: actor 开始更新
+    assert any(not torch.equal(a, b) for a, b in zip(actor0, learner.actor.parameters()))
+
+
+def test_real_lambda_returns_handle_termination_and_truncation():
+    learner = _tiny_learner(gamma=0.5, lam=1.0)
+    r = torch.ones(3, 3)
+    done = torch.tensor([[False, False, False], [False, True, False], [False, True, False]])
+    term = torch.tensor([[False, False, False], [False, True, False], [False, False, False]])
+    values = torch.tensor([[0.0, 0.0, 0.0, 8.0], [0.0, 4.0, 0.0, 8.0], [0.0, 4.0, 0.0, 8.0]])
+    G = learner.real_lambda_returns({"reward": r, "done": done, "terminated": term}, values)
+    assert G[0, 0].item() == pytest.approx(1 + 0.5 + 0.25 + 0.125 * 8)  # 窗口末端自举
+    assert G[1, 1].item() == pytest.approx(1.0)  # 真终止不自举
+    assert G[1, 0].item() == pytest.approx(1 + 0.5 * 1.0)
+    assert G[2, 1].item() == pytest.approx(1 + 0.5 * 4.0)  # 截断用本步价值近似自举
+
+
+def test_critic_real_returns_and_anchor_pull_toward_reference():
+    torch.manual_seed(0)
+    learner = _tiny_learner(critic_real_returns=True, real_return_window=4, real_return_batch=16, anchor_coef=50.0,
+                            actor_lr=1e-2)
+    n = learner.cfg.num_envs
+    s = random_state(n, 0.3)
+    for _ in range(30):
+        learner.observe(s, torch.randn(n, 12), torch.zeros(n, 12), torch.rand(n, 3), torch.rand(n) < 0.05,
+                        torch.rand(n, 5), torch.rand(n, 3), reward=torch.ones(n), terminated=torch.zeros(n, dtype=torch.bool))
+        s = state.integrate(s, torch.randn(n, state.DELTA_DIM) * 0.01)
+    ref = copy.deepcopy(learner.actor)
+    torch.nn.init.zeros_(ref.actor[-1].weight)
+    torch.nn.init.zeros_(ref.actor[-1].bias)
+    learner.set_anchor(ref)
+    # 信赖域只作用在回放起点的观测上，在同分布观测上度量（随机观测不在训练分布里）。
+    start = learner.replay.sample_states(64)
+    obs = learner.task.policy_obs(start["state"], start["command"], start["prev_action"])
+    before = (learner.act(obs, explore=False) - ref(obs)).square().sum(-1).mean().item()
+    for _ in range(20):
+        logs = learner.update()
+    after = (learner.act(obs, explore=False) - ref(obs)).square().sum(-1).mean().item()
+    assert after < 0.5 * before and math.isfinite(logs["critic_loss"]) and logs["anchor_mse"] > 0
