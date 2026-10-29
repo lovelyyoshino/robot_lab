@@ -833,7 +833,9 @@ bash scripts/supermimic/run_scratch.sh scratch_d3 2048 8000 \
 | `--strict_lane` | 晋级车道 0.15 m、出界 0.75 m，与验收一致；出车道为真终止（吃翻车惩罚、不自举） |
 | `--lane_obs --lateral_pos -5` | actor 多 1 维车道横向偏移（新列从 0 开始），想象里罚偏离中线 |
 
-产物观测/动作与 Teacher-Preview 相同（d1 为 232 → 12，d2 多 1 维车道偏移为 233 → 12），验收、回放命令不变；d2 暂不能转成 Student 老师。
+d3 第 4000 轮严格验收：8 / 12 / 16 cm 为 61% / 31% / 8%（PPO Teacher 100% / 70% / 0%），平地平稳通过；16 cm 是所有方案里第一次非零。
+
+产物观测/动作与 Teacher-Preview 相同（d1 为 232 → 12，d2/d3 多 1 维车道偏移为 233 → 12），验收、回放命令不变；d2/d3 暂不能转成 Student 老师。
 
 #### 其他可选流程
 

@@ -373,6 +373,10 @@ d2 ❌（第 1040 轮停止）：critic 只预热 300 轮、actor lr 1e-4、无�
 d3（2026-10-29）：同 d2，但锚定继承来的 d1 actor（anchor_coef 0.5，不是 PPO Teacher）、critic 预热 800 轮、actor lr 3e-5。
 d3 第 2000 轮（actor 更新约 1000 次）沿路线诊断：8 cm 成功 12.5%（d1 第 10000 轮 0.8%）、登顶 58%；首级 x=1.2 m 横向 +0.30 m（d1 +0.48，d2 第 1000 轮出界）；
 12 cm 登顶 3%（d1 81%），出界 31%。训练课程平均等级 0.05→0.36 回升中，速度误差 0.06–0.09 m/s，没有像 d2 那样崩。方向对，继续训。
+d3 第 4000 轮诊断（climb_search，64 env）：8 cm 成功 67%、登顶 100%；12 cm 成功 45%、登顶 88%。横向：首级 +0.20 m、最大 +0.30–0.36 m，
+登顶后能拉回（x=2.8 m 处 +0.11 / +0.09 m），越线 ≤0.15 m 的 36–39%。训练课程平均台阶 4.2 cm（门限收紧后从 2 cm 重新爬）。
+正式验收（accept_terrain，64 回合/档）：**8 cm 61%、12 cm 31%、16 cm 8%**，平地平稳通过。16 cm 第一次在严格门下非零（PPO Teacher、v3 都是 0%）。
+失败：8 cm 冲出终点 19 / 提前终止 6；12 cm 停住到超时 30；16 cm 停住到超时 45、提前终止 12——高台阶主要卡在推不上去（课程还没爬到那一档）。
 
 
 运行命令（均先 `conda activate env_isaaclab; unset PYTHONPATH; source /media/bigdisk/IsaacLab/_isaac_sim/setup_conda_env.sh`）：
