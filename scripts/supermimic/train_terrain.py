@@ -14,9 +14,11 @@ train_terrain.py — SuperMimic 越障训练：从 Teacher-Preview 热启动，�
 
 @author pony
 @date 2026-10-26
-@version v0.9.0
+@version v0.10.0
 @last_modified 2026-10-29
 @changelog
+    - v0.10.0 (2026-10-29): 存档保存/续训恢复 terrain_levels；--lateral_pos_final/--lateral_ramp_cm（横向惩罚随课程加重）；
+      --anchor_to_resume（从零续训锚定起点 actor，可配 --anchor_final）；续训时锚定衰减从本次起点算。
     - v0.9.1 (2026-10-29): --init_from 默认锚定继承 actor（0.5）、critic 预热 800、actor lr 3e-5（d2 训坏后）。
     - v0.9.0 (2026-10-29): --init_from（继承 actor + 世界模型）、--strict_lane（车道对齐验收）；从零可配 --lane_obs。
     - v0.8.0 (2026-10-28): --from_scratch（方案 D：从零、共用奖励、翻车惩罚、事件优先回放、2→16 cm 课程）。
@@ -102,6 +104,13 @@ parser.add_argument("--riser_anchor", type=float, default=0.0,
 parser.add_argument("--lateral_pos", type=float, default=0.0,
                     help="× 相对车道中心线横向偏移²，惩罚取负；非 0 时 critic 额外看到偏移量")
 parser.add_argument("--tilt_soft_start_deg", type=float, default=25.0)
+# d3 第 8000 轮：课程台阶 6.5 cm、登顶率上升，但越线横向 ≤0.15 m 从 57% 掉到 9%——固定 −5 压不住高台阶上的侧漂。
+# 给了 --lateral_pos_final 时，lateral_pos 随课程平均台阶高度在 [lateral_ramp_cm] 区间内线性加重到终值。
+parser.add_argument("--lateral_pos_final", type=float, default=None, help="横向位置惩罚终值；省略则固定 --lateral_pos")
+parser.add_argument("--lateral_ramp_cm", type=float, nargs=2, default=(5.0, 10.0), metavar=("START", "END"),
+                    help="课程平均台阶高度（cm）从 START 到 END 时，lateral_pos 从初值线性到终值")
+parser.add_argument("--anchor_to_resume", action="store_true",
+                    help="从零任务续训时以续训起点 actor 为锚定参考（权重 --anchor_coef，可配 --anchor_final 衰减）")
 AppLauncher.add_app_launcher_args(parser)
 _explicit = {a.split("=")[0].lstrip("-") for a in sys.argv[1:] if a.startswith("--")}
 args_cli, hydra_args = parser.parse_known_args()
@@ -113,14 +122,20 @@ if args_cli.from_scratch:
     for _k, _v in SCRATCH_ARG_DEFAULTS.items():
         if _k not in _explicit:
             setattr(args_cli, _k, _v)
-    if args_cli.riser_anchor or args_cli.anchor_final is not None:
-        parser.error("--from_scratch 不与 --riser_anchor / --anchor_final 组合（它们依赖 Teacher 锚定）")
+    if args_cli.riser_anchor:
+        parser.error("--from_scratch 不与 --riser_anchor 组合（它依赖 Teacher 锚定）")
+    if args_cli.anchor_final is not None and not (args_cli.init_from or args_cli.anchor_to_resume):
+        parser.error("--from_scratch 下 --anchor_final 需配 --init_from 或 --anchor_to_resume（否则没有锚定参考）")
+if args_cli.anchor_to_resume and not (args_cli.from_scratch and args_cli.resume):
+    parser.error("--anchor_to_resume 只用于 --from_scratch --resume")
 if args_cli.init_from:
     # actor 已会爬但 critic 是新的：随机 critic 的自举值会把第一批 BPTT 梯度推坏，先只训 critic。
     # d2 用 300 轮 + lr 1e-4 + 无锚定，第 1000 轮已训坏；d3 默认 800 轮、lr 3e-5、锚定继承 actor
     for _k, _v in (("critic_warmup_iterations", 800), ("actor_lr", 3e-5), ("anchor_coef", 0.5)):
         if _k not in _explicit:
             setattr(args_cli, _k, _v)
+if args_cli.anchor_to_resume and "anchor_coef" not in _explicit:
+    args_cli.anchor_coef = 0.5
 if args_cli.strict_lane and not args_cli.from_scratch:
     parser.error("--strict_lane 只用于 --from_scratch")
 sys.argv = [sys.argv[0]] + hydra_args
@@ -152,6 +167,7 @@ from robot_lab.supermimic.lane_offset import add_lane_offset_term, pad_first_lay
 from robot_lab.supermimic.learner import SuperMimicCfg, SuperMimicLearner  # noqa: E402
 from robot_lab.supermimic.preview_task import PreviewRewardCfg, PreviewTask  # noqa: E402
 from robot_lab.supermimic.rover_task import CONTROL_DT  # noqa: E402
+from robot_lab.supermimic.schedule import linear_ramp, restore_terrain_levels  # noqa: E402
 from robot_lab.supermimic.quat import quat_apply  # noqa: E402
 from robot_lab.supermimic.state import LIN, QUAT  # noqa: E402
 
@@ -263,7 +279,7 @@ def main():
                                      if getattr(args_cli, k) is not None})
     reward_cfg.tilt_soft_start = math.radians(args_cli.tilt_soft_start_deg)
     lane_center_y = None
-    if reward_cfg.lateral_pos != 0.0 or args_cli.lane_obs:
+    if reward_cfg.lateral_pos != 0.0 or args_cli.lateral_pos_final or args_cli.lane_obs:
         # 所有地形块原点的世界 y；楼梯与全宽单障碍的车道中心就是块原点（lane_center_y=0）
         lane_center_y = torch.unique(uenv.scene.terrain.terrain_origins[..., 1].flatten()).sort().values
     task = PreviewTask(hmap, kin, pattern, leg_soft_limits(reader), reward_cfg, exact_scan_fn=exact_scan_fn(env, pattern),
@@ -273,8 +289,19 @@ def main():
                                 extra_dim=terrain_map.RELIEF_DIM, task=task)
     resume_path = resolve_resume()
     if resume_path:
-        learner.load_state_dict(torch.load(resume_path, map_location=device, weights_only=False))
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        learner.load_state_dict(ckpt)
         print(f"[SuperMimic-Terrain] 续训 {resume_path} @ iteration {learner.iteration}")
+        terrain = uenv.scene.terrain
+        if "terrain_levels" in ckpt and terrain.terrain_origins is not None:
+            # 不恢复的话课程按 init_terrain_level 从头爬，前面几千轮的课程进度白费（d3 之前的存档没有这一项）
+            levels = restore_terrain_levels(ckpt["terrain_levels"], uenv.num_envs, terrain.max_terrain_level).to(device)
+            terrain.terrain_levels[:] = levels
+            terrain.env_origins[:] = terrain.terrain_origins[levels, terrain.terrain_types]
+            print(f"[SuperMimic-Terrain] 恢复地形课程等级，均值 {levels.float().mean():.2f}", flush=True)
+        elif args_cli.from_scratch:
+            print(f"[SuperMimic-Terrain] 存档无 terrain_levels，课程从 init_terrain_level={args_cli.init_terrain_level}"
+                  " 起（旧存档可用 --init_terrain_level 近似）", flush=True)
     elif args_cli.init_from:
         src = torch.load(args_cli.init_from, map_location=device, weights_only=False)
         actor_sd = src["actor"]
@@ -297,6 +324,10 @@ def main():
             anchor = copy.deepcopy(learner.actor)
             learner.set_anchor(anchor)
             print(f"[SuperMimic-Terrain] 锚定继承来的 actor（anchor_coef={cfg.anchor_coef}）", flush=True)
+    elif args_cli.anchor_to_resume:
+        # d4：以横向最好的存档为参考，配合 --anchor_final 逐步放开，避免一直被拉回 d1 的蟹行爬法
+        learner.set_anchor(copy.deepcopy(learner.actor))
+        print(f"[SuperMimic-Terrain] 锚定续训起点 actor（anchor_coef={cfg.anchor_coef}）", flush=True)
     else:
         print("[SuperMimic-Terrain] 从零训练：actor 随机初始化，不加载、不锚定 Teacher", flush=True)
 
@@ -327,14 +358,22 @@ def main():
                if n_driver else None)
     bound = cfg.action_bound
     obs, _ = env.reset()
-    min_rows = cfg.wm_window + 2
+    # 续训时迭代号已过预热，回放却是空的；critic 真实回报要 real_return_window+1 步窗口，攒够前只采数据
+    min_rows = max(cfg.wm_window, cfg.real_return_window if cfg.critic_real_returns else 0) + 2
     start_time = time.time()
     anchor_start = cfg.anchor_coef
-    actor_begin = cfg.warmup_iterations + cfg.critic_warmup_iterations
+    # 续训时衰减从本次起点算；否则 it 早已超过预热轮数，第一轮就跳到终值
+    actor_begin = max(cfg.warmup_iterations + cfg.critic_warmup_iterations, learner.iteration)
+    lateral_start = reward_cfg.lateral_pos
     for it in range(learner.iteration, args_cli.iterations):
         if args_cli.anchor_final is not None:
             frac = min(max(it - actor_begin, 0) / max(args_cli.anchor_decay_iterations, 1), 1.0)
             cfg.anchor_coef = anchor_start + frac * (args_cli.anchor_final - anchor_start)
+        if args_cli.lateral_pos_final is not None and args_cli.from_scratch:
+            # task.cfg 与 reward_cfg 是同一对象：真实回报与想象目标同时变化，口径不分叉
+            step_cm = curriculum_stats(uenv)["step_height_cm_mean"]
+            reward_cfg.lateral_pos = linear_ramp(step_cm, *args_cli.lateral_ramp_cm, lateral_start,
+                                                 args_cli.lateral_pos_final)
         sim = {"env_reward": 0.0, "shaping_reward": 0.0, "route_vel_err": 0.0, "terminated": 0.0,
                "obs_max_err": 0.0}
         for _ in range(args_cli.steps_per_iter):
@@ -389,6 +428,7 @@ def main():
             learner.iteration += 1
         logs.update(sim)
         logs["anchor_coef"] = cfg.anchor_coef
+        logs["lateral_pos_coef"] = reward_cfg.lateral_pos
         if it % args_cli.log_interval == 0:
             logs.update(curriculum_stats(uenv))
             logs["elapsed_min"] = (time.time() - start_time) / 60
@@ -407,7 +447,8 @@ def main():
             csv_file.flush()
             print(f"[it {it}] " + " ".join(f"{k}={v:.4g}" for k, v in sorted(logs.items())), flush=True)
         if (it + 1) % args_cli.save_interval == 0 or it + 1 == args_cli.iterations:
-            torch.save(learner.state_dict(), log_dir / f"ckpt_{it + 1:06d}.pt")
+            torch.save({**learner.state_dict(), "terrain_levels": uenv.scene.terrain.terrain_levels.cpu()},
+                       log_dir / f"ckpt_{it + 1:06d}.pt")
             export_policy(learner, log_dir / "exported", task.obs_dim)
     csv_file.close()
     writer.close()

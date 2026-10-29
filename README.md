@@ -834,6 +834,24 @@ bash scripts/supermimic/run_scratch.sh scratch_d3 2048 8000 \
 | `--lane_obs --lateral_pos -5` | actor 多 1 维车道横向偏移（新列从 0 开始），想象里罚偏离中线 |
 
 d3 第 4000 轮严格验收：8 / 12 / 16 cm 为 61% / 31% / 8%（PPO Teacher 100% / 70% / 0%），平地平稳通过；16 cm 是所有方案里第一次非零。
+第 6000 轮 69% / 31% / 0%，第 8000 轮 14% / 23% / 3%：课程台阶从 5.3 涨到 6.5 cm、16 cm 登顶率 27%→55%，但越线横向 ≤0.15 m 从 57% 掉到 9%。
+
+第四版 `scratch_d4` 从 d3 第 6000 轮（横向最好）续训到 40000 轮，横向惩罚随课程加重、锚定逐步放开：
+
+```bash
+bash scripts/supermimic/run_scratch.sh scratch_d4 2048 40000 \
+  --resume --load_run scratch_d3 --checkpoint ckpt_006000.pt --init_terrain_level 3 \
+  --strict_lane --lane_obs --lateral_pos -5 --lateral_pos_final -15 --lateral_ramp_cm 5 10 \
+  --actor_lr 3e-5 --anchor_to_resume --anchor_final 0.1 --anchor_decay_iterations 2000
+# 过程验收：每 2000 轮自动导出并跑 accept_terrain，汇总在 logs/supermimic_terrain/scratch_d4/acceptance_progress.md
+nohup bash scripts/supermimic/watch_accept.sh scratch_d4 8000 40000 2000 > logs/supermimic_terrain/scratch_d4_watch.log 2>&1 &
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--lateral_pos_final -15 --lateral_ramp_cm 5 10` | 课程平均台阶 5→10 cm 时横向位置惩罚从 −5 线性加重到 −15（想象与真实回报同时变） |
+| `--anchor_to_resume --anchor_final 0.1` | 锚定续训起点 actor，2000 轮内 0.5→0.1，不再一直拉回 d1 的蟹行爬法 |
+| `--init_terrain_level 3` | d3 旧存档没存课程等级，用 0–3 级均匀起步近似（d3 第 6000 轮均值 1.59）；新存档自带 `terrain_levels`，续训自动恢复 |
 
 产物观测/动作与 Teacher-Preview 相同（d1 为 232 → 12，d2/d3 多 1 维车道偏移为 233 → 12），验收、回放命令不变；d2/d3 暂不能转成 Student 老师。
 

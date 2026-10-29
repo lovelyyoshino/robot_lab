@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-10-26
-@version v0.1.0
-@last_modified 2026-10-26
+@version v0.2.0
+@last_modified 2026-10-29
 @changelog
+    - v0.2.0 (2026-10-29): 续训课程等级恢复与横向惩罚爬坡
     - v0.1.0 (2026-10-26): 初始创建
 """
 
@@ -470,3 +471,22 @@ def test_scratch_lane_gates_follow_cfg():
     d1 = type("E", (), {"cfg": type("C", (), {})()})()
     d2 = type("E", (), {"cfg": type("C", (), {"scratch_pass_lane_m": 0.15, "scratch_fail_lane_m": 0.75})()})()
     assert ns["_lanes"](d1) == (0.5, 1.0) and ns["_lanes"](d2) == (0.15, 0.75)
+
+
+from supermimic.schedule import linear_ramp, restore_terrain_levels  # noqa: E402
+
+
+def test_linear_ramp_clamps_and_interpolates():
+    assert linear_ramp(4.0, 5.0, 10.0, -5.0, -15.0) == -5.0
+    assert linear_ramp(7.5, 5.0, 10.0, -5.0, -15.0) == pytest.approx(-10.0)
+    assert linear_ramp(12.0, 5.0, 10.0, -5.0, -15.0) == -15.0
+    assert linear_ramp(5.0, 5.0, 5.0, -5.0, -15.0) == -15.0  # 区间退化时到起点即取终值
+
+
+def test_restore_terrain_levels_keeps_progress():
+    saved = torch.tensor([0, 2, 3, 8, 5])
+    # 环境数相同：逐个还原，越界的裁到最高级
+    assert restore_terrain_levels(saved, 5, max_level=6).tolist() == [0, 2, 3, 5, 5]
+    # 环境数不同：从存档分布抽样，不回到第 0 级
+    big = restore_terrain_levels(torch.full((64,), 4), 512, max_level=9, generator=torch.Generator().manual_seed(0))
+    assert big.shape == (512,) and bool((big == 4).all())
