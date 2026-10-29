@@ -10,9 +10,11 @@ scratch_env_cfg.py — 方案 D：不用 Teacher、从零用 SuperMimic 训练�
 
 @author pony
 @date 2026-10-28
-@version v1.0.0
-@last_modified 2026-10-28
+@version v1.1.0
+@last_modified 2026-10-29
 @changelog
+    - v1.1.0 (2026-10-29): 车道门限做成 cfg 字段（scratch_pass_lane_m / scratch_fail_lane_m）；出车道改为真终止。
+      d1 用 0.5 / 1.0 m 学成"斜着往 +y 开半米再爬"，验收（0.15 / 0.75 m）几乎全挂。
     - v1.0.0 (2026-10-28): 初始创建
 """
 
@@ -38,9 +40,13 @@ FIRST_EDGE_M = 1.20
 STEP_WIDTH_M = 0.40
 # 终点 = 最后一级前缘 + 0.6 m（后轮登顶的余量），与验收协议的 target_distance_m 一致
 TARGET_M = FIRST_EDGE_M + (SCRATCH_STEPS - 1) * STEP_WIDTH_M + 0.60
-# 训练期车道放宽到 0.5 m（验收是 0.15 m）：从零阶段先学会爬，横向精度交给奖励塑形
+# d1 默认（训练期放宽）；d2 起由 env_cfg.scratch_pass_lane_m / scratch_fail_lane_m 覆盖为验收值 0.15 / 0.75
 TRAIN_LANE_M = 0.5
 FAIL_LANE_M = 1.0
+
+
+def _lanes(env):
+    return (getattr(env.cfg, "scratch_pass_lane_m", TRAIN_LANE_M), getattr(env.cfg, "scratch_fail_lane_m", FAIL_LANE_M))
 
 
 def scratch_step_height(difficulty: float) -> float:
@@ -78,17 +84,18 @@ def _offsets(env, ids=None):
 
 
 def scratch_curriculum(env, env_ids):
-    """越过终点、直立、在 0.5 m 车道内 → 升一级；翻车 / 出车道 / 几乎没往前走 → 降一级。"""
+    """越过终点、直立、在晋级车道内 → 升一级；翻车 / 出车道 / 几乎没往前走 → 降一级。"""
     terrain = env.scene.terrain
     device = terrain.terrain_levels.device
     ids = torch.arange(env.num_envs, device=device)[env_ids] if isinstance(env_ids, slice) else torch.as_tensor(
         env_ids, device=device, dtype=torch.long)
+    pass_lane, fail_lane = _lanes(env)
     if ids.numel():
         rel = _offsets(env, ids)
         upright = -env.scene["robot"].data.projected_gravity_b[ids, 2] >= 0.85
         active = env.episode_length_buf[ids] > 0
-        passed = active & upright & (rel[:, 0] >= TARGET_M) & (rel[:, 1].abs() <= TRAIN_LANE_M)
-        failed = active & ~passed & (~upright | (rel[:, 1].abs() > FAIL_LANE_M) | (rel[:, 0] < 0.8))
+        passed = active & upright & (rel[:, 0] >= TARGET_M) & (rel[:, 1].abs() <= pass_lane)
+        failed = active & ~passed & (~upright | (rel[:, 1].abs() > fail_lane) | (rel[:, 0] < 0.8))
         levels = (terrain.terrain_levels[ids] + passed.long() - failed.long()).clamp(0, terrain.max_terrain_level - 1)
         terrain.terrain_levels[ids] = levels
         terrain.env_origins[ids] = terrain.terrain_origins[levels, terrain.terrain_types[ids]]
@@ -101,9 +108,17 @@ def scratch_curriculum(env, env_ids):
 
 
 def scratch_done(env):
-    """越过终点即截断（成功，time_out 语义）；横向出 1 m 车道也截断，避免在台阶侧面学到绕行。"""
+    """越过终点即截断（成功，time_out 语义）。"""
     rel = _offsets(env)
-    return (rel[:, 0] >= TARGET_M + 0.3) | (rel[:, 1].abs() > FAIL_LANE_M)
+    done = rel[:, 0] >= TARGET_M + 0.3
+    if not getattr(env.cfg, "scratch_lane_terminates", False):
+        done |= rel[:, 1].abs() > _lanes(env)[1]  # d1：出车道也按截断处理
+    return done
+
+
+def scratch_out_of_lane(env):
+    """横向出失败车道：真终止（不自举、吃翻车惩罚），与验收 traversal_failure 判出界一致。"""
+    return _offsets(env)[:, 1].abs() > _lanes(env)[1]
 
 
 @configclass
@@ -123,3 +138,15 @@ class ParallelogramRoverSuperMimicScratchEnvCfg(ParallelogramRoverSuperMimicTerr
         self.curriculum.terrain_levels.func = scratch_curriculum
         self.terminations.preview_success = None
         self.terminations.scratch_done = TerminationTermCfg(func=scratch_done, time_out=True)
+        # 由训练脚本按需打开（d2：--strict_lane），默认保持 d1 行为
+        self.scratch_pass_lane_m = TRAIN_LANE_M
+        self.scratch_fail_lane_m = FAIL_LANE_M
+        self.scratch_lane_terminates = False
+
+
+def enable_strict_lane(env_cfg, pass_lane_m: float = 0.15, fail_lane_m: float = 0.75) -> None:
+    """晋级 / 出界门限对齐验收，出车道改为真终止。"""
+    env_cfg.scratch_pass_lane_m = pass_lane_m
+    env_cfg.scratch_fail_lane_m = fail_lane_m
+    env_cfg.scratch_lane_terminates = True
+    env_cfg.terminations.scratch_out_of_lane = TerminationTermCfg(func=scratch_out_of_lane)

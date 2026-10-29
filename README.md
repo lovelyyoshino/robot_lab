@@ -800,7 +800,7 @@ run 目录的 `params/lane_offset_obs.json` 是标记，`play.py --supermimic_te
 
 2026-10-28 结果：lateral_pos −5 为 81% / 42% / 0%，−20 为 34% / 19% / 0%（v3 为 86% / 98% / 0%）。16 cm 侧漂只从 −0.57 m 压到 −0.38 m，8/12 cm 退化，暂不采用。
 
-#### 方案 D（训练中）：不用 Teacher，从零训练楼梯
+#### 方案 D（第二版训练中）：不用 Teacher，从零训练楼梯
 
 参考 [go2w-supermimic](https://github.com/uwvwko-zzz/go2w-supermimic)（Go2W 轮足从零用 SuperMimic 训到 20 cm 楼梯）的做法：
 
@@ -818,7 +818,22 @@ python scripts/supermimic/export_ckpt.py --load_run scratch_d1 --iterations 4000
 python scripts/supermimic/accept_terrain.py --checkpoint logs/supermimic_terrain/scratch_d1/ckpt_eval/it4000/exported/policy.pt
 ```
 
-产物观测/动作与 Teacher-Preview 相同（232 → 12），验收、回放、转 Student 老师的命令都不变。
+第一版 `scratch_d1`（12000 轮，停在第 10200 轮）在训练课程里能爬到 9–10 cm，但严格验收 8 cm 2%、12 cm 0%：
+训练晋级车道放到 0.5 m、奖励只罚横向速度，策略学成"一上来斜着往 +y 开半米再爬"，验收在 x≈1.1 m 判出车道。
+第二版 `scratch_d2` 在 d1 基础上对齐验收：
+
+```bash
+bash scripts/supermimic/run_scratch.sh scratch_d2 2048 8000 \
+  --init_from logs/supermimic_terrain/scratch_d1/ckpt_010000.pt --lane_obs --lateral_pos -5 --strict_lane
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--init_from` | 继承 d1 的 actor 和世界模型（已会爬），critic 重新训，先只训 critic 300 轮 |
+| `--strict_lane` | 晋级车道 0.15 m、出界 0.75 m，与验收一致；出车道为真终止（吃翻车惩罚、不自举） |
+| `--lane_obs --lateral_pos -5` | actor 多 1 维车道横向偏移（新列从 0 开始），想象里罚偏离中线 |
+
+产物观测/动作与 Teacher-Preview 相同（d1 为 232 → 12，d2 多 1 维车道偏移为 233 → 12），验收、回放命令不变；d2 暂不能转成 Student 老师。
 
 #### 其他可选流程
 

@@ -14,9 +14,10 @@ train_terrain.py — SuperMimic 越障训练：从 Teacher-Preview 热启动，�
 
 @author pony
 @date 2026-10-26
-@version v0.8.0
-@last_modified 2026-10-28
+@version v0.9.0
+@last_modified 2026-10-29
 @changelog
+    - v0.9.0 (2026-10-29): --init_from（继承 actor + 世界模型）、--strict_lane（车道对齐验收）；从零可配 --lane_obs。
     - v0.8.0 (2026-10-28): --from_scratch（方案 D：从零、共用奖励、翻车惩罚、事件优先回放、2→16 cm 课程）。
     - v0.7.0 (2026-10-28): --lane_obs（方案 B：actor 追加车道横向偏移观测，新列 0 初始化）。
     - v0.6.0 (2026-10-28): --max_iterations 默认 6000→1000（长训退化）；默认开启平地平稳惩罚 --smooth_flat_arm -0.5 / --smooth_flat_ang -5.0。
@@ -38,6 +39,11 @@ parser.add_argument("--from_scratch", action="store_true",
                     help="不热启动、不锚定 Teacher、无 Teacher 驾驶；任务改为 Scratch-Stairs，奖励两边共用同一实现")
 parser.add_argument("--terminated", type=float, default=None, help="翻车惩罚权重（想象与真实同口径）；从零默认 −20")
 parser.add_argument("--priority_fraction", type=float, default=None, help="事件优先回放比例；从零默认 0.25")
+# d2：在 d1 已学会的爬升上继续，但横向要求对齐验收。只继承 actor 与世界模型；critic 输入维度/回报口径都变了，重新训
+parser.add_argument("--init_from", default=None,
+                    help="从另一个越障 ckpt 继承 actor 与世界模型（不继承 critic、优化器、迭代号）；actor 维度不足时补 0 列")
+parser.add_argument("--strict_lane", action="store_true",
+                    help="从零任务的晋级/出界车道对齐验收（0.15 / 0.75 m），出车道为真终止")
 parser.add_argument("--task", default="RobotLab-Isaac-SuperMimic-Terrain-Preview-Parallelogram-Rover-v0")
 parser.add_argument("--teacher", default="logs/vision_preview/teacher/2026-10-14_11-31-31_stairs_climb/model_7999.pt")
 parser.add_argument("--num_envs", type=int, default=2048)
@@ -106,8 +112,13 @@ if args_cli.from_scratch:
     for _k, _v in SCRATCH_ARG_DEFAULTS.items():
         if _k not in _explicit:
             setattr(args_cli, _k, _v)
-    if args_cli.lane_obs or args_cli.riser_anchor or args_cli.anchor_final is not None:
-        parser.error("--from_scratch 不与 --lane_obs / --riser_anchor / --anchor_final 组合（它们依赖 Teacher 起点）")
+    if args_cli.riser_anchor or args_cli.anchor_final is not None:
+        parser.error("--from_scratch 不与 --riser_anchor / --anchor_final 组合（它们依赖 Teacher 锚定）")
+if args_cli.init_from and "critic_warmup_iterations" not in _explicit:
+    # actor 已会爬但 critic 是新的：随机 critic 的自举值会把第一批 BPTT 梯度推坏，先只训 critic
+    args_cli.critic_warmup_iterations = 300
+if args_cli.strict_lane and not args_cli.from_scratch:
+    parser.error("--strict_lane 只用于 --from_scratch")
 sys.argv = [sys.argv[0]] + hydra_args
 simulation_app = AppLauncher(args_cli).app
 
@@ -232,6 +243,9 @@ def main():
     env_cfg.scene.terrain.max_init_terrain_level = args_cli.init_terrain_level
     if args_cli.lane_obs:
         add_lane_offset_term(env_cfg)
+    if args_cli.strict_lane:
+        from robot_lab.tasks.manager_based.supermimic.scratch_env_cfg import enable_strict_lane
+        enable_strict_lane(env_cfg)
     env = gym.make(args_cli.task, cfg=env_cfg)
     uenv = env.unwrapped
     device = uenv.device
@@ -257,6 +271,14 @@ def main():
     if resume_path:
         learner.load_state_dict(torch.load(resume_path, map_location=device, weights_only=False))
         print(f"[SuperMimic-Terrain] 续训 {resume_path} @ iteration {learner.iteration}")
+    elif args_cli.init_from:
+        src = torch.load(args_cli.init_from, map_location=device, weights_only=False)
+        actor_sd = src["actor"]
+        extra = task.obs_dim - actor_sd["actor.0.weight"].shape[1]
+        learner.actor.load_state_dict(pad_first_layer(actor_sd, extra) if extra > 0 else actor_sd)
+        learner.world_model.load_state_dict(src["world_model"])
+        print(f"[SuperMimic-Terrain] 从 {args_cli.init_from} 继承 actor（补 {max(extra, 0)} 列 0）与世界模型；critic 重新训练",
+              flush=True)
     elif not args_cli.from_scratch:
         warm_start(learner, args_cli.teacher)
     if not args_cli.from_scratch:
@@ -264,7 +286,7 @@ def main():
         anchor = copy.deepcopy(learner.actor)
         anchor.load_state_dict(teacher_actor_state(args_cli.teacher, task.obs_dim))
         learner.set_anchor(anchor)
-    else:
+    elif not args_cli.init_from:
         print("[SuperMimic-Terrain] 从零训练：actor 随机初始化，不加载、不锚定 Teacher", flush=True)
 
     # 续训未给 --run_name 时写回原 run，与 rsl_rl 续训习惯一致

@@ -14,6 +14,7 @@ accept_terrain.py — SuperMimic 越障一键验收：8/12/16 cm 三档楼梯正
 @version v1.1.0
 @last_modified 2026-10-28
 @changelog
+    - v1.1.1 (2026-10-29): 失败分类第三项改名为「提前终止（出车道或倾倒）」，原「其他」易误读。
     - v1.1.0 (2026-10-28): 增加平地平稳检查（probe_flat.py），门为 arm 速度与俯仰角速度，不看高度慢漂。
     - v1.0.0 (2026-10-27): 初始创建；替代手写 bash 循环（曾因合同失配全部报错却无提示）。
 """
@@ -106,6 +107,7 @@ def main() -> int:
                 "fail_stalled": sum(tp[i] < j["target_distance_m"] and er[i]["duration_s"] >= j["episode_length_s"] - 0.05
                                     for i in fails),
             })
+            # 剩下的是没到终点就被提前终止：横向出 0.75 m 车道或倾角超门（评测 traversal_failure）
             row["fail_other"] = len(fails) - row["fail_overshoot"] - row["fail_stalled"]
         if args.diag_envs > 0:
             log = out / f"diag_d{d}.log"
@@ -139,7 +141,7 @@ def main() -> int:
               f"俯仰角速度 rms {flat['worst']['pitch_rate_rms_deg_s']:.1f}°/s"), flush=True)
     summary = {"policy": str(policy), "seed": args.seed, "rows": rows, "flat": flat, "broken": broken}
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))
-    lines = ["| 楼梯 | 通过率 | 倾角门 | 失败：冲出终点 / 中途停住 / 其他 | 登顶 | 越线横向 ≤0.15 m |", "|---|---|---|---|---|---|"]
+    lines = ["| 楼梯 | 通过率 | 倾角门 | 失败：冲出终点 / 停住到超时 / 提前终止（出车道或倾倒） | 登顶 | 越线横向 ≤0.15 m |", "|---|---|---|---|---|---|"]
     for r in rows:
         if "error" in r:
             lines.append(f"| {r['level']} | ❌ {r['error']} | | | | |")

@@ -456,3 +456,17 @@ def test_terminated_penalty_and_event_priority():
     front_x = kin.wheel_centers_base(torch.zeros(1, 4), torch.zeros(1, 4))[0, 0, 0].item()
     near = _flat_state(1.5 - front_x - 0.10, 0.37)
     assert task.event_priority(torch.cat((upright, near))).tolist() == [0.0, 1.0]
+
+
+def test_scratch_lane_gates_follow_cfg():
+    # scratch_env_cfg 依赖 Isaac 配置类；这里只核对门限读取与出车道判据的纯函数部分
+    spec = importlib.util.spec_from_file_location(
+        "scratch_under_test", Path(__file__).resolve().parents[1] / "robot_lab/tasks/manager_based/supermimic/scratch_env_cfg.py")
+    src = spec.loader.get_source(spec.name)
+    assert "scratch_pass_lane_m" in src and "def scratch_out_of_lane" in src
+    ns = {"torch": torch, "getattr": getattr}
+    exec(compile("TRAIN_LANE_M = 0.5\nFAIL_LANE_M = 1.0\n" + src[src.index("def _lanes"):src.index("def scratch_step_height")],
+                 "lanes", "exec"), ns)
+    d1 = type("E", (), {"cfg": type("C", (), {})()})()
+    d2 = type("E", (), {"cfg": type("C", (), {"scratch_pass_lane_m": 0.15, "scratch_fail_lane_m": 0.75})()})()
+    assert ns["_lanes"](d1) == (0.5, 1.0) and ns["_lanes"](d2) == (0.15, 0.75)
