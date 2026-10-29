@@ -800,60 +800,39 @@ run 目录的 `params/lane_offset_obs.json` 是标记，`play.py --supermimic_te
 
 2026-10-28 结果：lateral_pos −5 为 81% / 42% / 0%，−20 为 34% / 19% / 0%（v3 为 86% / 98% / 0%）。16 cm 侧漂只从 −0.57 m 压到 −0.38 m，8/12 cm 退化，暂不采用。
 
-#### 方案 D（第二版训练中）：不用 Teacher，从零训练楼梯
+#### 方案 D：不用 Teacher，从零训练楼梯（40000 轮）
 
-参考 [go2w-supermimic](https://github.com/uwvwko-zzz/go2w-supermimic)（Go2W 轮足从零用 SuperMimic 训到 20 cm 楼梯）的做法：
+参考 [go2w-supermimic](https://github.com/uwvwko-zzz/go2w-supermimic)（Go2W 轮足从零用 SuperMimic 训到 20 cm 楼梯）的做法，全程走世界模型 + 想象 BPTT，没有 PPO：
 
-| 改动 | 内容 |
+| 项 | 内容 |
 |---|---|
-| 任务 | `RobotLab-Isaac-SuperMimic-Scratch-Stairs-Parallelogram-Rover-v0`：9 行课程，台阶 2→16 cm 连续变化（4 级、40 cm 踏面），从 2 cm 起步；越过终点、直立、0.5 m 车道内升级 |
+| 任务 | `RobotLab-Isaac-SuperMimic-Scratch-Stairs-Parallelogram-Rover-v0`：9 行课程，台阶 2→16 cm 连续变化（4 级、40 cm 踏面），从 2 cm 起步 |
 | 起点 | actor 随机初始化，不加载、不锚定 Teacher，没有 Teacher 驾驶 |
-| 奖励 | 真实回报和想象目标用同一个 `PreviewTask.reward`（含抬轮塑形与航向/横向/平地平稳项），加翻车惩罚 −20 |
+| 奖励 | 真实回报和想象目标用同一个 `PreviewTask.reward`（抬轮塑形、航向/横向、平地平稳），加翻车惩罚 −20 |
 | 回放 | 25% 的世界模型窗口和想象起点优先取"轮子前方有台阶 / 正在越级 / 翻车"的片段 |
+| `--strict_lane` | 晋级车道 0.15 m、出界 0.75 m，与验收一致；出车道为真终止 |
+| `--lane_obs` | actor 多 1 维车道横向偏移（233 → 12） |
+| `--lateral_pos -5 --lateral_pos_final -15 --lateral_ramp_cm 5 10` | 横向位置惩罚随课程平均台阶 5→10 cm 从 −5 加重到 −15：台阶越高越容易侧漂 |
 
 ```bash
-bash scripts/supermimic/run_scratch.sh scratch_d1 2048 12000      # nohup 后台，日志 logs/supermimic_terrain/scratch_d1.log
-tail -f logs/supermimic_terrain/scratch_d1.log | grep "^\[it"       # 看 terrain_level_mean / step_height_cm_mean 是否上升
-python scripts/supermimic/export_ckpt.py --load_run scratch_d1 --iterations 4000
-python scripts/supermimic/accept_terrain.py --checkpoint logs/supermimic_terrain/scratch_d1/ckpt_eval/it4000/exported/policy.pt
+# 训练（nohup 后台，默认 2048 env × 40000 轮，每 1000 轮存 ckpt；日志 logs/supermimic_terrain/scratch_40k.log）
+bash scripts/supermimic/run_scratch.sh scratch_40k 2048 40000 \
+  --strict_lane --lane_obs --lateral_pos -5 --lateral_pos_final -15 --lateral_ramp_cm 5 10
+# 过程验收：每 2000 轮自动导出并跑严格验收，汇总在 logs/supermimic_terrain/scratch_40k/acceptance_progress.md
+nohup bash scripts/supermimic/watch_accept.sh scratch_40k 2000 40000 2000 > logs/supermimic_terrain/scratch_40k_watch.log 2>&1 &
+# 看课程进度：terrain_level_mean / step_height_cm_mean / lateral_pos_coef
+grep "^\[it" logs/supermimic_terrain/scratch_40k.log | tail -3
+# 单独验收某个存档、回放
+python scripts/supermimic/export_ckpt.py --load_run scratch_40k --iterations 20000
+python scripts/supermimic/accept_terrain.py --checkpoint logs/supermimic_terrain/scratch_40k/ckpt_eval/it20000/exported/policy.pt
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Teacher-Preview-v0 \
+  --supermimic_terrain --load_run scratch_40k --num_envs 4 --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5
 ```
 
-第一版 `scratch_d1`（12000 轮，停在第 10200 轮）在训练课程里能爬到 9–10 cm，但严格验收 8 cm 2%、12 cm 0%：
-训练晋级车道放到 0.5 m、奖励只罚横向速度，策略学成"一上来斜着往 +y 开半米再爬"，验收在 x≈1.1 m 判出车道。
-第二、三版在 d1 基础上对齐验收（d2 训坏已停，当前跑 d3）：
-
-```bash
-bash scripts/supermimic/run_scratch.sh scratch_d3 2048 8000 \
-  --init_from logs/supermimic_terrain/scratch_d1/ckpt_010000.pt --lane_obs --lateral_pos -5 --strict_lane
-```
-
-| 参数 | 作用 |
-|---|---|
-| `--init_from` | 继承 d1 的 actor 和世界模型（已会爬），critic 重新训；默认先只训 critic 800 轮、actor lr 3e-5、锚定继承来的 actor（0.5）。d2 用 300 轮且不锚定，放开 actor 后纠偏过头、爬升能力也丢了 |
-| `--strict_lane` | 晋级车道 0.15 m、出界 0.75 m，与验收一致；出车道为真终止（吃翻车惩罚、不自举） |
-| `--lane_obs --lateral_pos -5` | actor 多 1 维车道横向偏移（新列从 0 开始），想象里罚偏离中线 |
-
-d3 第 4000 轮严格验收：8 / 12 / 16 cm 为 61% / 31% / 8%（PPO Teacher 100% / 70% / 0%），平地平稳通过；16 cm 是所有方案里第一次非零。
-第 6000 轮 69% / 31% / 0%，第 8000 轮 14% / 23% / 3%：课程台阶从 5.3 涨到 6.5 cm、16 cm 登顶率 27%→55%，但越线横向 ≤0.15 m 从 57% 掉到 9%。
-
-第四版 `scratch_d4` 从 d3 第 6000 轮（横向最好）续训到 40000 轮，横向惩罚随课程加重、锚定逐步放开：
-
-```bash
-bash scripts/supermimic/run_scratch.sh scratch_d4 2048 40000 \
-  --resume --load_run scratch_d3 --checkpoint ckpt_006000.pt --init_terrain_level 3 \
-  --strict_lane --lane_obs --lateral_pos -5 --lateral_pos_final -15 --lateral_ramp_cm 5 10 \
-  --actor_lr 3e-5 --anchor_to_resume --anchor_final 0.1 --anchor_decay_iterations 2000
-# 过程验收：每 2000 轮自动导出并跑 accept_terrain，汇总在 logs/supermimic_terrain/scratch_d4/acceptance_progress.md
-nohup bash scripts/supermimic/watch_accept.sh scratch_d4 8000 40000 2000 > logs/supermimic_terrain/scratch_d4_watch.log 2>&1 &
-```
-
-| 参数 | 作用 |
-|---|---|
-| `--lateral_pos_final -15 --lateral_ramp_cm 5 10` | 课程平均台阶 5→10 cm 时横向位置惩罚从 −5 线性加重到 −15（想象与真实回报同时变） |
-| `--anchor_to_resume --anchor_final 0.1` | 锚定续训起点 actor，2000 轮内 0.5→0.1，不再一直拉回 d1 的蟹行爬法 |
-| `--init_terrain_level 3` | d3 旧存档没存课程等级，用 0–3 级均匀起步近似（d3 第 6000 轮均值 1.59）；新存档自带 `terrain_levels`，续训自动恢复 |
-
-产物观测/动作与 Teacher-Preview 相同（d1 为 232 → 12，d2/d3 多 1 维车道偏移为 233 → 12），验收、回放命令不变；d2/d3 暂不能转成 Student 老师。
+课程曲线一直涨不代表严格验收在涨（实测越训越会爬、但可能越歪），选存档以 `acceptance_progress.md` 为准。
+训练中断可用 `--resume --load_run scratch_40k` 接着跑，存档带地形课程等级，课程不会从头爬。
+产物比 Teacher-Preview 多 1 维车道偏移观测，验收、回放自动识别；暂不能转成 Student 老师。各版本实验记录见 `plan.md`。
 
 #### 其他可选流程
 
