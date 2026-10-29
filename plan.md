@@ -371,6 +371,8 @@ d1 在第 10200 轮停止（用户决定）。d2（2026-10-29 启动）：`--ini
 d2 ❌（第 1040 轮停止）：critic 只预热 300 轮、actor lr 1e-4、无锚定。放开 actor 后速度误差 0.10→0.31 m/s，第 1000 轮存档平地 x=0.6 m 已偏 −0.28 m（d1 为 +0.17），
 8/12 cm 登顶 0%、92–98% 被判出界：纠偏过头，同时丢了爬升能力（新 critic 不准时 BPTT 把继承的 actor 推坏，与热启动 v1 同一现象）。
 d3（2026-10-29）：同 d2，但锚定继承来的 d1 actor（anchor_coef 0.5，不是 PPO Teacher）、critic 预热 800 轮、actor lr 3e-5。
+d3 第 2000 轮（actor 更新约 1000 次）沿路线诊断：8 cm 成功 12.5%（d1 第 10000 轮 0.8%）、登顶 58%；首级 x=1.2 m 横向 +0.30 m（d1 +0.48，d2 第 1000 轮出界）；
+12 cm 登顶 3%（d1 81%），出界 31%。训练课程平均等级 0.05→0.36 回升中，速度误差 0.06–0.09 m/s，没有像 d2 那样崩。方向对，继续训。
 
 
 运行命令（均先 `conda activate env_isaaclab; unset PYTHONPATH; source /media/bigdisk/IsaacLab/_isaac_sim/setup_conda_env.sh`）：
