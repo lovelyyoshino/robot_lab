@@ -707,11 +707,40 @@ python /media/bigdisk/robot_lab/scripts/reinforcement_learning/rsl_rl/evaluate_p
 
 ### 平行四边形轮式车：SuperMimic 越障优化（实验性）
 
-本节以越障优化为主线：先用 PPO 训 Teacher，再用 SuperMimic 世界模型梯度在楼梯上优化，最后把优化后的策略蒸馏给深度 Student。
-不改动上面视觉前瞻一节的训练与产物。命令在 `/media/bigdisk/robot_lab` 下、已能启动 Isaac Lab 的终端执行
-（`conda activate env_isaaclab; unset PYTHONPATH; source /media/bigdisk/IsaacLab/_isaac_sim/setup_conda_env.sh`）。
+用 SuperMimic 世界模型梯度训练 8/12/16 cm 楼梯攀爬：世界模型在楼梯回放上拟合，actor 在世界模型里想象 32 步（0.64 s），
+回报梯度穿过世界模型更新 actor，critic 拟合真实回报。不改动上面视觉前瞻一节的训练与产物。
 
-#### 完整流程（6 步）
+命令都在 `/media/bigdisk/robot_lab` 下、已能启动 Isaac Lab 的终端执行：
+
+```bash
+conda activate env_isaaclab; unset PYTHONPATH; source /media/bigdisk/IsaacLab/_isaac_sim/setup_conda_env.sh
+```
+
+#### 两条训练路线
+
+| | 路线一：Teacher 热启动 | 路线二：从零训练 |
+|---|---|---|
+| 起点 | PPO Teacher-Preview 的 actor | 随机初始化，不用 Teacher |
+| 训练量 | 1024 env × 1000 轮（约 1 小时；超过 1000 轮会退化） | 2048 env × 40000 轮 |
+| 课程 | 8→12→16 cm | 2→16 cm 连续 9 级，从 2 cm 起步 |
+| 观测 | 232 维，与 Teacher 相同 | 233 维（多 1 维车道横向偏移） |
+| 能否转成 Student 老师 | 能（第 4 步） | 暂不能（Student 没有车道偏移观测） |
+
+#### 验收结果
+
+严格验收：登顶、越线时横向 ≤0.15 m、对齐 ≥0.8、稳住 0.5 s；途中倾角门 8/12 cm 为 31.8°，16 cm 为 45°。每档 64 回合。
+
+| 策略 | 8 cm | 12 cm | 16 cm |
+|---|---|---|---|
+| PPO Teacher-Preview | 100% | 70% | 0% |
+| 路线一（v3，第 1000 轮；同配置重训一次为 67% / 81% / 0%） | 86% | 98% | 0% |
+| 路线二（scratch_d3 第 4000 轮，分阶段训练的旧版本） | 61% | 31% | 8% |
+| 路线二 `scratch_40k`（一次训满 40000 轮） | 训练中 | 训练中 | 训练中 |
+
+16 cm 的主要难点是爬台阶时向一侧漂移，越线横向超差；路线二加了车道偏移观测和随台阶加重的横向惩罚，是目前唯一在 16 cm 上非零的做法。
+各版本的实验记录与失败分析见 `plan.md` 4.5–4.7。
+
+#### 路线一：Teacher → 越障优化 → Student（6 步）
 
 | 步骤 | 做什么 | 训练方法 | 产物 |
 |---|---|---|---|
@@ -730,11 +759,9 @@ python scripts/reinforcement_learning/rsl_rl/train.py \
   --num_envs 1024 --max_iterations 8000 --seed 42 --headless
 TEACHER=logs/vision_preview/teacher/2026-10-14_11-31-31_stairs_climb/model_7999.pt   # 换成你的
 
-# 2. 越障优化（默认参数即当前采用的 v3，1024 env × 1000 轮约 1 小时；不要加大轮数，2000 轮后 8/12 cm 会退化到 0–6%）
+# 2. 越障优化（默认参数即 v3；保持 1000 轮，2000 轮后 8/12 cm 会退化到 0–6%）
 python scripts/supermimic/train_terrain.py --headless --teacher $TEACHER \
   --num_envs 1024 --max_iterations 1000 --run_name terrain_v3
-# 续训（不给 --run_name 时写回原 run）
-python scripts/supermimic/train_terrain.py --headless --resume --load_run terrain_v3 --max_iterations 3000
 
 # 3. 验收（约 40 分钟）与回放
 python scripts/supermimic/accept_terrain.py --load_run terrain_v3
@@ -762,81 +789,60 @@ python scripts/reinforcement_learning/rsl_rl/play.py \
   --checkpoint $STUDENT --num_envs 4 --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5
 ```
 
-#### 当前进度与成品
-
-| 步骤 | 状态 | 位置 |
-|---|---|---|
-| 1. Teacher | 完成；8/12/16 cm 为 100% / 70% / 0% | `logs/vision_preview/teacher/2026-10-14_11-31-31_stairs_climb/model_7999.pt` |
-| 2–3. 越障优化与验收 | 完成，采用 v3；8/12/16 cm 为 86% / 98% / 0% | `logs/supermimic_terrain/probe_v3` |
-| 4. 转换 | 完成；转换后按普通 Teacher 评测，8/12 cm 与 v3 逐回合一致 | `logs/supermimic_terrain/probe_v3/rsl_rl_teacher/model_1000.pt` |
-| 5–6. Student | 未开始全量训练（只跑过 2 轮冒烟） | — |
-
-用现成的 v3 时，上面命令里的 `terrain_v3` 换成 `probe_v3`，可以直接从第 5 步开始。
-
-#### 说明
-
-- 第 2 步的方案：世界模型在楼梯回放上拟合，actor 在世界模型里想象 32 步（0.64 s），回报梯度穿过世界模型更新 actor；
-  PPO Teacher 提供起点、不能偏离太远的约束和 15% 的采样数据；critic 用真实回报拟合。
-- 16 cm 仍是 0%：车能登顶，但每级右侧先上，累计向一侧偏约 0.5 m，越线横向超差；策略观测里没有横向位置，靠调奖励改不了。原因与各版本实验见 plan.md 4.5–4.6。
-- 越障策略部署时动作限幅 ±2π，rsl_rl Teacher 不限幅；v3 在 16 cm 楼梯上只有 0.009% 的动作超出，对蒸馏没有实际影响。
-- 同一时刻只启动一个 Isaac 进程导入机器人，并行训练请错开启动，否则会报 mimic 关节缺失。
-
-#### 方案 B（已试，未达标）：给越障策略加车道横向偏移观测
-
-16 cm 失败是爬台阶时侧漂、策略又看不到自己的横向位置。方案 B 不动 Teacher，只给 SuperMimic actor 多 1 维"离车道中线多远"
-（第 233 维，权重从 0 开始，起点与 Teacher 完全相同），再在想象里罚偏移，让世界模型梯度学会纠偏：
+按上面命令重训 1000 轮即可直接接第 3 步。现有的 `logs/supermimic_terrain/terrain_v3` 被训到了 4000 轮，`exported/policy.pt` 是退化版本（3% / 0% / 0%）；
+要用其中第 1000 轮（实测 67% / 81% / 0%），先导出再验收、转换：
 
 ```bash
-python scripts/supermimic/train_terrain.py --headless --teacher $TEACHER --num_envs 1024 --max_iterations 1000 \
-  --lane_obs --lateral_pos -5 --run_name laneB_p5
-python scripts/supermimic/accept_terrain.py --load_run laneB_p5         # 评测/回放自动识别并追加第 233 维
-# 中间存档也要验收（训练中可能退化）：导出到 <run>/ckpt_eval/itXXXX/ 再验收
-python scripts/supermimic/export_ckpt.py --load_run laneB_p5 --iterations 500
-python scripts/supermimic/accept_terrain.py --checkpoint logs/supermimic_terrain/laneB_p5/ckpt_eval/it500/exported/policy.pt
+python scripts/supermimic/export_ckpt.py --load_run terrain_v3 --iterations 1000
+python scripts/supermimic/accept_terrain.py --checkpoint logs/supermimic_terrain/terrain_v3/ckpt_eval/it1000/exported/policy.pt
+python scripts/supermimic/export_terrain_teacher.py --load_run terrain_v3 --checkpoint ckpt_001000.pt
 ```
 
-run 目录的 `params/lane_offset_obs.json` 是标记，`play.py --supermimic_terrain`、验收和诊断据此自动追加观测，命令不变。
-部署需要车载定位提供"离路线中线多远"；Student 观测还没有这一项，方案 B 的策略暂不能转换成 Student 老师。
+目前第 5–6 步只跑过冒烟，还没有全量训练过的 Student。
 
-2026-10-28 结果：lateral_pos −5 为 81% / 42% / 0%，−20 为 34% / 19% / 0%（v3 为 86% / 98% / 0%）。16 cm 侧漂只从 −0.57 m 压到 −0.38 m，8/12 cm 退化，暂不采用。
+#### 路线二：从零训练（不用 Teacher）
 
-#### 方案 D：不用 Teacher，从零训练楼梯（40000 轮）
-
-参考 [go2w-supermimic](https://github.com/uwvwko-zzz/go2w-supermimic)（Go2W 轮足从零用 SuperMimic 训到 20 cm 楼梯）的做法，全程走世界模型 + 想象 BPTT，没有 PPO：
+参考 [go2w-supermimic](https://github.com/uwvwko-zzz/go2w-supermimic)（Go2W 轮足从零用 SuperMimic 训到 20 cm 楼梯）的做法，全程是世界模型 + 想象 BPTT，没有 PPO。
 
 | 项 | 内容 |
 |---|---|
-| 任务 | `RobotLab-Isaac-SuperMimic-Scratch-Stairs-Parallelogram-Rover-v0`：9 行课程，台阶 2→16 cm 连续变化（4 级、40 cm 踏面），从 2 cm 起步 |
-| 起点 | actor 随机初始化，不加载、不锚定 Teacher，没有 Teacher 驾驶 |
+| 任务 | `RobotLab-Isaac-SuperMimic-Scratch-Stairs-Parallelogram-Rover-v0`：9 级课程，台阶 2→16 cm（4 级台阶、40 cm 踏面），越过终点、直立、在车道内即升级 |
 | 奖励 | 真实回报和想象目标用同一个 `PreviewTask.reward`（抬轮塑形、航向/横向、平地平稳），加翻车惩罚 −20 |
 | 回放 | 25% 的世界模型窗口和想象起点优先取"轮子前方有台阶 / 正在越级 / 翻车"的片段 |
 | `--strict_lane` | 晋级车道 0.15 m、出界 0.75 m，与验收一致；出车道为真终止 |
 | `--lane_obs` | actor 多 1 维车道横向偏移（233 → 12） |
-| `--lateral_pos -5 --lateral_pos_final -15 --lateral_ramp_cm 5 10` | 横向位置惩罚随课程平均台阶 5→10 cm 从 −5 加重到 −15：台阶越高越容易侧漂 |
+| `--lateral_pos -5 --lateral_pos_final -15 --lateral_ramp_cm 5 10` | 课程平均台阶从 5 cm 到 10 cm，横向位置惩罚从 −5 加重到 −15 |
 
 ```bash
-# 训练（nohup 后台，默认 2048 env × 40000 轮，每 1000 轮存 ckpt；日志 logs/supermimic_terrain/scratch_40k.log）
+# 训练（nohup 后台，2048 env × 40000 轮，每 1000 轮存 ckpt；日志 logs/supermimic_terrain/scratch_40k.log）
 bash scripts/supermimic/run_scratch.sh scratch_40k 2048 40000 \
   --strict_lane --lane_obs --lateral_pos -5 --lateral_pos_final -15 --lateral_ramp_cm 5 10
-# 过程验收：每 2000 轮自动导出并跑严格验收，汇总在 logs/supermimic_terrain/scratch_40k/acceptance_progress.md
+# 过程验收：每 2000 轮自动导出并严格验收，结果追加到 logs/supermimic_terrain/scratch_40k/acceptance_progress.md
 nohup bash scripts/supermimic/watch_accept.sh scratch_40k 2000 40000 2000 > logs/supermimic_terrain/scratch_40k_watch.log 2>&1 &
-# 看课程进度：terrain_level_mean / step_height_cm_mean / lateral_pos_coef
+# 看课程进度（terrain_level_mean / step_height_cm_mean / lateral_pos_coef）
 grep "^\[it" logs/supermimic_terrain/scratch_40k.log | tail -3
-# 单独验收某个存档、回放
+# 单独验收某个存档
 python scripts/supermimic/export_ckpt.py --load_run scratch_40k --iterations 20000
 python scripts/supermimic/accept_terrain.py --checkpoint logs/supermimic_terrain/scratch_40k/ckpt_eval/it20000/exported/policy.pt
+# 回放（自动识别第 233 维车道偏移观测）
 python scripts/reinforcement_learning/rsl_rl/play.py \
   --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Teacher-Preview-v0 \
   --supermimic_terrain --load_run scratch_40k --num_envs 4 --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5
 ```
 
-课程曲线一直涨不代表严格验收在涨（实测越训越会爬、但可能越歪），选存档以 `acceptance_progress.md` 为准。
-训练中断可用 `--resume --load_run scratch_40k` 接着跑，存档带地形课程等级，课程不会从头爬。
-产物比 Teacher-Preview 多 1 维车道偏移观测，验收、回放自动识别；暂不能转成 Student 老师。各版本实验记录见 `plan.md`。
+- 课程曲线一直涨不代表严格验收在涨（实测会越训越会爬、但越歪），选哪个存档以 `acceptance_progress.md` 为准。
+- 训练中断后，用原来的参数加 `--resume --load_run scratch_40k` 运行 `train_terrain.py --from_scratch`；存档带地形课程等级，课程不会从头爬。
+- 部署需要车载定位提供"离路线中线多远"。
+
+#### 注意事项
+
+- 同一时刻只启动一个 Isaac 进程导入机器人，并行训练请错开启动，否则会报 mimic 关节缺失。
+- `vision_preview.py` 与 `vision_preview_reward.py` 的哈希写在每个 Preview 策略的 `params/vision_contract.json` 里，改动它们会让已有策略全部无法评测。
+- 越障策略部署时动作限幅 ±2π，rsl_rl Teacher 不限幅；v3 在 16 cm 楼梯上只有 0.009% 的动作超出，对蒸馏没有实际影响。
 
 #### 其他可选流程
 
-不在上面主线上，按需使用。
+不在上面两条路线上，按需使用。
 
 平地 SuperMimic（45 → 12，纯平地速度跟踪，没有地形）：
 
