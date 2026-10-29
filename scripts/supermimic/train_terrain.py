@@ -17,6 +17,7 @@ train_terrain.py — SuperMimic 越障训练：从 Teacher-Preview 热启动，�
 @version v0.9.0
 @last_modified 2026-10-29
 @changelog
+    - v0.9.1 (2026-10-29): --init_from 默认锚定继承 actor（0.5）、critic 预热 800、actor lr 3e-5（d2 训坏后）。
     - v0.9.0 (2026-10-29): --init_from（继承 actor + 世界模型）、--strict_lane（车道对齐验收）；从零可配 --lane_obs。
     - v0.8.0 (2026-10-28): --from_scratch（方案 D：从零、共用奖励、翻车惩罚、事件优先回放、2→16 cm 课程）。
     - v0.7.0 (2026-10-28): --lane_obs（方案 B：actor 追加车道横向偏移观测，新列 0 初始化）。
@@ -114,9 +115,12 @@ if args_cli.from_scratch:
             setattr(args_cli, _k, _v)
     if args_cli.riser_anchor or args_cli.anchor_final is not None:
         parser.error("--from_scratch 不与 --riser_anchor / --anchor_final 组合（它们依赖 Teacher 锚定）")
-if args_cli.init_from and "critic_warmup_iterations" not in _explicit:
-    # actor 已会爬但 critic 是新的：随机 critic 的自举值会把第一批 BPTT 梯度推坏，先只训 critic
-    args_cli.critic_warmup_iterations = 300
+if args_cli.init_from:
+    # actor 已会爬但 critic 是新的：随机 critic 的自举值会把第一批 BPTT 梯度推坏，先只训 critic。
+    # d2 用 300 轮 + lr 1e-4 + 无锚定，第 1000 轮已训坏；d3 默认 800 轮、lr 3e-5、锚定继承 actor
+    for _k, _v in (("critic_warmup_iterations", 800), ("actor_lr", 3e-5), ("anchor_coef", 0.5)):
+        if _k not in _explicit:
+            setattr(args_cli, _k, _v)
 if args_cli.strict_lane and not args_cli.from_scratch:
     parser.error("--strict_lane 只用于 --from_scratch")
 sys.argv = [sys.argv[0]] + hydra_args
@@ -286,7 +290,14 @@ def main():
         anchor = copy.deepcopy(learner.actor)
         anchor.load_state_dict(teacher_actor_state(args_cli.teacher, task.obs_dim))
         learner.set_anchor(anchor)
-    elif not args_cli.init_from:
+    elif args_cli.init_from:
+        # d2 第 1000 轮实测：critic 重训 300 轮后放开 actor，策略从"往 +y 偏"翻成"往 −y 偏"出车道，登顶率 0%。
+        # 以继承来的 actor 自身为信赖域参考（不是 PPO Teacher），保住已学会的爬升，只允许小步纠偏。
+        if cfg.anchor_coef > 0:
+            anchor = copy.deepcopy(learner.actor)
+            learner.set_anchor(anchor)
+            print(f"[SuperMimic-Terrain] 锚定继承来的 actor（anchor_coef={cfg.anchor_coef}）", flush=True)
+    else:
         print("[SuperMimic-Terrain] 从零训练：actor 随机初始化，不加载、不锚定 Teacher", flush=True)
 
     # 续训未给 --run_name 时写回原 run，与 rsl_rl 续训习惯一致

@@ -820,16 +820,16 @@ python scripts/supermimic/accept_terrain.py --checkpoint logs/supermimic_terrain
 
 第一版 `scratch_d1`（12000 轮，停在第 10200 轮）在训练课程里能爬到 9–10 cm，但严格验收 8 cm 2%、12 cm 0%：
 训练晋级车道放到 0.5 m、奖励只罚横向速度，策略学成"一上来斜着往 +y 开半米再爬"，验收在 x≈1.1 m 判出车道。
-第二版 `scratch_d2` 在 d1 基础上对齐验收：
+第二、三版在 d1 基础上对齐验收（d2 训坏已停，当前跑 d3）：
 
 ```bash
-bash scripts/supermimic/run_scratch.sh scratch_d2 2048 8000 \
+bash scripts/supermimic/run_scratch.sh scratch_d3 2048 8000 \
   --init_from logs/supermimic_terrain/scratch_d1/ckpt_010000.pt --lane_obs --lateral_pos -5 --strict_lane
 ```
 
 | 参数 | 作用 |
 |---|---|
-| `--init_from` | 继承 d1 的 actor 和世界模型（已会爬），critic 重新训，先只训 critic 300 轮 |
+| `--init_from` | 继承 d1 的 actor 和世界模型（已会爬），critic 重新训；默认先只训 critic 800 轮、actor lr 3e-5、锚定继承来的 actor（0.5）。d2 用 300 轮且不锚定，放开 actor 后纠偏过头、爬升能力也丢了 |
 | `--strict_lane` | 晋级车道 0.15 m、出界 0.75 m，与验收一致；出车道为真终止（吃翻车惩罚、不自举） |
 | `--lane_obs --lateral_pos -5` | actor 多 1 维车道横向偏移（新列从 0 开始），想象里罚偏离中线 |
 

@@ -368,6 +368,9 @@ PPO Teacher 同位置 y=0.00 / −0.02（8 cm），前轮 −5°。
 这是平地上就发生的偏移（世界模型在平地最准），与方案 B 的"台阶接触处梯度弱"不同，收紧课程 + 罚车道偏移应能纠正。
 d1 在第 10200 轮停止（用户决定）。d2（2026-10-29 启动）：`--init_from` d1 第 10000 轮（继承 actor + 世界模型，critic 重训）、`--strict_lane`（0.15 / 0.75 m，出车道真终止）、
 `--lane_obs --lateral_pos -5`，2048 env × 8000 轮。冒烟：想象/真实观测误差 1.9e-6，出车道终止项已注册。
+d2 ❌（第 1040 轮停止）：critic 只预热 300 轮、actor lr 1e-4、无锚定。放开 actor 后速度误差 0.10→0.31 m/s，第 1000 轮存档平地 x=0.6 m 已偏 −0.28 m（d1 为 +0.17），
+8/12 cm 登顶 0%、92–98% 被判出界：纠偏过头，同时丢了爬升能力（新 critic 不准时 BPTT 把继承的 actor 推坏，与热启动 v1 同一现象）。
+d3（2026-10-29）：同 d2，但锚定继承来的 d1 actor（anchor_coef 0.5，不是 PPO Teacher）、critic 预热 800 轮、actor lr 3e-5。
 
 
 运行命令（均先 `conda activate env_isaaclab; unset PYTHONPATH; source /media/bigdisk/IsaacLab/_isaac_sim/setup_conda_env.sh`）：
