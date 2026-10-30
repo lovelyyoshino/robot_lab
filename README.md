@@ -735,8 +735,9 @@ conda activate env_isaaclab; unset PYTHONPATH; source /media/bigdisk/IsaacLab/_i
 | PPO Teacher-Preview | 100% | 70% | 0% |
 | 路线一（v3，第 1000 轮；同配置重训一次为 67% / 81% / 0%） | 86% | 98% | 0% |
 | 路线二（scratch_d3 第 4000 轮，分阶段训练的旧版本） | 61% | 31% | 8% |
-| 路线二 `scratch_40k` 第 6000 轮（一次从零训练，训练中） | 91% | 89% | 33% |
+| 路线二 `scratch_40k` 第 6000 轮（一次从零训练） | 91% | 89% | 33% |
 | 路线二 `scratch_40k` 第 8000 轮 | 84% | 81% | 34% |
+| 路线二 `scratch_40k` 第 10000 轮 / 第 12000 轮起（约第 10500 轮崩溃，已停训） | 5% / 0% | 38% / 0% | 59% / 0% |
 
 16 cm 的主要难点是爬台阶时向一侧漂移，越线横向超差；路线二加了车道偏移观测和随台阶加重的横向惩罚，`scratch_40k` 第 6000 轮起 12 cm 超过 PPO Teacher，16 cm 到 33–34%。
 各版本的实验记录与失败分析见 `plan.md` 4.5–4.7。
@@ -831,7 +832,7 @@ python scripts/reinforcement_learning/rsl_rl/play.py \
   --supermimic_terrain --load_run scratch_40k --num_envs 4 --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5
 ```
 
-- 课程曲线一直涨不代表严格验收在涨（实测会越训越会爬、但越歪），选哪个存档以 `acceptance_progress.md` 为准。
+- 课程曲线一直涨不代表严格验收在涨，选哪个存档以 `acceptance_progress.md` 为准。`scratch_40k` 在课程到顶（约 8000 轮）后开始退化，约第 10500 轮崩溃成原地不动，过程见 `plan.md`。
 - 训练中断后，用原来的参数加 `--resume --load_run scratch_40k` 运行 `train_terrain.py --from_scratch`；存档带地形课程等级，课程不会从头爬。
 - 部署需要车载定位提供"离路线中线多远"。
 
