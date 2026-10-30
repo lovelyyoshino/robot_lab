@@ -2,9 +2,10 @@
 
 @author pony
 @date 2026-10-26
-@version v0.2.0
-@last_modified 2026-10-29
+@version v0.3.0
+@last_modified 2026-10-30
 @changelog
+    - v0.3.0 (2026-10-30): 课程到顶随机回落、课程饱和判据
     - v0.2.0 (2026-10-29): 续训课程等级恢复与横向惩罚爬坡
     - v0.1.0 (2026-10-26): 初始创建
 """
@@ -473,7 +474,7 @@ def test_scratch_lane_gates_follow_cfg():
     assert ns["_lanes"](d1) == (0.5, 1.0) and ns["_lanes"](d2) == (0.15, 0.75)
 
 
-from supermimic.schedule import linear_ramp, restore_terrain_levels  # noqa: E402
+from supermimic.schedule import linear_ramp, next_terrain_levels, restore_terrain_levels, saturation_reached  # noqa: E402
 
 
 def test_linear_ramp_clamps_and_interpolates():
@@ -490,3 +491,23 @@ def test_restore_terrain_levels_keeps_progress():
     # 环境数不同：从存档分布抽样，不回到第 0 级
     big = restore_terrain_levels(torch.full((64,), 4), 512, max_level=9, generator=torch.Generator().manual_seed(0))
     assert big.shape == (512,) and bool((big == 4).all())
+
+
+def test_next_terrain_levels_resamples_top_graduates():
+    torch.manual_seed(0)
+    levels = torch.tensor([0, 3, 8, 8, 8, 8, 8, 8, 8, 8])
+    passed = torch.tensor([False, True] + [True] * 8)
+    failed = torch.tensor([True, False] + [False] * 8)
+    out = next_terrain_levels(levels, passed, failed, max_level=9)
+    assert out[0] == 0 and out[1] == 4                           # 降级不低于 0、普通升级 +1
+    assert bool(((out[2:] >= 0) & (out[2:] < 9)).all()) and len(set(out[2:].tolist())) > 1  # 通关最高级随机回落
+    kept = next_terrain_levels(levels, passed, failed, max_level=9, top_resample=False)
+    assert kept[2:].tolist() == [8] * 8                          # 旧行为：夹在最高级
+
+
+def test_saturation_reached_accumulates():
+    ever = torch.zeros(4, dtype=torch.bool)
+    ever, hit = saturation_reached(ever, torch.tensor([8, 0, 0, 0]), max_level=9, threshold=0.5)
+    assert not hit
+    ever, hit = saturation_reached(ever, torch.tensor([2, 8, 0, 0]), max_level=9, threshold=0.5)
+    assert hit and ever.tolist() == [True, True, False, False]  # 第 0 个已回落，仍计入

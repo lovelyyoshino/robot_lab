@@ -14,9 +14,11 @@ train_terrain.py — SuperMimic 越障训练：从 Teacher-Preview 热启动，�
 
 @author pony
 @date 2026-10-26
-@version v0.10.0
-@last_modified 2026-10-29
+@version v0.11.0
+@last_modified 2026-10-30
 @changelog
+    - v0.11.0 (2026-10-30): --saturation_anchor（课程饱和后锚定好存档/当前 actor，存档内保存参考）；横向惩罚按课程历史峰值爬坡
+      （scratch 课程改为通关最高级随机回落后，瞬时均值会下降）。
     - v0.10.0 (2026-10-29): 存档保存/续训恢复 terrain_levels；--lateral_pos_final/--lateral_ramp_cm（横向惩罚随课程加重）；
       --anchor_to_resume（从零续训锚定起点 actor，可配 --anchor_final）；续训时锚定衰减从本次起点算。
     - v0.9.1 (2026-10-29): --init_from 默认锚定继承 actor（0.5）、critic 预热 800、actor lr 3e-5（d2 训坏后）。
@@ -109,6 +111,12 @@ parser.add_argument("--tilt_soft_start_deg", type=float, default=25.0)
 parser.add_argument("--lateral_pos_final", type=float, default=None, help="横向位置惩罚终值；省略则固定 --lateral_pos")
 parser.add_argument("--lateral_ramp_cm", type=float, nargs=2, default=(5.0, 10.0), metavar=("START", "END"),
                     help="课程平均台阶高度（cm）从 START 到 END 时，lateral_pos 从初值线性到终值")
+# scratch_40k：课程到顶后约 2500 轮蟹行复现、再崩成原地不动。到顶后用一份好存档做信赖域，只允许小步偏离。
+parser.add_argument("--saturation_anchor", default=None,
+                    help="课程饱和后锚定的 actor：越障 ckpt 路径，或 self（触发时冻结当前 actor）；省略关闭")
+parser.add_argument("--saturation_anchor_coef", type=float, default=0.5)
+parser.add_argument("--saturation_top_fraction", type=float, default=0.5,
+                    help="曾到过最高级的环境占比达到此值即触发（顶层随机回落后，瞬时占比不再能反映进度）")
 parser.add_argument("--anchor_to_resume", action="store_true",
                     help="从零任务续训时以续训起点 actor 为锚定参考（权重 --anchor_coef，可配 --anchor_final 衰减）")
 AppLauncher.add_app_launcher_args(parser)
@@ -134,6 +142,9 @@ if args_cli.init_from:
     for _k, _v in (("critic_warmup_iterations", 800), ("actor_lr", 3e-5), ("anchor_coef", 0.5)):
         if _k not in _explicit:
             setattr(args_cli, _k, _v)
+if args_cli.saturation_anchor and (args_cli.anchor_final is not None or args_cli.anchor_to_resume or args_cli.init_from
+                                   or not args_cli.from_scratch):
+    parser.error("--saturation_anchor 只用于 --from_scratch，且不与 --anchor_final / --anchor_to_resume / --init_from 组合")
 if args_cli.anchor_to_resume and "anchor_coef" not in _explicit:
     args_cli.anchor_coef = 0.5
 if args_cli.strict_lane and not args_cli.from_scratch:
@@ -167,7 +178,7 @@ from robot_lab.supermimic.lane_offset import add_lane_offset_term, pad_first_lay
 from robot_lab.supermimic.learner import SuperMimicCfg, SuperMimicLearner  # noqa: E402
 from robot_lab.supermimic.preview_task import PreviewRewardCfg, PreviewTask  # noqa: E402
 from robot_lab.supermimic.rover_task import CONTROL_DT  # noqa: E402
-from robot_lab.supermimic.schedule import linear_ramp, restore_terrain_levels  # noqa: E402
+from robot_lab.supermimic.schedule import linear_ramp, restore_terrain_levels, saturation_reached  # noqa: E402
 from robot_lab.supermimic.quat import quat_apply  # noqa: E402
 from robot_lab.supermimic.state import LIN, QUAT  # noqa: E402
 
@@ -328,8 +339,29 @@ def main():
         # d4：以横向最好的存档为参考，配合 --anchor_final 逐步放开，避免一直被拉回 d1 的蟹行爬法
         learner.set_anchor(copy.deepcopy(learner.actor))
         print(f"[SuperMimic-Terrain] 锚定续训起点 actor（anchor_coef={cfg.anchor_coef}）", flush=True)
-    else:
+    elif not resume_path:
         print("[SuperMimic-Terrain] 从零训练：actor 随机初始化，不加载、不锚定 Teacher", flush=True)
+
+    sat_active = False
+    ever_top = torch.zeros(uenv.num_envs, dtype=torch.bool, device=device)
+
+    def load_saturation_anchor(actor_sd=None) -> None:
+        """冻结饱和锚定参考并打开信赖域；actor_sd 为空时按 --saturation_anchor 取（self = 当前 actor）。"""
+        nonlocal sat_active
+        anchor = copy.deepcopy(learner.actor)
+        if actor_sd is None and args_cli.saturation_anchor != "self":
+            actor_sd = torch.load(args_cli.saturation_anchor, map_location=device, weights_only=False)["actor"]
+        if actor_sd is not None:
+            extra = task.obs_dim - actor_sd["actor.0.weight"].shape[1]
+            anchor.load_state_dict(pad_first_layer(actor_sd, extra) if extra > 0 else actor_sd)
+        learner.set_anchor(anchor)
+        cfg.anchor_coef = args_cli.saturation_anchor_coef
+        sat_active = True
+
+    if args_cli.saturation_anchor and resume_path and "saturation_anchor" in ckpt:
+        # 续训沿用触发时冻结的那份参考，不重新取（self 模式下重新取会变成续训起点 actor）
+        load_saturation_anchor(ckpt["saturation_anchor"])
+        print(f"[SuperMimic-Terrain] 续训恢复饱和锚定（anchor_coef={cfg.anchor_coef}）", flush=True)
 
     # 续训未给 --run_name 时写回原 run，与 rsl_rl 续训习惯一致
     run = args_cli.run_name or (Path(resume_path).parent.name if resume_path else datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
@@ -365,15 +397,25 @@ def main():
     # 续训时衰减从本次起点算；否则 it 早已超过预热轮数，第一轮就跳到终值
     actor_begin = max(cfg.warmup_iterations + cfg.critic_warmup_iterations, learner.iteration)
     lateral_start = reward_cfg.lateral_pos
+    # 横向惩罚按课程平均台阶的历史最大值爬坡：顶层随机回落会拉低瞬时均值，惩罚不应随之变轻
+    step_cm_peak = curriculum_stats(uenv)["step_height_cm_mean"] if args_cli.from_scratch else 0.0
     for it in range(learner.iteration, args_cli.iterations):
         if args_cli.anchor_final is not None:
             frac = min(max(it - actor_begin, 0) / max(args_cli.anchor_decay_iterations, 1), 1.0)
             cfg.anchor_coef = anchor_start + frac * (args_cli.anchor_final - anchor_start)
         if args_cli.lateral_pos_final is not None and args_cli.from_scratch:
             # task.cfg 与 reward_cfg 是同一对象：真实回报与想象目标同时变化，口径不分叉
-            step_cm = curriculum_stats(uenv)["step_height_cm_mean"]
-            reward_cfg.lateral_pos = linear_ramp(step_cm, *args_cli.lateral_ramp_cm, lateral_start,
+            step_cm_peak = max(step_cm_peak, curriculum_stats(uenv)["step_height_cm_mean"])
+            reward_cfg.lateral_pos = linear_ramp(step_cm_peak, *args_cli.lateral_ramp_cm, lateral_start,
                                                  args_cli.lateral_pos_final)
+        if args_cli.saturation_anchor and not sat_active:
+            t = uenv.scene.terrain
+            ever_top, hit = saturation_reached(ever_top, t.terrain_levels, t.max_terrain_level,
+                                               args_cli.saturation_top_fraction)
+            if hit:
+                load_saturation_anchor()
+                print(f"[SuperMimic-Terrain] 第 {it} 轮课程饱和，锚定 {args_cli.saturation_anchor}"
+                      f"（anchor_coef={cfg.anchor_coef}）", flush=True)
         sim = {"env_reward": 0.0, "shaping_reward": 0.0, "route_vel_err": 0.0, "terminated": 0.0,
                "obs_max_err": 0.0}
         for _ in range(args_cli.steps_per_iter):
@@ -429,6 +471,7 @@ def main():
         logs.update(sim)
         logs["anchor_coef"] = cfg.anchor_coef
         logs["lateral_pos_coef"] = reward_cfg.lateral_pos
+        logs["saturation_anchor_on"] = float(sat_active)
         if it % args_cli.log_interval == 0:
             logs.update(curriculum_stats(uenv))
             logs["elapsed_min"] = (time.time() - start_time) / 60
@@ -447,8 +490,10 @@ def main():
             csv_file.flush()
             print(f"[it {it}] " + " ".join(f"{k}={v:.4g}" for k, v in sorted(logs.items())), flush=True)
         if (it + 1) % args_cli.save_interval == 0 or it + 1 == args_cli.iterations:
-            torch.save({**learner.state_dict(), "terrain_levels": uenv.scene.terrain.terrain_levels.cpu()},
-                       log_dir / f"ckpt_{it + 1:06d}.pt")
+            extra_state = {"terrain_levels": uenv.scene.terrain.terrain_levels.cpu()}
+            if sat_active:
+                extra_state["saturation_anchor"] = learner.anchor_actor.state_dict()
+            torch.save({**learner.state_dict(), **extra_state}, log_dir / f"ckpt_{it + 1:06d}.pt")
             export_policy(learner, log_dir / "exported", task.obs_dim)
     csv_file.close()
     writer.close()

@@ -814,11 +814,14 @@ python scripts/supermimic/export_terrain_teacher.py --load_run terrain_v3 --chec
 | `--strict_lane` | 晋级车道 0.15 m、出界 0.75 m，与验收一致；出车道为真终止 |
 | `--lane_obs` | actor 多 1 维车道横向偏移（233 → 12） |
 | `--lateral_pos -5 --lateral_pos_final -15 --lateral_ramp_cm 5 10` | 课程平均台阶从 5 cm 到 10 cm，横向位置惩罚从 −5 加重到 −15 |
+| `--saturation_anchor <ckpt 或 self>` | 课程饱和（≥50% 环境到过最高级）后以该存档为信赖域参考（0.5），防止到顶后策略漂走；`self` 为触发时的当前 actor |
+
+课程中通关最高级（16 cm）的环境会随机回落到各级（与 Isaac Lab 默认一致），矮台阶一直有训练数据。
 
 ```bash
 # 训练（nohup 后台，2048 env × 40000 轮，每 1000 轮存 ckpt；日志 logs/supermimic_terrain/scratch_40k.log）
 bash scripts/supermimic/run_scratch.sh scratch_40k 2048 40000 \
-  --strict_lane --lane_obs --lateral_pos -5 --lateral_pos_final -15 --lateral_ramp_cm 5 10
+  --strict_lane --lane_obs --lateral_pos -5 --lateral_pos_final -15 --lateral_ramp_cm 5 10 --saturation_anchor self
 # 过程验收：每 2000 轮自动导出并严格验收，结果追加到 logs/supermimic_terrain/scratch_40k/acceptance_progress.md
 nohup bash scripts/supermimic/watch_accept.sh scratch_40k 2000 40000 2000 > logs/supermimic_terrain/scratch_40k_watch.log 2>&1 &
 # 看课程进度（terrain_level_mean / step_height_cm_mean / lateral_pos_coef）
@@ -832,7 +835,7 @@ python scripts/reinforcement_learning/rsl_rl/play.py \
   --supermimic_terrain --load_run scratch_40k --num_envs 4 --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5
 ```
 
-- 课程曲线一直涨不代表严格验收在涨，选哪个存档以 `acceptance_progress.md` 为准。`scratch_40k` 在课程到顶（约 8000 轮）后开始退化，约第 10500 轮崩溃成原地不动，过程见 `plan.md`。
+- 课程曲线一直涨不代表严格验收在涨，选哪个存档以 `acceptance_progress.md` 为准。`scratch_40k` 在课程到顶（约 8000 轮）后开始退化，约第 10500 轮崩溃成原地不动，过程见 `plan.md`。当时课程把通关者夹在最高级、也没有饱和锚定；现已修复，`scratch_40k_r8k` 从它第 8000 轮存档按新设置重训（锚定该存档）。
 - 训练中断后，用原来的参数加 `--resume --load_run scratch_40k` 运行 `train_terrain.py --from_scratch`；存档带地形课程等级，课程不会从头爬。
 - 部署需要车载定位提供"离路线中线多远"。
 
