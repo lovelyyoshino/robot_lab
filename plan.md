@@ -382,6 +382,9 @@ d3 第 6000 / 8000 轮严格验收：8 cm 69% / 14%、12 cm 31% / 23%、16 cm 0%
 从零续训不设锚定、锚定衰减按绝对轮号算（续训第一轮就到终值）、续训回放空时 critic 真实回报窗口（65 步）采样报错，均已修。
 d4（2026-10-29）：从 d3 第 6000 轮续训到 40000 轮；lateral_pos 随课程平均台阶 5→10 cm 从 −5 加重到 −15；锚定续训起点 actor，2000 轮内 0.5→0.1；
 每 2000 轮自动严格验收（watch_accept.sh → scratch_d4/acceptance_progress.md），横向持续变差就停。
+d4 跑了约 1 小时后按用户要求停掉，改为一次从零训练 `scratch_40k`（2048 env × 40000 轮，从第 0 轮起 --strict_lane --lane_obs，lateral_pos 随课程 5→10 cm 从 −5 加重到 −15，无锚定）。
+scratch_40k 严格验收（8/12/16 cm）：第 2000 轮 14/0/0%，第 4000 轮 55/27/6%，**第 6000 轮 91/89/33%**，第 8000 轮 84/81/34%；平地平稳全部通过。
+课程平均台阶 8000 轮已到 14.8 cm（81% 环境在最高级），比 d3（8000 轮 6.5 cm）快得多：从第 0 轮就按严格车道训，没有先学成蟹行再纠偏。
 
 
 运行命令（均先 `conda activate env_isaaclab; unset PYTHONPATH; source /media/bigdisk/IsaacLab/_isaac_sim/setup_conda_env.sh`）：
