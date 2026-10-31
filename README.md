@@ -744,6 +744,7 @@ conda activate env_isaaclab; unset PYTHONPATH; source /media/bigdisk/IsaacLab/_i
 | 路线二 `scratch_40k_r8k` 第 20000 轮 | 100% | 97% | 78% |
 | 路线二 `scratch_40k_r8k` 第 24000 轮 | 98% | 97% | 81% |
 | **路线二 `scratch_40k_r8k` 第 26000 轮（当前最好）** | **95%** | **97%** | **89%** |
+| 路线二 `scratch_40k_r8k` 第 28000 轮 | 100% | 97% | 67% |
 
 16 cm 的主要难点是爬台阶时向一侧漂移，越线横向超差；路线二加了车道偏移观测和随台阶加重的横向惩罚，`scratch_40k` 第 6000 轮起 12 cm 超过 PPO Teacher，16 cm 到 33–34%。
 各版本的实验记录与失败分析见 `plan.md` 4.5–4.7。
