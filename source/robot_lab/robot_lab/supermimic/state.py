@@ -10,9 +10,10 @@ state.py — 平行四边形车的扁平状态向量、航向不变特征与增�
 
 @author pony
 @date 2026-10-26
-@version v0.1.0
-@last_modified 2026-10-26
+@version v0.2.0
+@last_modified 2026-11-02
 @changelog
+    - v0.2.0 (2026-11-02): 原生物理状态可保留四元数位模式，避免扫描边缘因重复归一化改变命中。
     - v0.1.0 (2026-10-26): 初始创建
 """
 
@@ -41,11 +42,13 @@ DELTA_DIM = 32
 FEATURE_DIM = 3 + 3 + 3 + NUM_LEG_JOINTS + NUM_JOINTS  # 29
 
 
-def make_state(pos_w, quat_w, lin_vel_b, ang_vel_b, joint_pos_rel, joint_vel) -> torch.Tensor:
+def make_state(pos_w, quat_w, lin_vel_b, ang_vel_b, joint_pos_rel, joint_vel,
+               *, normalize_quat: bool = True) -> torch.Tensor:
     joint_pos_rel = joint_pos_rel.clone()
     # 轮子位置无界且不影响动力学，统一置零，避免数值漂移污染归一化统计。
     joint_pos_rel[..., NUM_LEG_JOINTS:] = 0.0
-    return torch.cat((pos_w, quat_normalize(quat_w), lin_vel_b, ang_vel_b, joint_pos_rel, joint_vel), dim=-1)
+    rotation = quat_normalize(quat_w) if normalize_quat else quat_w
+    return torch.cat((pos_w, rotation, lin_vel_b, ang_vel_b, joint_pos_rel, joint_vel), dim=-1)
 
 
 def features(state: torch.Tensor) -> torch.Tensor:

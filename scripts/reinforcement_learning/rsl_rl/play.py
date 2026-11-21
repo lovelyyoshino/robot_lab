@@ -373,7 +373,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     if args_cli.scan_student:
         # 扫描学生是 TorchScript，没有 rsl_rl 的 params/；改核对它训练时写下的深度合同。
-        from robot_lab.tasks.manager_based.locomotion.velocity.config.wheeled.parallelogram_rover.vision_env_cfg import vision_depth_contract
         from vision_contract import validate_scan_student
 
         if not args_cli.task.endswith("Vision-Student-Temporal-Preview-v0"):
@@ -383,7 +382,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if not runs:
                 raise FileNotFoundError("logs/supermimic_scan 下没有已导出的扫描学生")
             resume_path = str(max(runs, key=lambda p: p.stat().st_mtime).resolve())
-        validate_scan_student(resume_path, vision_depth_contract(env_cfg))
+        from robot_lab.supermimic.scan_student import configure_saved_student
+
+        validate_scan_student(resume_path, configure_saved_student(env_cfg, resume_path))
         log_dir = os.path.dirname(os.path.dirname(resume_path))
     elif args_cli.supermimic_terrain:
         # 越障策略是 TorchScript（232→12），观测/动作合同与热启动 Teacher 相同，按 run 目录的 vision_contract.json 校验。
@@ -399,6 +400,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if not runs:
                 raise FileNotFoundError(f"{root} 下没有已导出的越障策略（--load_run={agent_cfg.load_run}）")
             resume_path = str(max(runs, key=lambda p: p.stat().st_mtime).resolve())
+        from vision_contract import restore_height_scan_period
+
+        source_path = Path(resume_path).parent.parent / "params/vision_contract.json"
+        source_contract = json.loads(source_path.read_text())
+        restore_height_scan_period(env_cfg, source_contract)
+        preview_contract["shared"]["height_scanner"]["update_period"] = env_cfg.scene.height_scanner.update_period
         validate_supermimic_terrain(resume_path, preview_contract)
         from robot_lab.supermimic.lane_offset import add_lane_offset_term, policy_uses_lane_offset
 

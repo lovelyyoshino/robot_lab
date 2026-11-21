@@ -3,9 +3,15 @@
 
 @author pony
 @date 2026-09-16
-@version v0.8.0
-@last_modified 2026-10-28
+@version v0.12.0
+@last_modified 2026-11-07
 @changelog
+    - v0.12.0 (2026-11-07): --supermimic_terrain 未给 --wheel_friction 时用 terrain_env_cfg.WHEEL_FRICTION（固定 μ=1.0），
+      与 SuperMimic 训练任务一致，并记入 terrain_override。
+    - v0.11.0 (2026-11-07): 诊断参数 --wheel_friction STATIC DYNAMIC（固定轮胎摩擦，验证楼梯后轴对摩擦的依赖）。
+    - v0.10.0 (2026-11-06): --supermimic_terrain 的单台阶预抬使用 acceptance_metrics.PRELIFT_WINDOW（3–12 cm 起抬）。
+    - v0.9.0 (2026-11-05): --acceptance_metrics 逐回合姿态/平顺/四轮踢面碰撞（accept.py）；单台阶/楼梯几何运行时覆盖；
+      232/233 维按 actor 权重切换车道偏移列；删除旧的扫描消融 --scan_mode。
     - (2026-10-28): --supermimic_terrain 自动识别方案 B 策略并追加车道偏移观测。
     - (2026-10-27): 楼梯途中跌倒按 stairs_acceptance.CLIMB_TILT_DEG（16 cm 45°），终点稳定仍 31.8°；--climb_tilt_deg 覆盖。
     - (2026-10-26): 新增 --supermimic_terrain，评测 supermimic 越障策略（TorchScript 232→12）。
@@ -91,6 +97,16 @@ def parse_args():
                              "仅用于 student-preview；按 run 目录的 depth_contract.json 校验，不走 rsl_rl runner。")
     parser.add_argument("--climb_tilt_deg", type=float, default=None,
                         help="覆盖楼梯途中倾角门；默认按 stairs_acceptance.CLIMB_TILT_DEG（8/12 cm 31.8°，16 cm 45°）。")
+    parser.add_argument("--acceptance_metrics", action="store_true",
+                        help="记录逐回合姿态、平顺与四轮踢面碰撞（acceptance_metrics.py），供 accept.py 汇总。")
+    parser.add_argument("--step_height_m", type=float, default=None,
+                        help="单台阶高度覆盖（运行时改 cfg，不改训练配置文件），如 0.10/0.14/0.175。")
+    parser.add_argument("--stair_riser_m", type=float, default=None, help="楼梯踢面高度覆盖，需同时给 --stair_tread_m。")
+    parser.add_argument("--stair_tread_m", type=float, default=None, help="楼梯踏面深度覆盖，如 0.40/0.28。")
+    parser.add_argument("--stair_steps", type=int, default=None,
+                        help="楼梯级数覆盖；默认按 stairs_acceptance.ACCEPTANCE_STAIR_STEP_COUNTS。")
+    parser.add_argument("--wheel_friction", type=float, nargs=2, default=None, metavar=("STATIC", "DYNAMIC"),
+                        help="诊断：把轮胎摩擦固定为给定值（默认按任务随机 static 0.5–1.2 / dynamic 0.4–1.0）。")
     AppLauncher.add_app_launcher_args(parser)
     checkpoint_arg.required = True
     args = parser.parse_args()
@@ -103,6 +119,16 @@ def parse_args():
         parser.error(f"checkpoint 不存在：{args.checkpoint}")
     if not args.policy.startswith("student") and args.depth_mode != "live":
         parser.error("深度失效对照仅适用于 student")
+    if args.acceptance_metrics and not args.policy.endswith("-preview"):
+        parser.error("--acceptance_metrics 需要 Preview 任务（四轮几何与接触力来自 vision_preview）")
+    if args.step_height_m is not None and (args.scenario not in STEP_FRONT_WHEELS or not 0 < args.step_height_m <= 0.25):
+        parser.error("--step_height_m 只用于单台阶且须在 (0, 0.25] m")
+    if (args.stair_riser_m is None) != (args.stair_tread_m is None) or (
+            args.stair_steps is not None and args.stair_riser_m is None):
+        parser.error("--stair_riser_m 与 --stair_tread_m 必须同时给出，--stair_steps 依赖二者")
+    if args.stair_riser_m is not None and (args.scenario != "pyramid_stairs_inv" or not args.policy.endswith("-preview")
+                                           or not 0 < args.stair_riser_m <= 0.25 or not 0.2 <= args.stair_tread_m <= 0.6):
+        parser.error("楼梯几何覆盖只用于 Preview 的 pyramid_stairs_inv，踢面 (0,0.25] m、踏面 [0.2,0.6] m")
     if args.depth_snapshot is not None and not args.policy.startswith("student"):
         parser.error("depth_snapshot需要student相机")
     if args.camera_corruption and args.policy not in ("student-temporal", "student-preview"):
@@ -183,12 +209,18 @@ def capture_traversal(env, *, scenario: str):
         relative[:, 0].cpu().tolist(), squared_error.cpu().tolist(),
     )
     env._vision_eval_support = support_rows(support)
-    if scenario in STEP_FRONT_WHEELS:
+    acceptance_spec = getattr(env.cfg, "acceptance_metrics", None)
+    if scenario in STEP_FRONT_WHEELS or acceptance_spec is not None:
         from robot_lab.tasks.manager_based.locomotion.velocity.config.wheeled.parallelogram_rover import (
             vision_preview,
         )
 
         sample = vision_preview.collect_preview(env)
+    if acceptance_spec is not None:
+        from acceptance_metrics import capture_acceptance_sample
+
+        env._acceptance_sample = capture_acceptance_sample(env, sample, finite)
+    if scenario in STEP_FRONT_WHEELS:
         # 固定地形前缘比离散扫描命中的栅格更准确；必须在自动reset前测量。
         terrain = env.cfg.scene.terrain.terrain_generator.sub_terrains[scenario]
         front_x = vision_preview.step_front_x_for_difficulty(
@@ -359,20 +391,33 @@ def main(args, simulation_app):
     task = TASKS[args.policy]
     cfg = load_cfg_from_registry(task, "env_cfg_entry_point")
     agent_cfg = load_cfg_from_registry(task, "rsl_rl_cfg_entry_point")
+    if args.supermimic_terrain:
+        from vision_contract import restore_height_scan_period
+
+        source_path = args.checkpoint.parent.parent / "params/vision_contract.json"
+        restore_height_scan_period(cfg, json.loads(source_path.read_text()))
     # 三种策略在相同摩擦和地形下比较；blind 训练时的特殊摩擦不带入验收。
     preview_contract = contract_for_cfg(task, cfg, agent_cfg)
+    scan_depth_contract = None
+    actor_obs_dim = None
     if args.scan_student:
         from vision_contract import validate_scan_student
 
-        validate_scan_student(args.checkpoint, vision_depth_contract(cfg))
+        from robot_lab.supermimic.scan_student import configure_saved_student
+
+        scan_depth_contract = configure_saved_student(cfg, args.checkpoint)
+        validate_scan_student(args.checkpoint, scan_depth_contract)
     elif args.supermimic_terrain:
         from vision_contract import validate_supermimic_terrain
 
         validate_supermimic_terrain(args.checkpoint, preview_contract)
-        from robot_lab.supermimic.lane_offset import add_lane_offset_term, policy_uses_lane_offset
+        from acceptance_metrics import LANE_OFFSET_OBS_DIM, actor_input_dim
 
-        if policy_uses_lane_offset(args.checkpoint):
-            # 方案 B 策略：合同之外追加第 233 维车道偏移（run 目录 params/lane_offset_obs.json）
+        actor_obs_dim = actor_input_dim(args.checkpoint)
+        if actor_obs_dim == LANE_OFFSET_OBS_DIM:
+            from robot_lab.supermimic.lane_offset import add_lane_offset_term
+
+            # 旧方案 B 基线（233 维）：合同之外追加车道偏移列；当前越障策略为 232 维，不加。
             add_lane_offset_term(cfg)
     else:
         validate_checkpoint(args.checkpoint, preview_contract)
@@ -395,6 +440,24 @@ def main(args, simulation_app):
     selected = terrain.sub_terrains[args.scenario]
     selected.proportion = 1.0
     terrain.sub_terrains = {args.scenario: selected}
+    # 验收档位在运行时覆盖几何；合同已在上面按原配置计算，训练配置文件不变。
+    terrain_override = None
+    if args.step_height_m is not None:
+        selected.step_height_range = (args.step_height_m, args.step_height_m)
+        terrain_override = {"step_height_m": args.step_height_m}
+    if args.stair_riser_m is not None:
+        from robot_lab.tasks.manager_based.locomotion.velocity.config.wheeled.parallelogram_rover.stairs_acceptance import (
+            ACCEPTANCE_STAIR_STEP_COUNTS,
+        )
+
+        steps = args.stair_steps or ACCEPTANCE_STAIR_STEP_COUNTS.get(round(args.stair_riser_m, 3))
+        if steps is None:
+            raise ValueError(f"踢面 {args.stair_riser_m} m 没有默认级数，请给 --stair_steps")
+        selected.height_levels = (args.stair_riser_m,) * 3
+        selected.step_counts = (int(steps),) * 3
+        selected.step_width = args.stair_tread_m
+        terrain_override = {"stair_riser_m": args.stair_riser_m, "stair_tread_m": args.stair_tread_m,
+                            "stair_steps": int(steps)}
     terrain.num_rows = 1
     terrain.num_cols = 4
     terrain.difficulty_range = (args.difficulty, args.difficulty)
@@ -409,6 +472,17 @@ def main(args, simulation_app):
         "x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0),
     }
     cfg.events.randomize_reset_base.params["velocity_range"] = {}
+    wheel_friction = args.wheel_friction
+    if wheel_friction is None and args.supermimic_terrain:
+        # SuperMimic 训练与平地验收的任务固定了轮胎摩擦；Teacher-Preview 任务仍是随机范围，这里对齐
+        from robot_lab.tasks.manager_based.supermimic.terrain_env_cfg import WHEEL_FRICTION
+
+        wheel_friction = WHEEL_FRICTION
+    if wheel_friction is not None:
+        material = cfg.events.randomize_wheel_rigid_body_material.params
+        material["static_friction_range"] = (wheel_friction[0],) * 2
+        material["dynamic_friction_range"] = (wheel_friction[1],) * 2
+        terrain_override = {**(terrain_override or {}), "wheel_friction": list(wheel_friction)}
     command = cfg.commands.base_velocity
     evaluation_speed = 0.30 if preview_contract is not None else 0.40
     command.ranges.lin_vel_x = (evaluation_speed, evaluation_speed)
@@ -427,14 +501,26 @@ def main(args, simulation_app):
             evaluation_protocol.update(stairs_profile(
                 args.difficulty, selected.height_levels, selected.step_counts, selected.first_edge_m, selected.step_width,
             ))
-            from robot_lab.tasks.manager_based.locomotion.velocity.config.wheeled.parallelogram_rover.stairs_acceptance import climb_tilt_deg
-            evaluation_protocol["climb_tilt_deg"] = climb_tilt_deg(evaluation_protocol, args.climb_tilt_deg)
+            from robot_lab.tasks.manager_based.locomotion.velocity.config.wheeled.parallelogram_rover.stairs_acceptance import (
+                climb_tilt_deg,
+                climb_tilt_for_riser,
+            )
+            override = args.climb_tilt_deg
+            if override is None and args.stair_riser_m is not None:
+                # 档位覆盖后 stage 恒为 1，按踢面取翻车门（≥14 cm 45°）
+                override = climb_tilt_for_riser(args.stair_riser_m)
+            evaluation_protocol["climb_tilt_deg"] = climb_tilt_deg(evaluation_protocol, override)
         cfg.vision_evaluation_protocol = evaluation_protocol
         cfg.terminations.preview_success = None
     support_sensors = configure_support_sensors(cfg)
 
     tracker = SkillEvaluation(args.num_envs, args.episodes_per_env, cfg.sim.dt * cfg.decimation,
                               0.5, cfg.episode_length_s - 0.5)
+    prelift_window = {}
+    if args.supermimic_terrain:
+        from acceptance_metrics import PRELIFT_WINDOW
+
+        prelift_window = PRELIFT_WINDOW
     prelift = (
         PreliftEvaluation(
             args.num_envs,
@@ -452,9 +538,34 @@ def main(args, simulation_app):
             baseline_settle_s=cfg.vision_preview["baseline_settle_s"],
             baseline_stable_s=cfg.vision_preview["baseline_stable_s"],
             preparation_max_advance_m=cfg.vision_preview["preparation_max_advance_m"],
+            **prelift_window,
         )
         if args.scenario in STEP_FRONT_WHEELS else None
     )
+    acceptance = None
+    if args.acceptance_metrics:
+        from acceptance_metrics import EpisodeMetrics, single_step_risers, stairs_risers
+
+        from robot_lab.assets.parallelogram_rover import PARALLELOGRAM_ROVER_SUSPENSION_JOINT_NAMES
+        from robot_lab.tasks.manager_based.locomotion.velocity.config.wheeled.parallelogram_rover import (
+            vision_preview,
+        )
+
+        risers = None
+        if args.scenario in STEP_FRONT_WHEELS:
+            low, high = selected.step_height_range
+            risers = single_step_risers(
+                vision_preview.step_front_x_for_difficulty(args.difficulty, selected.step_front_x_range, terrain.seed),
+                low + args.difficulty * (high - low),
+                vision_preview.step_lateral_bounds(selected.lane_center_y, selected.lane_width),
+            )
+        elif args.scenario == "pyramid_stairs_inv" and evaluation_protocol is not None:
+            risers = stairs_risers(selected.first_edge_m, selected.step_width, evaluation_protocol["step_height_m"],
+                                   evaluation_protocol["num_steps"], selected.lane_width)
+        cfg.acceptance_metrics = {"risers": risers, "arm_joint_names": list(PARALLELOGRAM_ROVER_SUSPENSION_JOINT_NAMES)}
+        acceptance = EpisodeMetrics(args.num_envs, tracker.dt,
+                              climb_tilt_deg=(evaluation_protocol or {}).get("climb_tilt_deg", 31.8),
+                              target_distance_m=(evaluation_protocol or {}).get("target_distance_m", 2.5))
     tracking_error_sum = 0.0
     tracking_samples = 0
     terminal_progress = []
@@ -486,17 +597,20 @@ def main(args, simulation_app):
             runner.load(str(args.checkpoint), load_optimizer=False)
             policy = runner.get_inference_policy(device=env.unwrapped.device)
         obs, _ = env.reset()
+        if actor_obs_dim is not None and obs["policy"].shape[-1] != actor_obs_dim:
+            raise RuntimeError(f"环境 policy 观测 {obs['policy'].shape[-1]} 维，策略需要 {actor_obs_dim} 维")
         depth_probe_initial = (capture_depth_probe(env.unwrapped, args, save_snapshot=False)
                                if args.policy.startswith("student") else None)
         depth_probe = depth_probe_initial
         depth_probe_prelift_window = None
         evaluation_steps = 0
-        frozen_depth = obs["policy"][:, 45:].clone() if args.policy.startswith("student") else None
+        depth_end = 45 + 8 * 16 * 32
+        frozen_depth = obs["policy"][:, 45:depth_end].clone() if args.policy.startswith("student") else None
         while not tracker.complete and simulation_app.is_running():
             with torch.inference_mode():
                 if args.policy.startswith("student") and args.depth_mode != "live":
                     obs = obs.clone()
-                    obs["policy"][:, 45:] = 1.0 if args.depth_mode == "blank" else frozen_depth
+                    obs["policy"][:, 45:depth_end] = 1.0 if args.depth_mode == "blank" else frozen_depth
                 actions = policy(obs)
                 if not torch.isfinite(actions).all():
                     raise RuntimeError("策略输出非有限动作，终止评测")
@@ -532,12 +646,14 @@ def main(args, simulation_app):
             tracker.update(stable, terminated, truncated, finite)
             if prelift is not None:
                 prelift.update(env.unwrapped._vision_prelift_sample, tracker)
+            if acceptance is not None:
+                acceptance.update(env.unwrapped._acceptance_sample, tracker)
             if not (args.scan_student or args.supermimic_terrain):
                 # 扫描学生的 GRU 只在 8 帧窗口内展开、跨步无状态，无需 reset。
                 runner.alg.policy.reset(dones)
             if frozen_depth is not None:
                 reset_ids = dones.bool()
-                frozen_depth[reset_ids] = obs["policy"][reset_ids, 45:]
+                frozen_depth[reset_ids] = obs["policy"][reset_ids, 45:depth_end]
     finally:
         env.close()
 
@@ -577,11 +693,14 @@ def main(args, simulation_app):
         "base_height_scan_policy": "finite_xyz_or_all_positive_inf_during_gap_crossing; finite_xyz_at_terminal",
         "scope": "fixed_lane_traversal; does not establish general navigation or parkour",
         "camera_corruption": args.camera_corruption,
-        "depth_contract": vision_depth_contract(cfg) if args.policy.startswith("student") else None,
+        "depth_contract": (scan_depth_contract or vision_depth_contract(cfg)) if args.policy.startswith("student") else None,
         "vision_contract": preview_contract,
         "depth_probe": depth_probe,
         "depth_probe_initial": depth_probe_initial,
         "depth_probe_prelift_window": depth_probe_prelift_window,
+        "actor_obs_dim": actor_obs_dim,
+        "terrain_override": terrain_override,
+        "acceptance_metrics": acceptance.summary() if acceptance is not None else None,
         "acceptance_protocol": ("rover_single_step_prelift" if prelift is not None else
                                 "rover_preview_route_climb" if evaluation_protocol is not None else TRAVERSAL_PROTOCOL),
     })

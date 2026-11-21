@@ -1,35 +1,69 @@
 #!/usr/bin/env python3
 """
-train_terrain.py — SuperMimic 越障训练：从 Teacher-Preview 热启动，在 8→12→16 cm 楼梯课程上用世界模型 + BPTT 优化。
-
-流程：
-1. actor 直接加载 Teacher-Preview 的 rsl_rl 权重（232→512/256/128→12，clamp 输出，界内动作与 Teacher 完全相同）；
-2. 前 --warmup_iterations 轮只拟合世界模型（有地形输入 relief_features），接着 --critic_warmup_iterations 轮只训 critic；
-3. 之后 actor 在想象中按 PreviewTask 的解析奖励 + 几何抬轮塑形做 BPTT；
-4. --driver_fraction 的环境始终由冻结 Teacher + 噪声驱动，给世界模型持续提供 actor 分布之外（含卡台阶）的数据。
-课程沿用 Preview 原生 preview_route_curriculum（按真实通行晋级），日志里的 stage/stairs 比例即为课程进度。
-
-日志：logs/supermimic_terrain/<run>/ 下 train_log.csv、TensorBoard、ckpt_XXXXXX.pt、exported/policy.pt
-（232→12 TorchScript）、params/vision_contract.json（与 Teacher 同一合同，供 play/评测校验）。
+train_terrain.py — SuperMimic 越障训练：从零（无 PPO Teacher、无监督初始化、无锚定）用世界模型 + BPTT 优化。
 
 @author pony
 @date 2026-10-26
-@version v0.11.0
-@last_modified 2026-10-30
+@version v0.22.0
+@last_modified 2026-11-19
+
+流程：
+1. 前 --warmup_iterations 轮只拟合世界模型（地形输入 relief_features），之后每轮 actor 在想象中按 PreviewTask 的
+   越障解析目标做 BPTT；critic 拟合真实回报（或想象 λ-return，取决于 learner 配置）。
+2. 真实回报与想象目标是同一个函数 PreviewTask.reward；翻车/出车道终止另加 terminated×dt。车道惩罚用地形块中心
+   的横向偏移（训练特权，--lane≠0 或 --critic_lane 时启用），actor 观测仍为 232 维。
+3. 地形/课程见 tasks/manager_based/supermimic/obstacle_terrain.py：训练循环逐步记录每个环境本回合的立面碰撞、
+   姿态超限与命令距离，课程在 reset 时按地形类型晋级/降级。
+4. --check_obs_interval N：每 N 轮核对一次想象观测与 env 观测（>1e-4 即中止并保存现场）。
+
+日志：logs/supermimic_terrain/<run>/ 下 train_log.csv、TensorBoard、ckpt_XXXXXX.pt、exported/policy.pt|onnx
+（232→12）、params/vision_contract.json（部署合同）、params/supermimic_terrain.json（全部参数与实现哈希）。
+
 @changelog
-    - v0.11.0 (2026-10-30): --saturation_anchor（课程饱和后锚定好存档/当前 actor，存档内保存参考）；横向惩罚按课程历史峰值爬坡
-      （scratch 课程改为通关最高级随机回落后，瞬时均值会下降）。
-    - v0.10.0 (2026-10-29): 存档保存/续训恢复 terrain_levels；--lateral_pos_final/--lateral_ramp_cm（横向惩罚随课程加重）；
-      --anchor_to_resume（从零续训锚定起点 actor，可配 --anchor_final）；续训时锚定衰减从本次起点算。
-    - v0.9.1 (2026-10-29): --init_from 默认锚定继承 actor（0.5）、critic 预热 800、actor lr 3e-5（d2 训坏后）。
-    - v0.9.0 (2026-10-29): --init_from（继承 actor + 世界模型）、--strict_lane（车道对齐验收）；从零可配 --lane_obs。
-    - v0.8.0 (2026-10-28): --from_scratch（方案 D：从零、共用奖励、翻车惩罚、事件优先回放、2→16 cm 课程）。
-    - v0.7.0 (2026-10-28): --lane_obs（方案 B：actor 追加车道横向偏移观测，新列 0 初始化）。
-    - v0.6.0 (2026-10-28): --max_iterations 默认 6000→1000（长训退化）；默认开启平地平稳惩罚 --smooth_flat_arm -0.5 / --smooth_flat_ang -5.0。
-    - v0.5.0 (2026-10-27): 导出同时写 policy.onnx；新增 --lateral_pos、--riser_anchor、--anchor_final（PPO 约束衰减）；--wheel_heading 默认 0（v4 实测有害）；默认值回到 v3 基线。
-    - v0.4.0 (2026-10-27): 参数与 rsl_rl/train.py 对齐：--max_iterations、--resume --load_run --checkpoint。
-    - v0.3.0 (2026-10-26): 航向/横向速度/倾角软惩罚（想象与真实回报同口径）。
-    - v0.2.0 (2026-10-26): v1 退化后改为 critic 拟合真实回报 + Teacher 信赖域；抬轮塑形 ×10；初始地形覆盖全课程。
+    - v0.22.0 (2026-11-19): --post_climb_relief / --post_climb_window_m（preview_task v0.23.0 登顶后回正窗口）。
+    - v0.21.0 (2026-11-19): --tilt_temperature（软存活 sigmoid 的温度；与 --terminated 一起决定想象里翻车代价从多大倾角开始计入）。
+    - v0.20.0 (2026-11-18): --leg_action_bound：腿关节动作上界取 min(2π, 饱和界)（摆臂 ≈ ±2.72，转向与轮子不变；networks v0.5.0），
+      摆臂动作不再落到关节限位之外的零梯度区；--stall_linear_cap（preview_task v0.21.0，线性停滞代价放开到倒车区间）。
+    - v0.19.0 (2026-11-17): --stairs_success_lane_schedule START END：楼梯成功车道（课程晋级的横偏门）单独按这条时间表
+      从 fail_lane_m 收紧到 success_lane_m；给了它时 --stairs_lane_schedule 只管楼梯区车道代价。r22 第 32000 轮 16×40
+      楼梯 5/8 回合登顶但横偏 17–27 cm（验收门 15 cm）：代价可以早开，晋级门要等楼梯高度上来再收紧。
+    - v0.18.0 (2026-11-16): --stairs_climb_trail_weight / --stairs_alt_lift / --stairs_alt_lift_frac / --stairs_contact_climb_m（preview_task v0.20.0，楼梯左右轮替）。
+    - v0.17.0 (2026-11-16): --lead_side_obs：每回合随机先抬侧标记 ±1，作为命令第 4 维进回放、作为观测第 233 维进 actor
+      （镜像取反，preview_task v0.19.0 / symmetry v1.1.0 / learner v0.14.0 / networks v0.4.0）。r20 第 30000 轮 16×40
+      楼梯 4/4 回合后轴顶第一级卡死、左右动作几乎相同（|a_rl − a_rr| 0.2），第 24000 轮靠左右不对称一次上一个后轮
+      （|a_rl − a_rr| 1.0–1.5）全部登顶；镜像一致性在近似对称的状态上把动作推向对称。导出 policy.pt/onnx 固定 +1，
+      仍是 232 维输入，验收/部署链路不变。
+    - v0.16.0 (2026-11-13): --stairs_lane_schedule START END：楼梯车道约束从宽到严。START 前楼梯成功车道 = fail_lane_m、
+      楼梯区车道项与越障横向速度额外倍数 ×0，START→END 线性收紧到 success_lane_m / ×1（obstacle_terrain v1.6.0、
+      preview_task v0.18.0），日志 stairs_lane_scale。不给时与原行为相同。
+    - v0.15.0 (2026-11-13): --stall_climb_min_clearance / --stall_climb_lead_m / --riser_spin / --riser_spin_lead_m
+      （preview_task v0.17.0）。
+    - v0.14.0 (2026-11-12): --stall_linear / --stairs_climb_pair_sum（preview_task v0.16.0）。
+    - v0.13.0 (2026-11-11): --obstacle_lateral_vel_scale（preview_task v0.15.0）。
+    - v0.12.0 (2026-11-11): --trailing_contact_climb（preview_task v0.14.0）。
+    - v0.11.0 (2026-11-11): --stairs_stall_climb_scale / --stairs_riser_contact_scale / --stairs_riser_approach_m
+      （preview_task v0.13.0）；--curriculum_stairs_promote_streak / --curriculum_stairs_demote_streak /
+      --curriculum_freeze_non_stairs / --curriculum_stairs_min_level（obstacle_terrain v1.5.0，续训恢复等级后同样套用下限）。
+    - v0.10.0 (2026-11-10): --stall_climb_scale / --drop_relief（preview_task v0.12.0）、--actor_ema_decay /
+      --critic_warmup_iterations / --warm_start_reset（learner v0.13.0）、--curriculum_freeze / --curriculum_promote_streak /
+      --curriculum_demote_streak 与 --stairs_tread_rule（obstacle_terrain v1.4.0）。
+    - v0.9.0 (2026-11-09): --action_saturation_coef / --action_saturation_margin（腿关节动作超出软限位外 margin 的 tanh 前
+      代价，界由 env 动作项 scale 与软限位换算）、--imag_flat_fraction；课程 --curriculum_stairs_demote_ratio /
+      --curriculum_stall_truncate_s（训练循环把停滞步数写入 env.obstacle_stall_steps，供 stall_timeout 截断）；
+      日志 stall_truncated、actor_mirror_loss、actor_saturation_loss、actor_saturated_fraction、imag_flat_start_fraction。
+    - v0.8.0 (2026-11-08): 奖励参数 --flat_steer / --wheel_sync / --wheel_sync_delta / --prelift_margin_m /
+      --prelift_shift_zone（preview_task v0.10.0）。
+    - v0.7.0 (2026-11-08): 奖励参数 --single_slant_deg / --prelift_front / --toe / --wheel_slip / --wheel_slip_delta /
+      --stand_yaw_rate / --stand_yaw_rate_delta（preview_task v0.9.0）。
+    - v0.6.1 (2026-11-07): 启动时总打印实际生效的轮胎静/动摩擦（固定 μ=1.0 后核对用）。
+    - v0.6.0 (2026-11-07): --curriculum_stairs_explore_frac（楼梯探索回合，随机等级、不改课程）；日志与存档用课程等级，
+      另记 curriculum/stairs_explore[_high]_pass_rate；--contact_context（ξ 追加四轮摩擦，世界模型与 critic 用）。
+    - v0.5.0 (2026-11-07): 奖励参数 --yaw_rate / --stairs_slant_deg / --stairs_slant_zone_m。
+    - v0.4.0 (2026-11-07): 奖励参数 --heading_huber / --heading_huber_delta。
+    - v0.3.0 (2026-11-05): 车道惩罚/横向 Huber/预抬与姿态参考新参数；课程 success_lane_m、楼梯碰撞门；
+      --episode_length_s、--command_lin_vel_x、--command_standing_fraction；日志 lateral_abs_m。
+    - v0.2.0 (2026-11-05): 只保留从零越障路线：统一目标、四轮立面碰撞、按类型课程、观测核对按间隔；
+      删除 Teacher 热启动/驾驶、锚定、动作参考、预抬探索、平地校准、车道观测、旧预抬目标等路径。
     - v0.1.0 (2026-10-26): 初始创建
 """
 
@@ -38,126 +72,119 @@ import sys
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="SuperMimic terrain (stairs) training")
-# 方案 D：不用 Teacher，从零在 2→16 cm 课程上训练（参考 go2w-supermimic）。下列默认值只在未显式传参时生效。
-parser.add_argument("--from_scratch", action="store_true",
-                    help="不热启动、不锚定 Teacher、无 Teacher 驾驶；任务改为 Scratch-Stairs，奖励两边共用同一实现")
-parser.add_argument("--terminated", type=float, default=None, help="翻车惩罚权重（想象与真实同口径）；从零默认 −20")
-parser.add_argument("--priority_fraction", type=float, default=None, help="事件优先回放比例；从零默认 0.25")
-# d2：在 d1 已学会的爬升上继续，但横向要求对齐验收。只继承 actor 与世界模型；critic 输入维度/回报口径都变了，重新训
-parser.add_argument("--init_from", default=None,
-                    help="从另一个越障 ckpt 继承 actor 与世界模型（不继承 critic、优化器、迭代号）；actor 维度不足时补 0 列")
-parser.add_argument("--strict_lane", action="store_true",
-                    help="从零任务的晋级/出界车道对齐验收（0.15 / 0.75 m），出车道为真终止")
-parser.add_argument("--task", default="RobotLab-Isaac-SuperMimic-Terrain-Preview-Parallelogram-Rover-v0")
-parser.add_argument("--teacher", default="logs/vision_preview/teacher/2026-10-14_11-31-31_stairs_climb/model_7999.pt")
+DEFAULT_TASK = "RobotLab-Isaac-SuperMimic-Obstacle-Parallelogram-Rover-v0"
+# PreviewRewardCfg 字段（名字与类型一一对应；未传时取 dataclass 默认值）
+REWARD_FLAGS = (
+    ("track_lin_vel", float), ("track_lin_vel_std", float), ("slow_band_m", float), ("slow_band_speed", float),
+    ("progress", float), ("stall", float), ("stall_speed_ratio", float), ("stall_climb_scale", float),
+    ("stairs_stall_climb_scale", float), ("stall_linear", float), ("stall_linear_cap", float),
+    ("stall_climb_min_clearance", float), ("stall_climb_lead_m", float), ("riser_spin", float), ("riser_spin_lead_m", float), ("stairs_lane_scale", float),
+    ("drop_relief", float), ("post_climb_relief", float), ("post_climb_window_m", float),
+    ("terminated", float), ("tilt_limit", float), ("tilt_temperature", float), ("roll", float), ("roll_excess", float), ("roll_excess_deg", float),
+    ("pitch", float), ("pitch_tol_deg", float),
+    ("pitch_ref_window", float), ("pitch_ref_deadband_deg", float), ("ang_vel", float), ("arm_vel", float),
+    ("action_rate", float), ("lin_vel_z", float), ("heading", float), ("heading_huber", float),
+    ("heading_huber_delta", float), ("yaw_rate", float), ("stairs_slant_deg", float), ("stairs_slant_zone_m", float),
+    ("single_slant_deg", float), ("lateral_vel", float),
+    ("lateral_vel_delta", float), ("obstacle_lateral_vel_scale", float),
+    ("lane", float), ("steering", float), ("flat_neutral", float),
+    ("rest_clearance", float), ("flat_lookahead", float), ("toe", float), ("flat_steer", float),
+    ("wheel_sync", float), ("wheel_sync_delta", float), ("wheel_slip", float),
+    ("wheel_slip_delta", float), ("stand_yaw_rate", float), ("stand_yaw_rate_delta", float),
+    ("riser_min_height", float), ("riser_contact_gap", float),
+    ("riser_contact_speed", float), ("riser_safe_speed", float), ("riser_approach_m", float),
+    ("stairs_riser_contact_scale", float), ("stairs_riser_approach_m", float), ("trailing_contact_climb", float),
+    ("stairs_climb_pair_sum", float), ("stairs_climb_trail_weight", float), ("stairs_alt_lift", float),
+    ("stairs_alt_lift_frac", float), ("stairs_contact_climb_m", float),
+    ("prelift_track", float), ("prelift_window", float), ("prelift_front", float), ("early_lift", float),
+    ("early_lift_lead", float),
+    ("support_margin", float), ("support_margin_m", float), ("prelift_margin_m", float),
+    ("prelift_shift_zone", float), ("multi_lift", float),
+    ("ready_stroke", float), ("ready_zone_m", float),
+    ("min_step", float), ("joint_pos_limits", float),
+)
+# SuperMimicCfg 字段（含 learner 新增：actor 学习率余弦衰减、镜像一致性、诊断间隔、torch.compile）；
+# 显式传入而 learner 没有该字段时启动即报错，避免静默忽略。想象 λ-return critic = --no-critic_real_returns。
+LEARNER_FLAGS = (
+    ("buffer_len", int), ("horizon", int), ("imag_batch", int), ("wm_window", int), ("wm_batch", int),
+    ("wm_updates", int), ("wm_lr", float), ("warmup_iterations", int), ("actor_lr", float), ("critic_lr", float),
+    ("action_noise", float), ("warmup_action_noise", float), ("actor_update_every", int), ("real_return_window", int),
+    ("real_return_batch", int), ("gamma", float), ("lam", float), ("priority_fraction", float),
+    ("actor_value_grad_scale", float), ("actor_lr_final", float), ("actor_lr_decay_iterations", int),
+    ("mirror_loss_coef", float), ("diagnostics_interval", int), ("imag_flat_fraction", float),
+    ("action_saturation_coef", float), ("actor_ema_decay", float), ("critic_warmup_iterations", int),
+)
+LEARNER_SWITCHES = ("critic_real_returns", "actor_value_grad", "compile_wm", "compile_imagination", "mirror_aug",
+                    "warm_start_reset")
+CURRICULUM_FLAGS = ("promote_m", "success_lane_m", "demote_ratio", "posture_bad_frac", "collision_frac",
+                    "stairs_collision_frac", "fail_lane_m", "roll_limit_deg", "pitch_dev_limit_deg",
+                    "stairs_explore_frac", "stairs_demote_ratio", "stall_truncate_s", "freeze", "promote_streak",
+                    "demote_streak", "stairs_promote_streak", "stairs_demote_streak", "freeze_non_stairs",
+                    "stairs_min_level", "stairs_success_lane_m")
+
+parser = argparse.ArgumentParser(description="SuperMimic obstacle terrain training (from scratch)")
+parser.add_argument("--task", default=DEFAULT_TASK)
 parser.add_argument("--num_envs", type=int, default=2048)
-# 与 rsl_rl/train.py 同名：--max_iterations；--iterations 为旧名保留
-# 默认 1000：2026-10-28 同配置 checkpoint 验收 8/12 cm——第 1000 轮 67%/81%，第 2000 轮 6%/0%，第 4000 轮 3%/0%。
-# 越训越偏离 Teacher（anchor_mse 0.85→1.35），8/12 cm 登顶后侧漂冲出终点；车道横向位置不在想象目标里，长训会丢掉。
-parser.add_argument("--max_iterations", "--iterations", dest="iterations", type=int, default=1000)
+parser.add_argument("--max_iterations", dest="iterations", type=int, default=40000)
 parser.add_argument("--steps_per_iter", type=int, default=2)
+parser.add_argument("--stairs_lane_schedule", type=int, nargs=2, default=None, metavar=("START", "END"),
+                    help="楼梯车道约束：START 轮前放松（成功车道 = fail_lane_m，楼梯区车道代价 ×0），START→END 线性收紧")
+parser.add_argument("--stairs_success_lane_schedule", type=int, nargs=2, default=None, metavar=("START", "END"),
+                    help="楼梯成功车道单独的收紧时间表（fail_lane_m → success_lane_m）；给了时 --stairs_lane_schedule 只管车道代价")
 parser.add_argument("--run_name", default=None)
-# 与 rsl_rl/train.py 同口径：--resume [--load_run RUN] [--checkpoint ckpt_XXXXXX.pt]；仍接受旧写法 --resume <路径>
-parser.add_argument("--resume", nargs="?", const=True, default=None)
-parser.add_argument("--load_run", default=None, help="logs/supermimic_terrain 下的 run 名；省略时取最新 run")
-parser.add_argument("--checkpoint", default=None, help="ckpt 文件名或路径；省略时取该 run 最新 ckpt")
-parser.add_argument("--save_interval", type=int, default=500)
-parser.add_argument("--log_interval", type=int, default=10)
-parser.add_argument("--driver_fraction", type=float, default=0.15)
-parser.add_argument("--driver_noise", type=float, default=0.2)
+parser.add_argument("--resume", action="store_true", help="从 --load_run 的 --checkpoint（默认最新）续训")
+parser.add_argument("--load_run", default=None)
+parser.add_argument("--checkpoint", default=None)
+parser.add_argument("--save_interval", type=int, default=1000)
+parser.add_argument("--log_interval", type=int, default=20)
 parser.add_argument("--map_res", type=float, default=0.02)
-parser.add_argument("--check_obs", action="store_true", help="每轮核对想象观测与 env 观测")
 parser.add_argument("--seed", type=int, default=42)
-for name, typ in (("buffer_len", int), ("horizon", int), ("imag_batch", int), ("wm_batch", int), ("wm_updates", int),
-                  ("warmup_iterations", int), ("critic_warmup_iterations", int), ("actor_lr", float), ("wm_lr", float),
-                  ("action_noise", float), ("warmup_action_noise", float), ("actor_update_every", int),
-                  ("anchor_coef", float), ("real_return_window", int)):
-    parser.add_argument(f"--{name}", type=typ, default=None)
+parser.add_argument("--init_terrain_level", type=int, default=0)
+parser.add_argument("--check_obs_interval", type=int, default=0, help="每 N 轮核对一次想象/真实观测；0 关闭")
+parser.add_argument("--critic_lane", action="store_true", help="critic 额外看车道横向偏移（训练特权，actor 不看）")
+parser.add_argument("--episode_length_s", type=float, default=None, help="覆盖 env 回合长度（秒）")
+parser.add_argument("--command_lin_vel_x", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="覆盖前进命令范围 (m/s)")
+parser.add_argument("--command_standing_fraction", type=float, default=None, help="覆盖静止命令比例 rel_standing_envs")
+parser.add_argument("--critic_route_features", action="store_true", help="critic 额外看世界路线航向")
+parser.add_argument("--contact_context", action="store_true",
+                    help="世界模型与 critic 的上下文 ξ 追加四轮摩擦/恢复系数（25→37 维，训练特权，actor 不看）")
 parser.add_argument("--wm_hidden", type=int, nargs="+", default=None)
-parser.add_argument("--wheel_lift", type=float, default=10.0,
-                    help="几何抬轮塑形权重；1.0 时只有跟踪项的 ~1%（v1 实测无效），默认 10")
-parser.add_argument("--idle_lift", type=float, default=None)
-parser.add_argument("--imagined_critic", action="store_true", help="回到 v1：critic 只在想象轨迹上拟合")
-parser.add_argument("--init_terrain_level", type=int, default=8,
-                    help="初始地形等级上限（0–8 均匀抽）；Teacher 已学会全课程，从 0 起会把 12/16 cm 留到很晚")
-# v3：v2 失败主要是越线横向 >0.15 m（航向偏 ~13°）和 16 cm 倾角 >31.8°，env 奖励对二者都不约束。
-# 13° 航向时 heading 项 ≈ -0.5/s、tilt_soft 在 62° 时 ≈ -2.4/s，对比跟踪项满分 5/s。传 0 回到 v2。
-parser.add_argument("--heading", type=float, default=-10.0, help="× sin²(航向)，惩罚取负")
-parser.add_argument("--lateral_vel", type=float, default=-20.0, help="× 世界系 vy²，惩罚取负")
-# 默认值 = v3（2026-10-27 用户选定的基线：8/12/16 cm 86%/98%/0%）。去掉 tilt_soft 的 v3b 是 78%/94%/0%，
-# 16 cm 上它不起作用（途中倾角仅 ~20°），但 8/12 cm 略好，保留。
-parser.add_argument("--tilt_soft", type=float, default=-6.0, help="× relu(cos25° − cosθ)，惩罚取负")
-# v4：策略习惯性蟹行（车头左偏、轮子右转），上 16 cm 台阶时沿轮子方向侧漂；惩罚轮子世界系朝向
-# v4 实测有害：蟹行是策略斜着上台阶的手段，压掉后 8 cm 50%、12 cm 19–44%（后轮卡在首级前），默认关闭
-parser.add_argument("--wheel_heading", type=float, default=0.0, help="× 四轮平均 sin²(航向+转向角)，惩罚取负")
-# PPO 指导逐步让位给世界模型梯度：actor 开始更新后，anchor_coef 在 --anchor_decay_iterations 轮内线性降到
-# --anchor_final（默认不衰减 = v3）；riser_anchor 的局部加权不受影响，难点处仍保持 Teacher 约束。
-parser.add_argument("--anchor_final", type=float, default=None, help="anchor_coef 衰减终值；省略则不衰减")
-parser.add_argument("--anchor_decay_iterations", type=int, default=500)
-# 平地平稳：terrain_v3 训到 4000 轮后平地 arm 2.9 Hz 来回摆、车体上下跳。默认开启；传 0 回到 v3。
-parser.add_argument("--smooth_flat_arm", type=float, default=-0.5, help="× 平地处 Σ arm 关节速度²，惩罚取负")
-# 量级：抖动时 arm 项 ≈ −2.9/s、角速度项 ≈ −0.85/s；平稳行驶时两项合计 < −0.05/s（跟踪满分 5/s）
-parser.add_argument("--smooth_flat_ang", type=float, default=-5.0, help="× 平地处俯仰/滚转角速度²，惩罚取负")
-# 方案 B：actor 追加 1 维车道横向偏移观测（Teacher 不动，新列权重初始化为 0），配合 --lateral_pos 让世界模型梯度学纠偏
-parser.add_argument("--lane_obs", action="store_true", help="actor 观测追加车道横向偏移（233 维）；见 supermimic/lane_offset.py")
-parser.add_argument("--riser_anchor", type=float, default=0.0,
-                    help="后轮贴台阶立面时 Teacher 锚定加权倍数（1+此值）；0 关闭")
-parser.add_argument("--lateral_pos", type=float, default=0.0,
-                    help="× 相对车道中心线横向偏移²，惩罚取负；非 0 时 critic 额外看到偏移量")
-parser.add_argument("--tilt_soft_start_deg", type=float, default=25.0)
-# d3 第 8000 轮：课程台阶 6.5 cm、登顶率上升，但越线横向 ≤0.15 m 从 57% 掉到 9%——固定 −5 压不住高台阶上的侧漂。
-# 给了 --lateral_pos_final 时，lateral_pos 随课程平均台阶高度在 [lateral_ramp_cm] 区间内线性加重到终值。
-parser.add_argument("--lateral_pos_final", type=float, default=None, help="横向位置惩罚终值；省略则固定 --lateral_pos")
-parser.add_argument("--lateral_ramp_cm", type=float, nargs=2, default=(5.0, 10.0), metavar=("START", "END"),
-                    help="课程平均台阶高度（cm）从 START 到 END 时，lateral_pos 从初值线性到终值")
-# scratch_40k：课程到顶后约 2500 轮蟹行复现、再崩成原地不动。到顶后用一份好存档做信赖域，只允许小步偏离。
-parser.add_argument("--saturation_anchor", default=None,
-                    help="课程饱和后锚定的 actor：越障 ckpt 路径，或 self（触发时冻结当前 actor）；省略关闭")
-parser.add_argument("--saturation_anchor_coef", type=float, default=0.5)
-parser.add_argument("--saturation_top_fraction", type=float, default=0.5,
-                    help="曾到过最高级的环境占比达到此值即触发（顶层随机回落后，瞬时占比不再能反映进度）")
-parser.add_argument("--anchor_to_resume", action="store_true",
-                    help="从零任务续训时以续训起点 actor 为锚定参考（权重 --anchor_coef，可配 --anchor_final 衰减）")
+parser.add_argument("--stairs_tread_rule", type=float, nargs=3, default=None, metavar=("R0", "R1", "T1"),
+                    help="楼梯踏面下限随立面提高：立面 ≤R0 不变、≥R1 时下限 T1（米），中间线性；默认不启用")
+parser.add_argument("--lead_side_obs", action="store_true",
+                    help="actor 观测追加每回合随机的先抬侧标记 ±1（镜像取反）；导出时固定 +1，部署仍 232 维")
+parser.add_argument("--leg_action_bound", action="store_true",
+                    help="腿关节动作上界取 min(2π, 软限位外放 --action_saturation_margin 后的幅值)，默认关 = 统一 2π")
+parser.add_argument("--action_saturation_margin", type=float, default=0.10,
+                    help="动作饱和代价的界 = 腿关节软限位外放该值（rad）对应的动作值")
+for _name, _type in REWARD_FLAGS + LEARNER_FLAGS:
+    parser.add_argument(f"--{_name}", type=_type, default=None)
+for _name in LEARNER_SWITCHES:
+    parser.add_argument(f"--{_name}", action=argparse.BooleanOptionalAction, default=None)
+for _name in CURRICULUM_FLAGS:
+    parser.add_argument(f"--curriculum_{_name}", type=float, default=None)
 AppLauncher.add_app_launcher_args(parser)
-_explicit = {a.split("=")[0].lstrip("-") for a in sys.argv[1:] if a.startswith("--")}
 args_cli, hydra_args = parser.parse_known_args()
-SCRATCH_TASK = "RobotLab-Isaac-SuperMimic-Scratch-Stairs-Parallelogram-Rover-v0"
-# 从零：task / 地形起点 / Teacher 驾驶 / 塑形的默认值改掉；用户显式传的参数一律保留
-SCRATCH_ARG_DEFAULTS = {"task": SCRATCH_TASK, "init_terrain_level": 0, "driver_fraction": 0.0,
-                        "tilt_soft": 0.0, "terminated": -20.0, "priority_fraction": 0.25}
-if args_cli.from_scratch:
-    for _k, _v in SCRATCH_ARG_DEFAULTS.items():
-        if _k not in _explicit:
-            setattr(args_cli, _k, _v)
-    if args_cli.riser_anchor:
-        parser.error("--from_scratch 不与 --riser_anchor 组合（它依赖 Teacher 锚定）")
-    if args_cli.anchor_final is not None and not (args_cli.init_from or args_cli.anchor_to_resume):
-        parser.error("--from_scratch 下 --anchor_final 需配 --init_from 或 --anchor_to_resume（否则没有锚定参考）")
-if args_cli.anchor_to_resume and not (args_cli.from_scratch and args_cli.resume):
-    parser.error("--anchor_to_resume 只用于 --from_scratch --resume")
-if args_cli.init_from:
-    # actor 已会爬但 critic 是新的：随机 critic 的自举值会把第一批 BPTT 梯度推坏，先只训 critic。
-    # d2 用 300 轮 + lr 1e-4 + 无锚定，第 1000 轮已训坏；d3 默认 800 轮、lr 3e-5、锚定继承 actor
-    for _k, _v in (("critic_warmup_iterations", 800), ("actor_lr", 3e-5), ("anchor_coef", 0.5)):
-        if _k not in _explicit:
-            setattr(args_cli, _k, _v)
-if args_cli.saturation_anchor and (args_cli.anchor_final is not None or args_cli.anchor_to_resume or args_cli.init_from
-                                   or not args_cli.from_scratch):
-    parser.error("--saturation_anchor 只用于 --from_scratch，且不与 --anchor_final / --anchor_to_resume / --init_from 组合")
-if args_cli.anchor_to_resume and "anchor_coef" not in _explicit:
-    args_cli.anchor_coef = 0.5
-if args_cli.strict_lane and not args_cli.from_scratch:
-    parser.error("--strict_lane 只用于 --from_scratch")
+if args_cli.stairs_success_lane_schedule is not None and args_cli.stairs_lane_schedule is None:
+    parser.error("--stairs_success_lane_schedule 须与 --stairs_lane_schedule 一起给")
+if args_cli.check_obs_interval < 0 or args_cli.steps_per_iter < 1:
+    parser.error("--check_obs_interval 须 ≥0，--steps_per_iter 须 ≥1")
+if args_cli.episode_length_s is not None and args_cli.episode_length_s <= 0:
+    parser.error("--episode_length_s 须为正")
+if args_cli.command_lin_vel_x is not None and not 0.0 <= args_cli.command_lin_vel_x[0] <= args_cli.command_lin_vel_x[1]:
+    parser.error("--command_lin_vel_x 须满足 0 ≤ LO ≤ HI")
+if args_cli.command_standing_fraction is not None and not 0.0 <= args_cli.command_standing_fraction <= 1.0:
+    parser.error("--command_standing_fraction 须在 [0, 1]")
 sys.argv = [sys.argv[0]] + hydra_args
 simulation_app = AppLauncher(args_cli).app
 
 import copy  # noqa: E402
 import csv  # noqa: E402
+import hashlib  # noqa: E402
 import json  # noqa: E402
 import math  # noqa: E402
 import os  # noqa: E402
-import shutil  # noqa: E402
 import time  # noqa: E402
 from dataclasses import asdict, fields  # noqa: E402
 from datetime import datetime  # noqa: E402
@@ -167,334 +194,377 @@ import gymnasium as gym  # noqa: E402
 import torch  # noqa: E402
 from torch.utils.tensorboard import SummaryWriter  # noqa: E402
 
-from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
+from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: E402
 
 import robot_lab.tasks  # noqa: F401, E402
 from robot_lab.supermimic import terrain_map  # noqa: E402
 from robot_lab.supermimic.isaac_adapter import (  # noqa: E402
-    CONTEXT_DIM, RoverStateReader, build_height_map, exact_scan_fn, leg_soft_limits, scan_pattern_base)
+    CONTEXT_DIM, RoverStateReader, build_height_map, exact_riser_fn, exact_scan_fn, leg_soft_limits, scan_pattern_base)
 from robot_lab.supermimic.kinematics import RoverKinematics  # noqa: E402
-from robot_lab.supermimic.lane_offset import add_lane_offset_term, pad_first_layer, write_marker  # noqa: E402
 from robot_lab.supermimic.learner import SuperMimicCfg, SuperMimicLearner  # noqa: E402
 from robot_lab.supermimic.preview_task import PreviewRewardCfg, PreviewTask  # noqa: E402
-from robot_lab.supermimic.rover_task import CONTROL_DT  # noqa: E402
-from robot_lab.supermimic.schedule import linear_ramp, restore_terrain_levels, saturation_reached  # noqa: E402
 from robot_lab.supermimic.quat import quat_apply  # noqa: E402
+from robot_lab.supermimic.rover_task import CONTROL_DT  # noqa: E402
+from robot_lab.supermimic.schedule import restore_terrain_levels  # noqa: E402
 from robot_lab.supermimic.state import LIN, QUAT  # noqa: E402
+from robot_lab.tasks.manager_based.supermimic import obstacle_terrain  # noqa: E402
 
-# 越障默认值：比平地更小的想象批量（每步含 FK + 地形查询 + 射线投射），热启动后降低探索噪声。
-# v2（2026-10-26）：v1 在 100 次 actor 更新内把 8 cm 楼梯从 100% 降到 9%；改为 critic 拟合真实回报 + Teacher 信赖域。
-TERRAIN_DEFAULTS = dict(buffer_len=600, imag_batch=2048, wm_batch=2048, wm_updates=10, warmup_iterations=200,
-                        critic_warmup_iterations=300, actor_lr=5e-5, action_noise=0.05, warmup_action_noise=0.1,
-                        action_squash="clamp", aux_dim=0, context_dim=CONTEXT_DIM, critic_real_returns=True,
-                        real_return_window=64, anchor_coef=1.0)
-
-
-# 从零（go2w 配方）：tanh 输出、无 Teacher 锚定、无 critic 预热；探索加大；事件优先回放；actor lr 介于平地 2e-4 与微调 5e-5 之间
-SCRATCH_DEFAULTS = dict(TERRAIN_DEFAULTS, imag_batch=4096, warmup_iterations=200, critic_warmup_iterations=0,
-                        actor_lr=1e-4, action_noise=0.1, warmup_action_noise=0.3, action_squash="tanh", anchor_coef=0.0)
+ROOT = Path(__file__).resolve().parents[2]
+LOG_ROOT = Path("logs/supermimic_terrain")
+# 从零配方（scratch_40k_r8k 最优存档 + 上游式优化）：每轮更新 actor、价值梯度 1.0、4096 想象批量、
+# 8 步 × 2048 × 10 次世界模型窗口、tanh 输出、事件优先回放 0.25、critic 拟合 64 步真实回报。
+LEARNER_DEFAULTS = dict(buffer_len=600, imag_batch=4096, wm_window=8, wm_batch=2048, wm_updates=10, horizon=32,
+                        warmup_iterations=200, critic_warmup_iterations=0, actor_lr=1e-4, action_noise=0.1,
+                        warmup_action_noise=0.3, action_squash="tanh", aux_dim=0, context_dim=CONTEXT_DIM,
+                        critic_real_returns=True, real_return_window=64, priority_fraction=0.25,
+                        actor_update_every=1, actor_value_grad=True, actor_value_grad_scale=1.0)
+LEARNER_LOG_KEYS = ("wm_loss", "wm_err_1step", "wm_err_last", "wm_reward_bias", "wm_reward_abs_gap",
+                    "wm_event_reward_abs_gap", "wm_flat_reward_abs_gap", "wm_grad_norm", "actor_loss",
+                    "actor_model_loss", "actor_grad_norm", "critic_loss", "imag_reward", "imag_survival",
+                    "actor_skipped", "actor_update_applied", "actor_lr", "actor_mirror_loss", "actor_saturation_loss",
+                    "actor_saturated_fraction", "imag_flat_start_fraction")
+IMPLEMENTATION_FILES = (
+    "source/robot_lab/robot_lab/supermimic/preview_task.py", "source/robot_lab/robot_lab/supermimic/learner.py",
+    "source/robot_lab/robot_lab/supermimic/networks.py", "source/robot_lab/robot_lab/supermimic/kinematics.py",
+    "source/robot_lab/robot_lab/supermimic/isaac_adapter.py", "source/robot_lab/robot_lab/supermimic/terrain_map.py",
+    "source/robot_lab/robot_lab/supermimic/replay.py", "source/robot_lab/robot_lab/supermimic/state.py",
+    "source/robot_lab/robot_lab/supermimic/quat.py",
+    "source/robot_lab/robot_lab/tasks/manager_based/supermimic/terrain_env_cfg.py",
+    "source/robot_lab/robot_lab/tasks/manager_based/supermimic/obstacle_env_cfg.py",
+    "source/robot_lab/robot_lab/tasks/manager_based/supermimic/obstacle_terrain.py",
+    "scripts/supermimic/train_terrain.py",
+)
 
 
 def build_cfg() -> SuperMimicCfg:
-    cfg = SuperMimicCfg(num_envs=args_cli.num_envs, **(SCRATCH_DEFAULTS if args_cli.from_scratch else TERRAIN_DEFAULTS))
-    if args_cli.priority_fraction is not None:
-        cfg.priority_fraction = args_cli.priority_fraction
-    for f in fields(cfg):
-        value = getattr(args_cli, f.name, None)
+    cfg = SuperMimicCfg(num_envs=args_cli.num_envs, **LEARNER_DEFAULTS)
+    known = {f.name for f in fields(cfg)}
+    requested = {name: getattr(args_cli, name) for name, _ in LEARNER_FLAGS}
+    requested.update({name: getattr(args_cli, name) for name in LEARNER_SWITCHES})
+    requested["wm_hidden"] = tuple(args_cli.wm_hidden) if args_cli.wm_hidden else None
+    missing = sorted(name for name, value in requested.items() if value is not None and name not in known)
+    if missing:
+        raise SystemExit(f"learner.SuperMimicCfg 没有这些字段：{missing}（需与 learner.py 对齐后再启动）")
+    for name, value in requested.items():
         if value is not None:
-            setattr(cfg, f.name, tuple(value) if isinstance(value, list) else value)
-    if args_cli.imagined_critic:
-        cfg.critic_real_returns = False
+            setattr(cfg, name, value)
+    if args_cli.diagnostics_interval is None and "diagnostics_interval" in known:
+        cfg.diagnostics_interval = args_cli.log_interval  # reward_gap 等诊断只在记日志的轮次计算
     return cfg
 
 
+def build_reward_cfg() -> PreviewRewardCfg:
+    cfg = PreviewRewardCfg()
+    for name, _ in REWARD_FLAGS:
+        if getattr(args_cli, name) is not None:
+            setattr(cfg, name, getattr(args_cli, name))
+    return cfg
+
+
+def resolve_resume() -> Path | None:
+    if not args_cli.resume:
+        return None
+    if args_cli.checkpoint and Path(args_cli.checkpoint).is_file():
+        return Path(args_cli.checkpoint)
+    if not args_cli.load_run:
+        raise SystemExit("--resume 需要 --load_run")
+    run_dir = LOG_ROOT / args_cli.load_run
+    if args_cli.checkpoint:
+        return run_dir / args_cli.checkpoint
+    ckpts = sorted(run_dir.glob("ckpt_*.pt"))
+    if not ckpts:
+        raise FileNotFoundError(f"{run_dir} 下没有 ckpt_*.pt")
+    return ckpts[-1]
+
+
+def leg_action_limits(uenv, reader: RoverStateReader, margin: float) -> tuple:
+    """12 个动作的 (lo, hi)：腿关节（默认位 + scale·a）软限位外放 margin 处对应的动作值；轮速 4 个不限（None）。"""
+    term = uenv.action_manager.get_term("joint_pos")
+    ids = reader.joint_ids[:8].tolist()
+    names = [reader.robot.joint_names[i] for i in ids]
+    if list(term._joint_names) != names:
+        raise SystemExit(f"腿关节动作顺序 {term._joint_names} 与状态读取顺序 {names} 不一致")
+    scale = term._scale[0] if isinstance(term._scale, torch.Tensor) else torch.full((8,), float(term._scale))
+    if not bool(term.cfg.use_default_offset) or (scale <= 0).any():
+        raise SystemExit("动作饱和界假设 腿关节目标 = 默认位 + scale·a（scale > 0）")
+    soft, scale = leg_soft_limits(reader).cpu(), scale.cpu()
+    lows = ((soft[:, 0] - margin) / scale).tolist()
+    highs = ((soft[:, 1] + margin) / scale).tolist()
+    return tuple(zip(lows, highs)) + (None,) * 4
+
+
 def export_policy(learner: SuperMimicLearner, out: Path, obs_dim: int) -> None:
-    """policy.pt（TorchScript）+ policy.onnx，与 play_rover / rsl_rl play 的导出物一致；
-    观测/动作语义沿用 params/vision_contract.json（与热启动 Teacher 相同）。"""
+    """policy.pt（TorchScript）+ policy.onnx；观测/动作语义见 params/vision_contract.json。"""
     learner.export_actor(out / "policy.pt")
-    cpu = copy.deepcopy(learner.actor).cpu().eval()
+    cpu = learner.deploy_actor()
     torch.onnx.export(cpu, torch.zeros(1, obs_dim), str(out / "policy.onnx"), input_names=["obs"],
                       output_names=["actions"], dynamic_axes={"obs": {0: "batch"}}, opset_version=17)
 
 
-def resolve_resume() -> str | None:
-    if args_cli.resume is None:
-        return None
-    if isinstance(args_cli.resume, str):
-        return args_cli.resume
-    if args_cli.checkpoint and Path(args_cli.checkpoint).is_file():
-        return args_cli.checkpoint
-    root = Path("logs/supermimic_terrain")
-    run_dir = root / args_cli.load_run if args_cli.load_run else max(
-        (d for d in root.iterdir() if any(d.glob("ckpt_*.pt"))), key=lambda d: d.stat().st_mtime, default=None)
-    if run_dir is None or not run_dir.is_dir():
-        raise FileNotFoundError(f"找不到续训 run：{run_dir or root}")
-    if args_cli.checkpoint:
-        return str(run_dir / args_cli.checkpoint)
-    ckpts = sorted(run_dir.glob("ckpt_*.pt"))
-    if not ckpts:
-        raise FileNotFoundError(f"{run_dir} 下没有 ckpt_*.pt")
-    return str(ckpts[-1])
+def write_deployment_contract(env_cfg, log_dir: Path) -> None:
+    """部署合同来自 Teacher-Preview 部署任务的观测配置（与越障任务观测逐列相同），不依赖任何训练产物。"""
+    sys.path.insert(0, str(ROOT / "scripts/reinforcement_learning/rsl_rl"))
+    from vision_contract import contract_for_cfg
+
+    task = "RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Teacher-Preview-v0"
+    deployment_cfg = load_cfg_from_registry(task, "env_cfg_entry_point")
+    deployment_cfg.scene.height_scanner.update_period = env_cfg.scene.height_scanner.update_period
+    contract = contract_for_cfg(task, deployment_cfg, load_cfg_from_registry(task, "rsl_rl_cfg_entry_point"))
+    (log_dir / "params" / "vision_contract.json").write_text(json.dumps(contract, indent=2))
 
 
-def teacher_actor_state(teacher_ckpt: str, obs_dim: int) -> dict:
-    """Teacher 的 actor.*；任务多出的输入列（方案 B 车道偏移）补 0 权重，输出与原 Teacher 逐位相同。"""
-    sd = torch.load(teacher_ckpt, map_location="cpu", weights_only=False)["model_state_dict"]
-    actor_sd = {k: v for k, v in sd.items() if k.startswith("actor.")}
-    extra = obs_dim - actor_sd["actor.0.weight"].shape[1]
-    return pad_first_layer(actor_sd, extra) if extra > 0 else actor_sd
-
-
-def warm_start(learner: SuperMimicLearner, teacher_ckpt: str) -> None:
-    actor_sd = teacher_actor_state(teacher_ckpt, learner.task.obs_dim)
-    if actor_sd["actor.0.weight"].shape[1] != learner.task.obs_dim:
-        raise ValueError(f"Teacher 输入 {actor_sd['actor.0.weight'].shape[1]} 维，任务观测 {learner.task.obs_dim} 维")
-    learner.actor.load_state_dict(actor_sd)
-    print(f"[SuperMimic-Terrain] actor 从 Teacher 热启动：{teacher_ckpt}")
-
-
-def curriculum_stats(uenv) -> dict:
-    t = uenv.scene.terrain
-    levels = t.terrain_levels.float()
-    if args_cli.from_scratch:
-        from robot_lab.tasks.manager_based.supermimic.scratch_env_cfg import SCRATCH_HEIGHT_RANGE
-        lo, hi = SCRATCH_HEIGHT_RANGE
-        rows = t.cfg.terrain_generator.num_rows
-        return {"terrain_level_mean": levels.mean().item(), "terrain_level_max": levels.max().item(),
-                "step_height_cm_mean": ((lo + (levels + 0.5) / rows * (hi - lo)).mean() * 100).item(),
-                "top_level_fraction": (levels >= rows - 1).float().mean().item()}
-    return {"terrain_level_mean": levels.mean().item(), "stage_1": (levels < 3).float().mean().item(),
-            "stage_2": ((levels >= 3) & (levels < 6)).float().mean().item(), "stage_3": (levels >= 6).float().mean().item()}
+def check_observation(task, s, cmd, prev, env_obs, log_dir: Path, uenv) -> float:
+    with torch.no_grad():
+        difference = (task.policy_obs(s, cmd, prev) - env_obs).abs()
+    worst = difference.max().item()
+    if worst > 1e-4:
+        scanner = uenv.scene.sensors["height_scanner"]
+        torch.save({"state": s, "command": cmd, "prev_action": prev, "obs": env_obs, "difference": difference,
+                    "sensor_hits": scanner.data.ray_hits_w, "episode_length": uenv.episode_length_buf},
+                   log_dir / "observation_mismatch.pt")
+        raise RuntimeError(f"想象与真实观测误差 {worst:.6g} > 1e-4（本体 {difference[:, :45].max().item():.3g}，"
+                           f"扫描 {difference[:, 45:].max().item():.3g}）；现场已存 observation_mismatch.pt")
+    return worst
 
 
 def main():
     torch.manual_seed(args_cli.seed)
+    resume_path = resolve_resume()
+    resume_data = torch.load(resume_path, map_location="cpu", weights_only=False) if resume_path else None
+    task_features = {"critic_lane": args_cli.critic_lane, "critic_route_features": args_cli.critic_route_features}
+    if args_cli.contact_context:
+        # 只在开启时写入，旧存档（无此键）仍可按原配置续训；ξ 维数不同的存档不能互相续训
+        task_features["contact_context"] = True
+    if args_cli.lead_side_obs:
+        task_features["lead_side_obs"] = True  # actor 输入 233 维，不能和 232 维存档互相续训
+    if resume_data is not None and resume_data.get("task_features") != task_features:
+        raise SystemExit(f"续训存档的 critic 输入 {resume_data.get('task_features')} 与本次 {task_features} 不同")
+    cfg = build_cfg()
+    reward_cfg = build_reward_cfg()
+
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
     env_cfg.seed = args_cli.seed
     env_cfg.scene.terrain.max_init_terrain_level = args_cli.init_terrain_level
-    if args_cli.lane_obs:
-        add_lane_offset_term(env_cfg)
-    if args_cli.strict_lane:
-        from robot_lab.tasks.manager_based.supermimic.scratch_env_cfg import enable_strict_lane
-        enable_strict_lane(env_cfg)
+    for name in CURRICULUM_FLAGS:
+        if getattr(args_cli, f"curriculum_{name}") is not None:
+            env_cfg.obstacle_curriculum_cfg[name] = getattr(args_cli, f"curriculum_{name}")
+    curriculum_cfg = {**obstacle_terrain.CURRICULUM_DEFAULTS, **env_cfg.obstacle_curriculum_cfg}
+    if args_cli.stairs_tread_rule is not None:
+        stairs_cfg = env_cfg.scene.terrain.terrain_generator.sub_terrains[obstacle_terrain.STAIRS]
+        stairs_cfg.tread_rule = tuple(args_cli.stairs_tread_rule)
+        obstacle_terrain.min_tread_for_riser(stairs_cfg.riser_range[1], stairs_cfg.tread_range[0], stairs_cfg.tread_rule)
+    if args_cli.episode_length_s is not None:
+        env_cfg.episode_length_s = args_cli.episode_length_s
+    command_cfg = env_cfg.commands.base_velocity
+    if args_cli.command_lin_vel_x is not None:
+        command_cfg.ranges.lin_vel_x = tuple(args_cli.command_lin_vel_x)
+    if args_cli.command_standing_fraction is not None:
+        command_cfg.rel_standing_envs = args_cli.command_standing_fraction
+    command_summary = {"class": type(command_cfg).__name__, "lin_vel_x": tuple(command_cfg.ranges.lin_vel_x),
+                       "rel_standing_envs": command_cfg.rel_standing_envs,
+                       "resampling_time_range": tuple(command_cfg.resampling_time_range),
+                       "episode_length_s": env_cfg.episode_length_s}
+    print(f"[supermimic] 命令与回合：{command_summary}", flush=True)
+    if abs(env_cfg.terminations.bad_orientation.params["limit_angle"] - reward_cfg.tilt_limit) > 1e-6:
+        raise SystemExit("env 倾角终止与 --tilt_limit 不一致，软存活与真实终止会分叉")
     env = gym.make(args_cli.task, cfg=env_cfg)
     uenv = env.unwrapped
     device = uenv.device
-    reader = RoverStateReader(env, world_frame=True)
+    tracker = obstacle_terrain.EpisodeTracker(uenv.num_envs, device)
+    uenv.obstacle_tracker, uenv.obstacle_curriculum_log = tracker, {}
+    kinds = torch.as_tensor(env_cfg.column_kinds, device=device)
+
+    # 摩擦摘要（第七轮诊断）：同一策略在 8 cm 楼梯上 μ=1.0 成功 98%、μ=0.5 只有 3%（后轮顶住第一级），
+    # 摩擦是后轴能否翻上立面的主变量；不给世界模型/critic 摩擦，它们只能对 μ∈[0.4,1.0] 取平均。
+    reader = RoverStateReader(env, world_frame=True, contact_context=args_cli.contact_context)
+    cfg.context_dim = reader.context_dim
+    # 打印实际生效的轮胎摩擦（2026-11-07 起固定 μ=1.0，见 terrain_env_cfg.WHEEL_FRICTION）
+    material = reader._read_wheel_materials().view(-1, 4, 3)
+    print(f"[supermimic] 轮胎摩擦：静 {material[..., 0].min():.2f}–{material[..., 0].max():.2f}，"
+          f"动 {material[..., 1].min():.2f}–{material[..., 1].max():.2f}"
+          + ("（ξ 含四轮摩擦）" if args_cli.contact_context else ""), flush=True)
     kin = RoverKinematics().to(device)
     hmap = build_height_map(env, res=args_cli.map_res)
     pattern = scan_pattern_base(env)
-    reward_cfg = PreviewRewardCfg(**{k: getattr(args_cli, k) for k in ("wheel_lift", "idle_lift", "heading",
-                                                                       "lateral_vel", "tilt_soft", "wheel_heading", "lateral_pos", "riser_anchor",
-                                                                       "smooth_flat_arm", "smooth_flat_ang", "terminated")
-                                     if getattr(args_cli, k) is not None})
-    reward_cfg.tilt_soft_start = math.radians(args_cli.tilt_soft_start_deg)
-    lane_center_y = None
-    if reward_cfg.lateral_pos != 0.0 or args_cli.lateral_pos_final or args_cli.lane_obs:
-        # 所有地形块原点的世界 y；楼梯与全宽单障碍的车道中心就是块原点（lane_center_y=0）
-        lane_center_y = torch.unique(uenv.scene.terrain.terrain_origins[..., 1].flatten()).sort().values
+    # 车道中心 = 各地形块原点的 y（与终止/课程用的 env_origins 同源）；只进奖励与 critic，不进 actor。
+    lane_center_y = (torch.unique(uenv.scene.terrain.terrain_origins[..., 1].flatten()).sort().values
+                     if args_cli.critic_lane or reward_cfg.lane else None)
     task = PreviewTask(hmap, kin, pattern, leg_soft_limits(reader), reward_cfg, exact_scan_fn=exact_scan_fn(env, pattern),
-                       lane_center_y=lane_center_y, lane_obs=args_cli.lane_obs)
-    cfg = build_cfg()
+                       exact_riser_fn=exact_riser_fn(env), lane_center_y=lane_center_y,
+                       critic_route_features=args_cli.critic_route_features, critic_lane=args_cli.critic_lane,
+                       lead_obs=args_cli.lead_side_obs)
+    if cfg.action_saturation_coef or args_cli.leg_action_bound:
+        cfg.action_limits = leg_action_limits(uenv, reader, args_cli.action_saturation_margin)
+    if args_cli.leg_action_bound:
+        # 动作上界逐维：腿关节取 min(原上界, 饱和界的幅值)，轮子不变；超过关节限位的动作物理上没有区别，梯度为 0
+        base = float(cfg.action_bound)
+        cfg.action_bound = tuple(base if lim is None else min(base, max(abs(float(lim[0])), abs(float(lim[1]))))
+                                 for lim in cfg.action_limits)
+        print("[supermimic] 动作上界（逐维）：" + " ".join(f"{b:.2f}" for b in cfg.action_bound), flush=True)
+    if cfg.action_saturation_coef:
+        print(f"[supermimic] 动作饱和界（动作单位，腿关节软限位外放 {args_cli.action_saturation_margin:.2f} rad）："
+              + " ".join(f"[{lo:+.2f},{hi:+.2f}]" for lo, hi in cfg.action_limits[:8]), flush=True)
     learner = SuperMimicLearner(cfg, device, extra_fn=lambda s: terrain_map.relief_features(hmap, kin, s),
                                 extra_dim=terrain_map.RELIEF_DIM, task=task)
-    resume_path = resolve_resume()
-    if resume_path:
-        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        learner.load_state_dict(ckpt)
-        print(f"[SuperMimic-Terrain] 续训 {resume_path} @ iteration {learner.iteration}")
-        terrain = uenv.scene.terrain
-        if "terrain_levels" in ckpt and terrain.terrain_origins is not None:
-            # 不恢复的话课程按 init_terrain_level 从头爬，前面几千轮的课程进度白费（d3 之前的存档没有这一项）
-            levels = restore_terrain_levels(ckpt["terrain_levels"], uenv.num_envs, terrain.max_terrain_level).to(device)
-            terrain.terrain_levels[:] = levels
-            terrain.env_origins[:] = terrain.terrain_origins[levels, terrain.terrain_types]
-            print(f"[SuperMimic-Terrain] 恢复地形课程等级，均值 {levels.float().mean():.2f}", flush=True)
-        elif args_cli.from_scratch:
-            print(f"[SuperMimic-Terrain] 存档无 terrain_levels，课程从 init_terrain_level={args_cli.init_terrain_level}"
-                  " 起（旧存档可用 --init_terrain_level 近似）", flush=True)
-    elif args_cli.init_from:
-        src = torch.load(args_cli.init_from, map_location=device, weights_only=False)
-        actor_sd = src["actor"]
-        extra = task.obs_dim - actor_sd["actor.0.weight"].shape[1]
-        learner.actor.load_state_dict(pad_first_layer(actor_sd, extra) if extra > 0 else actor_sd)
-        learner.world_model.load_state_dict(src["world_model"])
-        print(f"[SuperMimic-Terrain] 从 {args_cli.init_from} 继承 actor（补 {max(extra, 0)} 列 0）与世界模型；critic 重新训练",
-              flush=True)
-    elif not args_cli.from_scratch:
-        warm_start(learner, args_cli.teacher)
-    if not args_cli.from_scratch:
-        # 信赖域参考 = Teacher 本身（续训时也锚定 Teacher，而不是上一个 checkpoint）
-        anchor = copy.deepcopy(learner.actor)
-        anchor.load_state_dict(teacher_actor_state(args_cli.teacher, task.obs_dim))
-        learner.set_anchor(anchor)
-    elif args_cli.init_from:
-        # d2 第 1000 轮实测：critic 重训 300 轮后放开 actor，策略从"往 +y 偏"翻成"往 −y 偏"出车道，登顶率 0%。
-        # 以继承来的 actor 自身为信赖域参考（不是 PPO Teacher），保住已学会的爬升，只允许小步纠偏。
-        if cfg.anchor_coef > 0:
-            anchor = copy.deepcopy(learner.actor)
-            learner.set_anchor(anchor)
-            print(f"[SuperMimic-Terrain] 锚定继承来的 actor（anchor_coef={cfg.anchor_coef}）", flush=True)
-    elif args_cli.anchor_to_resume:
-        # d4：以横向最好的存档为参考，配合 --anchor_final 逐步放开，避免一直被拉回 d1 的蟹行爬法
-        learner.set_anchor(copy.deepcopy(learner.actor))
-        print(f"[SuperMimic-Terrain] 锚定续训起点 actor（anchor_coef={cfg.anchor_coef}）", flush=True)
-    elif not resume_path:
-        print("[SuperMimic-Terrain] 从零训练：actor 随机初始化，不加载、不锚定 Teacher", flush=True)
+    terrain = uenv.scene.terrain
+    if resume_data is not None:
+        learner.load_state_dict(resume_data)
+        levels = restore_terrain_levels(resume_data["terrain_levels"], uenv.num_envs, terrain.max_terrain_level).to(device)
+        # 楼梯补练：存档里的楼梯等级低于 stairs_min_level 时直接抬到下限（其它类型不变）
+        levels = obstacle_terrain.apply_level_floor(levels, kinds[terrain.terrain_types], curriculum_cfg,
+                                                    terrain.max_terrain_level)
+        terrain.terrain_levels[:] = levels
+        terrain.env_origins[:] = terrain.terrain_origins[levels, terrain.terrain_types]
+        if getattr(uenv, "obstacle_base_levels", None) is not None:
+            uenv.obstacle_base_levels[:] = levels  # 课程等级与存档一致（探索回合的随机等级不入档）
+        print(f"[supermimic] 续训 {resume_path} @ iteration {learner.iteration}，课程均值 {levels.float().mean():.2f}", flush=True)
+    else:
+        print("[supermimic] 从零训练：actor 随机初始化", flush=True)
 
-    sat_active = False
-    ever_top = torch.zeros(uenv.num_envs, dtype=torch.bool, device=device)
-
-    def load_saturation_anchor(actor_sd=None) -> None:
-        """冻结饱和锚定参考并打开信赖域；actor_sd 为空时按 --saturation_anchor 取（self = 当前 actor）。"""
-        nonlocal sat_active
-        anchor = copy.deepcopy(learner.actor)
-        if actor_sd is None and args_cli.saturation_anchor != "self":
-            actor_sd = torch.load(args_cli.saturation_anchor, map_location=device, weights_only=False)["actor"]
-        if actor_sd is not None:
-            extra = task.obs_dim - actor_sd["actor.0.weight"].shape[1]
-            anchor.load_state_dict(pad_first_layer(actor_sd, extra) if extra > 0 else actor_sd)
-        learner.set_anchor(anchor)
-        cfg.anchor_coef = args_cli.saturation_anchor_coef
-        sat_active = True
-
-    if args_cli.saturation_anchor and resume_path and "saturation_anchor" in ckpt:
-        # 续训沿用触发时冻结的那份参考，不重新取（self 模式下重新取会变成续训起点 actor）
-        load_saturation_anchor(ckpt["saturation_anchor"])
-        print(f"[SuperMimic-Terrain] 续训恢复饱和锚定（anchor_coef={cfg.anchor_coef}）", flush=True)
-
-    # 续训未给 --run_name 时写回原 run，与 rsl_rl 续训习惯一致
-    run = args_cli.run_name or (Path(resume_path).parent.name if resume_path else datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-    log_dir = Path("logs/supermimic_terrain") / run
+    run = args_cli.run_name or (resume_path.parent.name if resume_path else datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    log_dir = LOG_ROOT / run
+    if resume_data is None and log_dir.exists() and any(log_dir.iterdir()):
+        raise FileExistsError(f"拒绝覆盖已有目录：{log_dir}")
     (log_dir / "exported").mkdir(parents=True, exist_ok=True)
     (log_dir / "params").mkdir(exist_ok=True)
-    # 与 Teacher 相同的观测/动作合同：play/评测按它校验，防止同维度不同语义的误加载。
-    teacher_contract = Path(args_cli.teacher).parent / "params" / "vision_contract.json"
-    if teacher_contract.is_file():
-        shutil.copy(teacher_contract, log_dir / "params" / "vision_contract.json")
-    if args_cli.lane_obs:
-        # 合同仍描述前 232 维；第 233 维由此标记描述，评测/回放据此追加观测
-        write_marker(log_dir, task.base_obs_dim)
+    write_deployment_contract(env_cfg, log_dir)
+    implementation_sha256 = {Path(p).name: hashlib.sha256((ROOT / p).read_bytes()).hexdigest()
+                             for p in IMPLEMENTATION_FILES}
     (log_dir / "params" / "supermimic_terrain.json").write_text(json.dumps(
-        {"teacher": str(Path(args_cli.teacher).resolve()), "task": args_cli.task, "cfg": asdict(cfg),
-         "reward": asdict(reward_cfg), "map_res": args_cli.map_res}, indent=2, default=str))
+        {"objective": "obstacle", "actor_source": str(resume_path) if resume_path else "random",
+         "actor_optimizer": "world_model_bptt", "ppo_updates": 0, "task": args_cli.task, "task_features": task_features,
+         "implementation_sha256": implementation_sha256, "cfg": asdict(cfg), "reward": asdict(reward_cfg),
+         "curriculum": curriculum_cfg, "command": command_summary, "arguments": vars(args_cli),
+         "map_res": args_cli.map_res},
+        indent=2, default=str))
     writer = SummaryWriter(str(log_dir))
     csv_file = open(log_dir / "train_log.csv", "a", newline="")
     csv_writer = None
 
-    n = args_cli.num_envs
-    n_driver = int(round(args_cli.driver_fraction * n))
-    actor_mask = torch.ones(n, dtype=torch.bool, device=device)
-    actor_mask[:n_driver] = False
-    teacher = (torch.jit.load(str(Path(args_cli.teacher).parent / "exported" / "policy.pt"), map_location=device).eval()
-               if n_driver else None)
-    bound = cfg.action_bound
+    n = uenv.num_envs
+    roll_limit = math.radians(curriculum_cfg["roll_limit_deg"])
+    pitch_limit = math.radians(curriculum_cfg["pitch_dev_limit_deg"])
+    stall_steps = torch.zeros(n, dtype=torch.long, device=device)
+    stall_limit = round(1.0 / CONTROL_DT)  # 停滞 >1 s 记入日志
+    uenv.obstacle_stall_steps = stall_steps  # obstacle_terrain.stall_timeout 读取（stall_truncate_s > 0 时截断回合）
     obs, _ = env.reset()
-    # 续训时迭代号已过预热，回放却是空的；critic 真实回报要 real_return_window+1 步窗口，攒够前只采数据
+    # 先抬侧标记：每回合 ±1 随机，回合结束（done）时重抽；只在 --lead_side_obs 时进命令与 actor 观测。
+    lead = torch.randint(0, 2, (n,), device=device).float() * 2.0 - 1.0
+
+    def with_lead(x):
+        return torch.cat((x, lead[:, None]), dim=-1) if args_cli.lead_side_obs else x
+
     min_rows = max(cfg.wm_window, cfg.real_return_window if cfg.critic_real_returns else 0) + 2
     start_time = time.time()
-    anchor_start = cfg.anchor_coef
-    # 续训时衰减从本次起点算；否则 it 早已超过预热轮数，第一轮就跳到终值
-    actor_begin = max(cfg.warmup_iterations + cfg.critic_warmup_iterations, learner.iteration)
-    lateral_start = reward_cfg.lateral_pos
-    # 横向惩罚按课程平均台阶的历史最大值爬坡：顶层随机回落会拉低瞬时均值，惩罚不应随之变轻
-    step_cm_peak = curriculum_stats(uenv)["step_height_cm_mean"] if args_cli.from_scratch else 0.0
+    lane_strict = float(curriculum_cfg["stairs_success_lane_m"]) or float(curriculum_cfg["success_lane_m"])
     for it in range(learner.iteration, args_cli.iterations):
-        if args_cli.anchor_final is not None:
-            frac = min(max(it - actor_begin, 0) / max(args_cli.anchor_decay_iterations, 1), 1.0)
-            cfg.anchor_coef = anchor_start + frac * (args_cli.anchor_final - anchor_start)
-        if args_cli.lateral_pos_final is not None and args_cli.from_scratch:
-            # task.cfg 与 reward_cfg 是同一对象：真实回报与想象目标同时变化，口径不分叉
-            step_cm_peak = max(step_cm_peak, curriculum_stats(uenv)["step_height_cm_mean"])
-            reward_cfg.lateral_pos = linear_ramp(step_cm_peak, *args_cli.lateral_ramp_cm, lateral_start,
-                                                 args_cli.lateral_pos_final)
-        if args_cli.saturation_anchor and not sat_active:
-            t = uenv.scene.terrain
-            ever_top, hit = saturation_reached(ever_top, t.terrain_levels, t.max_terrain_level,
-                                               args_cli.saturation_top_fraction)
-            if hit:
-                load_saturation_anchor()
-                print(f"[SuperMimic-Terrain] 第 {it} 轮课程饱和，锚定 {args_cli.saturation_anchor}"
-                      f"（anchor_coef={cfg.anchor_coef}）", flush=True)
-        sim = {"env_reward": 0.0, "shaping_reward": 0.0, "route_vel_err": 0.0, "terminated": 0.0,
-               "obs_max_err": 0.0}
-        for _ in range(args_cli.steps_per_iter):
+        log_now = it % args_cli.log_interval == 0
+        sums: dict[str, torch.Tensor] = {}
+        if args_cli.stairs_lane_schedule is not None:
+            # 先爬上去、后期再收紧车道：楼梯成功车道 fail_lane_m → lane_strict，楼梯区车道代价 ×0 → ×1
+            lane_scale = obstacle_terrain.lane_schedule_scale(it, *args_cli.stairs_lane_schedule)
+            task.set_stairs_lane_scale(lane_scale, device=device)
+            success_scale = (lane_scale if args_cli.stairs_success_lane_schedule is None
+                             else obstacle_terrain.lane_schedule_scale(it, *args_cli.stairs_success_lane_schedule))
+            uenv.cfg.obstacle_curriculum_cfg["stairs_success_lane_m"] = (
+                curriculum_cfg["fail_lane_m"] + (lane_strict - curriculum_cfg["fail_lane_m"]) * success_scale)
+
+        def add(key, value):
+            value = value.float().mean()
+            sums[key] = sums[key] + value if key in sums else value
+
+        for step in range(args_cli.steps_per_iter):
             s, prev, ctx = reader.state(), reader.last_action(), reader.context()
-            cmd = uenv.command_manager.get_command("base_velocity").clone()
-            if args_cli.check_obs:
-                with torch.no_grad():
-                    sim["obs_max_err"] = max(sim["obs_max_err"],
-                                             (task.policy_obs(s, cmd, prev) - obs["policy"]).abs().max().item())
-            # actor 直接吃 env 观测（与部署一致）；想象观测与它逐列一致已由 verify_preview_task 核对。
-            action = learner.act(obs["policy"])
-            if n_driver:
-                with torch.no_grad():
-                    drive = teacher(obs["policy"][:n_driver, :task.base_obs_dim])
-                action[:n_driver] = (drive + args_cli.driver_noise * torch.randn_like(drive)).clamp(-bound, bound)
-            obs, rew, terminated, truncated, _ = env.step(action)
-            done = terminated | truncated
-            # v3 塑形补到真实回报上（critic 拟合真实回报，不补则想象目标与 critic 口径不一致）。
-            # 用步前状态 s：步后状态在 reset 环境里已被重置；与想象里用 next_state 差一步，可忽略。
+            cmd = with_lead(uenv.command_manager.get_command("base_velocity").clone())
+            policy_obs = with_lead(obs["policy"])
+            if args_cli.check_obs_interval and it % args_cli.check_obs_interval == 0 and step == 0:
+                sums["obs_max_err"] = torch.tensor(check_observation(task, s, cmd, prev, policy_obs, log_dir, uenv))
             with torch.no_grad():
-                shaping = task.shaping_reward(s)
-                priority = task.event_priority(s) if cfg.priority_fraction > 0 else None
-                if priority is not None:
-                    priority = torch.maximum(priority, terminated.float())
-                if args_cli.from_scratch:
-                    # go2w：真实回报与想象目标用同一个奖励函数，critic 与 actor 不再各看一套。
-                    # done 的 env 步后状态已被 reset，没有物理后继，用步前状态代替（该步只剩翻车惩罚有意义）。
-                    s_next = reader.state()
-                    s_next = torch.where(done[:, None], s, s_next)
-                    env_rew = rew
-                    rew = task.reward(s, s_next, cmd, action, prev)
-                    if reward_cfg.terminated != 0.0:
-                        rew = rew + reward_cfg.terminated * CONTROL_DT * terminated.float()
-            sim["shaping_reward"] += shaping[actor_mask].mean().item() / args_cli.steps_per_iter
-            if not args_cli.from_scratch:
-                env_rew = rew
-                rew = rew + shaping
-            if priority is not None:
-                sim["priority_rate"] = sim.get("priority_rate", 0.0) + priority.mean().item() / args_cli.steps_per_iter
-            sim["shared_reward"] = sim.get("shared_reward", 0.0) + rew[actor_mask].mean().item() / args_cli.steps_per_iter
+                # 课程统计属于当前回合：在 env.step（其中会 reset）之前记录步前状态。
+                contacts = task.riser_contacts(s)
+                roll, pitch_dev = task.posture_errors(s)
+                tracker.update(contacts.any(-1), (roll > roll_limit) | (pitch_dev > pitch_limit), cmd[:, 0], CONTROL_DT)
+                priority = task.event_priority(s)
+            # 截断判据在 env.step 内按截至上一步的连续停滞步数计算。
+            uenv.obstacle_stall_steps = stall_steps
+            stall_cut = obstacle_terrain.stall_steps_exceeded(stall_steps, curriculum_cfg["stall_truncate_s"], CONTROL_DT)
+            action = learner.act(policy_obs)
+            if not torch.isfinite(action).all():
+                raise FloatingPointError("动作含非有限值，拒绝送入仿真")
+            obs, env_rew, terminated, truncated, _ = env.step(action)
+            done = terminated | truncated
+            with torch.no_grad():
+                # done 的步后状态已被 reset，没有物理后继：用步前状态代替，该步只剩终止惩罚有意义。
+                s_next = torch.where(done[:, None], s, reader.state())
+                terms = task.reward_terms(s, s_next, cmd, action, prev)
+                rew = torch.stack(list(terms.values()), dim=-1).sum(-1) * CONTROL_DT
+                rew = rew + reward_cfg.terminated * CONTROL_DT * terminated.float()
+                priority = torch.maximum(priority, terminated.float())
+                stall_steps = torch.where(task.progressing(s, cmd) | done, 0, stall_steps + 1)
             learner.observe(s, action, prev, cmd, done, ctx, reward=rew, terminated=terminated, priority=priority)
-            a = actor_mask
-            v_w = quat_apply(s[a][:, QUAT], s[a][:, LIN])
-            sim["env_reward"] += env_rew[a].mean().item() / args_cli.steps_per_iter
-            sim["route_vel_err"] += (cmd[a, 0] - v_w[:, 0]).abs().mean().item() / args_cli.steps_per_iter
-            # terminated 只剩 bad_orientation（成功/超时/出界都是 truncated），即翻车率
-            sim["terminated"] += terminated[a].float().mean().item() / args_cli.steps_per_iter
+            if args_cli.lead_side_obs:
+                lead = torch.where(done, torch.randint_like(lead, 0, 2) * 2.0 - 1.0, lead)
+            if log_now:
+                with torch.no_grad():
+                    for key, value in terms.items():
+                        add(f"r_{key}", value)
+                    add("shared_reward", rew)
+                    add("env_reward", env_rew)
+                    add("terminated", terminated)
+                    add("priority_rate", priority > 0)
+                    add("riser_contact_front", contacts[:, [0, 2]].any(-1))
+                    add("riser_contact_rear", contacts[:, [1, 3]].any(-1))
+                    add("roll_deg", roll * 180.0 / math.pi)
+                    add("pitch_dev_deg", pitch_dev * 180.0 / math.pi)
+                    add("pitch_rate_rms", s[:, 11].square())
+                    add("stall_1s_fraction", stall_steps > stall_limit)
+                    add("stall_truncated", stall_cut)
+                    add("route_vel_err", (cmd[:, 0] - quat_apply(s[:, QUAT], s[:, LIN])[:, 0]).abs())
+                    if lane_center_y is not None:
+                        add("lateral_abs_m", task.lateral_offset(s).abs())
         if learner.replay.size >= min_rows:
             logs = learner.update()
         else:
             logs = {}
             learner.iteration += 1
-        logs.update(sim)
-        logs["anchor_coef"] = cfg.anchor_coef
-        logs["lateral_pos_coef"] = reward_cfg.lateral_pos
-        logs["saturation_anchor_on"] = float(sat_active)
-        if it % args_cli.log_interval == 0:
-            logs.update(curriculum_stats(uenv))
+        if log_now:
+            logs.update({k: v.item() / (1 if k == "obs_max_err" else args_cli.steps_per_iter) for k, v in sums.items()})
+            if args_cli.stairs_lane_schedule is not None:
+                logs["stairs_lane_scale"] = lane_scale
+                logs["stairs_success_lane_m"] = uenv.cfg.obstacle_curriculum_cfg["stairs_success_lane_m"]
+            logs["pitch_rate_rms"] = math.sqrt(logs["pitch_rate_rms"]) * 180.0 / math.pi
+            logs.update({f"curriculum/{k}": v.item() for k, v in obstacle_terrain.curriculum_summary(
+                obstacle_terrain.curriculum_levels(uenv), kinds[terrain.terrain_types],
+                terrain.cfg.terrain_generator.num_rows).items()})
+            decisions, uenv.obstacle_curriculum_log = uenv.obstacle_curriculum_log, {}
+            for name in obstacle_terrain.KIND_NAMES.values():
+                episodes = max(decisions.get(f"{name}_episodes", 0), 1)
+                for outcome in ("promoted", "demoted", "collided"):
+                    logs[f"curriculum/{name}_{outcome}_rate"] = decisions.get(f"{name}_{outcome}", 0) / episodes
+            if curriculum_cfg["stairs_explore_frac"] > 0:
+                # 探索回合（随机楼梯等级）的通过率；high = ≥12 cm（验收的高楼梯区间）。回合数少时噪声大，看趋势
+                for key in ("explore", "explore_high"):
+                    logs[f"curriculum/stairs_{key}_episodes"] = decisions.get(f"stairs_{key}_episodes", 0)
+                    logs[f"curriculum/stairs_{key}_pass_rate"] = (decisions.get(f"stairs_{key}_passed", 0)
+                                                                  / max(decisions.get(f"stairs_{key}_episodes", 0), 1))
             logs["elapsed_min"] = (time.time() - start_time) / 60
             for k, v in logs.items():
                 writer.add_scalar(f"supermimic_terrain/{k}", v, it)
             row = {"iteration": it, **logs}
             if csv_writer is None:
-                keys = set(row) | {"wm_loss", "wm_err_1step", "wm_err_last", "wm_reward_bias", "wm_reward_abs_gap",
-                                   "actor_loss", "anchor_mse", "actor_grad_norm", "critic_loss", "imag_reward",
-                                   "imag_survival", "actor_skipped", "terrain_level_mean", "stage_1", "stage_2",
-                                   "stage_3"}
-                csv_writer = csv.DictWriter(csv_file, fieldnames=sorted(keys), extrasaction="ignore")
+                csv_writer = csv.DictWriter(csv_file, fieldnames=sorted(set(row) | set(LEARNER_LOG_KEYS)),
+                                            extrasaction="ignore")
                 if csv_file.tell() == 0:
                     csv_writer.writeheader()
             csv_writer.writerow(row)
             csv_file.flush()
             print(f"[it {it}] " + " ".join(f"{k}={v:.4g}" for k, v in sorted(logs.items())), flush=True)
         if (it + 1) % args_cli.save_interval == 0 or it + 1 == args_cli.iterations:
-            extra_state = {"terrain_levels": uenv.scene.terrain.terrain_levels.cpu()}
-            if sat_active:
-                extra_state["saturation_anchor"] = learner.anchor_actor.state_dict()
-            torch.save({**learner.state_dict(), **extra_state}, log_dir / f"ckpt_{it + 1:06d}.pt")
-            export_policy(learner, log_dir / "exported", task.obs_dim)
+            torch.save({**learner.state_dict(), "terrain_levels": obstacle_terrain.curriculum_levels(uenv).cpu(),
+                        "task_features": task_features, "task_reward": asdict(reward_cfg),
+                        "curriculum": curriculum_cfg, "implementation_sha256": implementation_sha256},
+                       log_dir / f"ckpt_{it + 1:06d}.pt")
+            export_policy(learner, log_dir / "exported", task.obs_dim - int(task.lead_obs))
     csv_file.close()
     writer.close()
     env.close()

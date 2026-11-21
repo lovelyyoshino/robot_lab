@@ -7,9 +7,16 @@ actor 的 MLP 层命名与 rsl_rl ActorCritic 的 `actor.N` 一致（45→512/25
 
 @author pony
 @date 2026-10-26
-@version v0.2.0
-@last_modified 2026-10-26
+@version v0.5.0
+@last_modified 2026-11-18
 @changelog
+    - v0.5.0 (2026-11-18): Actor.action_bound 可给 12 个逐维上界（序列 → buffer）；给标量时与原来逐位相同、state_dict 不变。
+      摆臂关节限位 ≈ ±2.4–2.7（动作单位），统一的 2π 上界让摆臂动作能落到限位之外：第二十三轮第 22000 轮驻车时后摆臂
+      动作 −4.4～−4.7，仿真与世界模型对它都没有响应，BPTT 梯度为 0，只剩 0.02 的超界代价往回拉。
+    - v0.4.0 (2026-11-16): critic 只读命令前 3 维（第 4 维是 actor 的先抬侧标记，不进价值）；LeadSideActor 部署包装
+      （先抬侧固定，对外仍是 232 维观测）。
+    - (2026-11-05): RunningNorm 原地更新 var/count，供 torch.compile 的世界模型单步复用同一图。
+    - (2026-11-04): 归一化计数改为float64，十亿级历史仍精确累计小批次；特征统计保持float32。
     - v0.3.0 (2026-10-26): actor 支持 squash="clamp"，用于从 rsl_rl PPO 权重无损热启动。
     - v0.2.0 (2026-10-26): 世界模型接入动力学上下文 ξ 与关节加速度 aux 头；critic 读 ξ；actor 界改 2π。
     - v0.1.0 (2026-10-26): 初始创建
@@ -39,7 +46,7 @@ class RunningNorm(nn.Module):
         super().__init__()
         self.register_buffer("mean", torch.zeros(dim))
         self.register_buffer("var", torch.ones(dim))
-        self.register_buffer("count", torch.tensor(eps))
+        self.register_buffer("count", torch.tensor(eps, dtype=torch.float64))
         self.min_std = min_std
 
     @torch.no_grad()
@@ -49,8 +56,9 @@ class RunningNorm(nn.Module):
         total = self.count + n
         delta = batch_mean - self.mean
         self.mean += delta * n / total
-        self.var = (self.var * self.count + batch_var * n + delta.square() * self.count * n / total) / total
-        self.count = total
+        # 原地写回：缓冲对象身份不变，torch.compile 的图不会因换了张量而重编译；数值与重新赋值相同。
+        self.var.copy_((self.var * self.count + batch_var * n + delta.square() * self.count * n / total) / total)
+        self.count.copy_(total)
 
     @property
     def std(self) -> torch.Tensor:
@@ -102,6 +110,25 @@ class WorldModel(nn.Module):
         delta = self.delta_norm.denormalize(self.net(x))
         return integrate(state, delta)
 
+    def load_context_expanded_state_dict(self, weights: dict, extra_dim: int = 0) -> None:
+        """在固定上下文末尾插入新列，保留其后的地形列；零权重保证旧模型前向不变。"""
+        old_dim = weights["input_norm.mean"].numel()
+        added = self.in_dim - old_dim
+        if added < 0 or not 0 <= extra_dim <= old_dim - FEATURE_DIM - NUM_ACTIONS:
+            raise ValueError("world model context只能扩展，且须保留原地形列")
+        expanded = dict(weights)
+        if added:
+            column = old_dim - extra_dim
+            for key, fill in (("input_norm.mean", 0.0), ("input_norm.var", 1.0),
+                              ("net.0.weight", 0.0), ("aux_net.0.weight", 0.0)):
+                if key not in weights:
+                    continue
+                tensor = weights[key]
+                shape = (*tensor.shape[:-1], added)
+                expanded[key] = torch.cat((tensor[..., :column], tensor.new_full(shape, fill),
+                                           tensor[..., column:]), dim=-1)
+        self.load_state_dict(expanded)
+
     def aux_normalized(self, state, action, context=None) -> torch.Tensor:
         return self.aux_net(self.input_norm.normalize(self._inputs(state, action, context)))
 
@@ -119,7 +146,13 @@ class Actor(nn.Module):
         # 界取 2π：轮速动作 ×5 后正好是 env 的轮速目标 clip ±31.4 rad/s。轮子是 DCMotor
         # （stiffness 0、damping 0.5、effort 10 N·m），扭矩 ≈ 0.5×(目标−实际)，实测 1 m/s 需 ~8.8 rad/s，
         # 要出满扭矩目标须 ≥ ~29 rad/s；原来的界 4（20 rad/s）只能出约一半扭矩。
-        self.action_bound = action_bound
+        if isinstance(action_bound, (int, float)):
+            self.action_bound = float(action_bound)
+        else:
+            bound = torch.as_tensor(action_bound, dtype=torch.float32).flatten()
+            if bound.numel() != NUM_ACTIONS or not bool((bound > 0).all()):
+                raise ValueError(f"逐维 action_bound 须为 {NUM_ACTIONS} 个正数")
+            self.register_buffer("action_bound", bound)
         # "clamp"：界内与 rsl_rl 线性输出完全相同，从 PPO 权重热启动时动作不变（tanh 会把 3 压成 2.3）；
         # 界外梯度为 0，与 env 自身的动作 clip 一致。
         if squash not in ("tanh", "clamp"):
@@ -143,7 +176,25 @@ class Critic(nn.Module):
         self.net = mlp(self.in_dim, hidden, 1)
 
     def inputs(self, state, command, last_action, context):
-        return torch.cat((features(state), command, last_action, context), dim=-1)
+        return torch.cat((features(state), command[..., :3], last_action, context), dim=-1)
 
     def forward(self, state, command, last_action, context) -> torch.Tensor:
         return self.net(self.norm.normalize(self.inputs(state, command, last_action, context))).squeeze(-1)
+
+
+class LeadSideActor(nn.Module):
+    """部署包装：actor 末维的先抬侧标记固定为 lead（±1），对外仍是不含标记的观测接口（越障 232 维）。
+
+    训练时每回合随机 ±1，镜像变换把它取反：π(o, −1) ≈ M·π(M·o, +1)。左右几乎对称的卡死状态下，标记决定先抬哪一侧，
+    镜像一致性不再把动作压成左右对称。部署固定一侧即可，另一侧的行为是它的镜像。"""
+
+    def __init__(self, actor: nn.Module, lead: float = 1.0):
+        super().__init__()
+        if lead not in (1.0, -1.0):
+            raise ValueError("先抬侧标记只能是 ±1")
+        self.inner = actor
+        self.lead = float(lead)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        side = obs[..., :1] * 0.0 + self.lead
+        return self.inner(torch.cat((obs, side), dim=-1))

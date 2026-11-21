@@ -2,9 +2,11 @@
 
 @author pony
 @date 2026-09-30
-@version v0.2.0
-@last_modified 2026-10-14
+@version v0.3.0
+@last_modified 2026-11-06
 @changelog
+    - v0.3.0 (2026-11-06): 起抬窗口改为构造参数 lead_window_m / target_lead_m（默认仍为 8–14 cm），
+      SuperMimic 越障验收传入 3–12 cm。
     - (2026-10-14): 实际全宽验收允许一侧完整主动动作，保留双侧独立诊断及历史默认门槛。
     - (2026-10-13): 独立建立稳定接近基线，排除出生冲击并输出冻结及采样门。
     - (2026-10-11): 仅在65cm障碍接近范围内记录首次离地，避免出生颠簸误消耗整回合资格。
@@ -53,7 +55,9 @@ class PreliftEvaluation:
                  load_drop_fraction=0.35, min_force_drop_n=3.0, min_clearance_m=0.005, unload_hold_s=0.06,
                  require_hold_to_edge=False, prelift_hold_s=0.06, release_hold_s=0.06,
                  baseline_settle_s=0.40, baseline_stable_s=0.12,
-                 preparation_max_advance_m=0.25, required_active_count=None):
+                 preparation_max_advance_m=0.25, required_active_count=None,
+                 lead_window_m=(PRELIFT_ACTION_MIN_ADVANCE_M, PRELIFT_ACTION_MAX_ADVANCE_M),
+                 target_lead_m=PRELIFT_ACTION_TARGET_ADVANCE_M):
         if not required_front_wheels or len(set(required_front_wheels)) != len(required_front_wheels) or any(
             wheel not in (0, 1) for wheel in required_front_wheels
         ):
@@ -65,8 +69,12 @@ class PreliftEvaluation:
             baseline_settle_s, baseline_stable_s, preparation_max_advance_m,
         )):
             raise ValueError("窄障碍净空、减载力和保持时长必须为有限正数")
+        self.min_lead_m, self.max_lead_m = (float(v) for v in lead_window_m)
+        self.target_lead_m = float(target_lead_m)
+        if not 0 < self.min_lead_m <= self.target_lead_m <= self.max_lead_m:
+            raise ValueError("起抬窗口必须满足 0 < min ≤ target ≤ max")
         if not (
-            PRELIFT_ACTION_MAX_ADVANCE_M <= preparation_max_advance_m < PRELIFT_PERCEPTION_MAX_ADVANCE_M
+            self.max_lead_m <= preparation_max_advance_m < PRELIFT_PERCEPTION_MAX_ADVANCE_M
         ):
             raise ValueError("稳定基线容差或准备距离无效")
         self.dt = dt
@@ -171,7 +179,7 @@ class PreliftEvaluation:
                 state["collision_seen"][wheel] |= bool(collision)
                 state["contacted"][wheel] |= bool(collision)
                 in_window = (valid and not state["contacted"][wheel]
-                             and PRELIFT_ACTION_MIN_ADVANCE_M <= lead <= PRELIFT_ACTION_MAX_ADVANCE_M)
+                             and self.min_lead_m <= lead <= self.max_lead_m)
                 if in_window:
                     diagnostics["lead_window_steps"][wheel] += 1
                     diagnostics["max_lift_m_in_window"][wheel] = max(
@@ -263,7 +271,7 @@ class PreliftEvaluation:
                     diagnostics["unloaded_clearance_steps_in_window"][wheel] += 1
                 avoidance = unloading if self.allow_load_drop else rising
                 if (airborne and state["takeoff"][wheel] is not None and not state["contacted"][wheel]
-                        and lead > PRELIFT_ACTION_MAX_ADVANCE_M):
+                        and lead > self.max_lead_m):
                     diagnostics["early_lift_steps"][wheel] += 1
                     if diagnostics["first_early_lift_lead_m"][wheel] is None:
                         diagnostics["first_early_lift_lead_m"][wheel] = lead
@@ -387,9 +395,9 @@ class PreliftEvaluation:
                 label: self._distance_stats(wheel, "front_wheels", "height_threshold_lead_m")
                 for wheel, label in enumerate(("fl", "fr"))
             },
-            "gates": {"min_lead_distance_m": PRELIFT_ACTION_MIN_ADVANCE_M,
-                      "max_lead_distance_m": PRELIFT_ACTION_MAX_ADVANCE_M,
-                      "target_lead_distance_m": PRELIFT_ACTION_TARGET_ADVANCE_M,
+            "gates": {"min_lead_distance_m": self.min_lead_m,
+                      "max_lead_distance_m": self.max_lead_m,
+                      "target_lead_distance_m": self.target_lead_m,
                       "timing_reference": "first_ground_clearance_with_unloading",
                       "takeoff_clearance_m": PRELIFT_TAKEOFF_CLEARANCE_M,
                       "min_articulation_lift_m": None if self.allow_load_drop else 0.02,

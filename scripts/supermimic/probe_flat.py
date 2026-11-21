@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-probe_flat.py — 平地抖动探针：纯平地、固定命令下测车体上下起伏、俯仰抖动与 arm 来回摆动。
+probe_flat.py — 平地行驶探针：accept.py 的平地档（姿态、平顺、偏航/横向/速度跟踪）。
 
-用于排查"平地上一直上下跳"：Preview 任务只在楼梯/障碍上验收，平地平稳性没有指标。
-每个命令档单独跑一次（同一进程内改命令），前 3 s 视为起步瞬态不计。不改任何训练配置。
+每个策略 × 种子 × 命令速度跑一遍；稳态从 --settle_s 开始统计。逐环境先在时间上取统计量，
+输出 per_env 数组供 accept.py 跨种子合并后取 P95（验收规格：跨环境 P95，不用中位数）。
 
 @author pony
 @date 2026-10-27
-@version v1.0.0
-@last_modified 2026-10-27
+@version v1.2.0
+@last_modified 2026-11-05
 @changelog
+    - v1.2.0 (2026-11-05): 逐环境 roll/pitch/俯仰角速度/摆臂速度/垂向速度/动作变化率与偏航、横向、速度 RMSE；
+      --seeds 多种子同进程；232/233 维按 actor 权重切换车道偏移；删除旧中位数抖动指标（旧 accept_terrain 专用）。
+    - v1.1.0 (2026-11-02): 可选记录逐步物理轨迹和上下文，定位持续行驶的偏航、减速与模型误差。
+    - (2026-11-02): 增加稳态偏航和横向偏移统计，避免起步端正掩盖持续转圈。
+    - v1.0.3 (2026-11-02): 记录每个摆臂实际姿态和PD目标，区分单轮持续限位与整体统计。
+    - v1.0.2 (2026-11-02): 起步/稳态姿态、路线速度与四轮独立接触力检查。
     - v1.0.1 (2026-10-28): 支持方案 B 策略（车道偏移观测）。
     - v1.0.0 (2026-10-27): 初始创建
 """
@@ -18,6 +24,7 @@ import argparse
 import sys
 
 from isaaclab.app import AppLauncher
+from pathlib import Path
 
 parser = argparse.ArgumentParser(description="平地抖动探针")
 parser.add_argument("--task", default="RobotLab-Isaac-SuperMimic-Terrain-Preview-Parallelogram-Rover-v0")
@@ -27,6 +34,10 @@ parser.add_argument("--num_envs", type=int, default=64)
 parser.add_argument("--seconds", type=float, default=10.0)
 parser.add_argument("--settle_s", type=float, default=3.0)
 parser.add_argument("--seed", type=int, default=7)
+parser.add_argument("--seeds", type=int, nargs="+", default=None, help="多种子依次复位评测；默认只用 --seed")
+parser.add_argument("--output", type=Path, default=None)
+parser.add_argument("--record_dir", type=Path, default=None,
+                    help="保存各策略/速度的动作前状态、观测、动作和动力学上下文，供离线复核")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -37,14 +48,19 @@ import math  # noqa: E402
 import os  # noqa: E402
 
 import gymnasium as gym  # noqa: E402
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
 import robot_lab.tasks  # noqa: F401, E402
 from robot_lab.supermimic.isaac_adapter import RoverStateReader  # noqa: E402
-from robot_lab.supermimic.quat import projected_gravity  # noqa: E402
+from robot_lab.supermimic.quat import projected_gravity, quat_apply  # noqa: E402
+from robot_lab.supermimic.kinematics import RoverKinematics  # noqa: E402
 from robot_lab.supermimic.state import ANG, JPOS, JVEL, LIN, POS, QUAT  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "reinforcement_learning/rsl_rl"))
+from acceptance_metrics import LANE_OFFSET_OBS_DIM, actor_input_dim, quat_to_roll_pitch  # noqa: E402
 
 
 def configure(env_cfg):
@@ -69,44 +85,96 @@ def configure(env_cfg):
     cmd.resampling_time_range = (1e3, 1e3)
 
 
-def run(env, reader, policy, command):
+def run(env, reader, policy, command, name, seed):
     uenv = env.unwrapped
-    obs, _ = env.reset()
+    # 各策略/速度使用相同reset随机数，避免执行顺序改变增益随机化而污染对照。
+    obs, _ = env.reset(seed=seed)
     uenv.command_manager.get_term("base_velocity").vel_command_b[:, 0] = command
     obs = uenv.observation_manager.compute()
     steps = int(args_cli.seconds / uenv.step_dt)
     settle = int(args_cli.settle_s / uenv.step_dt)
-    rec = {k: [] for k in ("z", "vz", "pitch_rate", "arm_vel", "arm_pos", "arm_act", "tilt")}
+    rec = {k: [] for k in ("vz", "route_vx", "pitch_rate", "arm_vel", "arm_pos", "action", "tilt",
+                           "roll", "pitch", "yaw", "lateral")}
+    startup_tilt, support, support_loss = [], [], []
+    trace = {k: [] for k in ("state", "obs", "action", "context", "command", "done")} if args_cli.record_dir else None
+    kin = RoverKinematics().to(uenv.device)
+    force_sensor = uenv.scene.sensors["contact_forces"]
+    wheel_ids, _ = force_sensor.find_bodies(["fl_wheel", "fr_wheel", "rl_wheel", "rr_wheel"], preserve_order=True)
+    if len(wheel_ids) != 4:
+        raise RuntimeError("平地四轮支撑检查需要四个轮子的独立接触力")
     for t in range(steps):
         uenv.command_manager.get_term("base_velocity").vel_command_b[:, 0] = command
         with torch.no_grad():
             action = policy(obs["policy"])
-        obs, _, _, _, _ = env.step(action)
+        if trace is not None:
+            # 统一记录动作前的状态，避免用后继状态解释同一步动作或拟合错误的动力学转移。
+            for key, value in (("state", reader.state()), ("obs", obs["policy"]), ("action", action),
+                               ("context", reader.context()), ("command", reader.command())):
+                trace[key].append(value.detach().cpu().clone())
+        obs, _, terminated, truncated, _ = env.step(action)
+        if trace is not None:
+            trace["done"].append((terminated | truncated).cpu().clone())
+        s = reader.state()
+        tilt = torch.acos((-projected_gravity(s[:, QUAT])[:, 2]).clamp(-1, 1))
+        if t * uenv.step_dt < 1.0:
+            startup_tilt.append(tilt)
         if t < settle:
             continue
-        s = reader.state()
-        rec["z"].append(s[:, POS][:, 2])
+        jp = s[:, JPOS]
+        wheels = kin.wheel_centers_world(s[:, POS], s[:, QUAT], jp[:, :4], jp[:, 4:8])
+        support.append((wheels[:, :, 2] - 0.1085).clamp_min(0.0).amax(-1))
+        support_loss.append((force_sensor.data.net_forces_w[:, wheel_ids, 2] <= 1.0).any(-1).float())
         rec["vz"].append(s[:, LIN][:, 2])
+        rec["route_vx"].append(quat_apply(s[:, QUAT], s[:, LIN])[:, 0])
         rec["pitch_rate"].append(s[:, ANG][:, 1])
         rec["arm_vel"].append(s[:, JVEL][:, 0:4])
         rec["arm_pos"].append(s[:, JPOS][:, 0:4])
-        rec["arm_act"].append(action[:, 0:4])
-        rec["tilt"].append(torch.acos((-projected_gravity(s[:, QUAT])[:, 2]).clamp(-1, 1)))
+        rec["action"].append(action)
+        rec["tilt"].append(tilt)
+        q = s[:, QUAT]
+        roll, pitch = quat_to_roll_pitch(q)
+        rec["roll"].append(roll)
+        rec["pitch"].append(pitch)
+        rec["yaw"].append(torch.atan2(2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+                                       1 - 2 * (q[:, 2].square() + q[:, 3].square())))
+        rec["lateral"].append(s[:, POS][:, 1])
     r = {k: torch.stack(v) for k, v in rec.items()}  # [T, N, ...]
-    da = (r["arm_act"][1:] - r["arm_act"][:-1]).abs()
-    # 主频：车体 vz 的过零次数 / 2 / 时长
-    zc = ((r["vz"][1:] * r["vz"][:-1]) < 0).float().sum(0) / 2 / (r["vz"].shape[0] * uenv.step_dt)
+    if trace is not None:
+        args_cli.record_dir.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(args_cli.record_dir / f"{name}_s{seed}_v{command:.2f}.npz",
+                            **{k: torch.stack(v).numpy() for k, v in trace.items()},
+                            origins=uenv.scene.env_origins.cpu().numpy(), step_dt=uenv.step_dt)
+    deg = torch.rad2deg
+    da = r["action"][1:] - r["action"][:-1]
+    # 逐环境：先在时间上取统计量，accept.py 再跨环境/种子取 P95。
+    per_env = {
+        "roll_abs_p95_deg": deg(r["roll"].abs().quantile(0.95, dim=0)),
+        "roll_abs_max_deg": deg(r["roll"].abs().amax(0)),
+        "pitch_abs_p95_deg": deg(r["pitch"].abs().quantile(0.95, dim=0)),
+        "pitch_abs_max_deg": deg(r["pitch"].abs().amax(0)),
+        "pitch_rate_rms_deg_s": deg(r["pitch_rate"].square().mean(0).sqrt()),
+        "arm_vel_rms_rad_s": r["arm_vel"].square().mean((0, 2)).sqrt(),
+        "base_vz_rms_m_s": r["vz"].square().mean(0).sqrt(),
+        "action_delta_rms": da.square().mean((0, 2)).sqrt(),
+        "arm_action_delta_rms": da[..., :4].square().mean((0, 2)).sqrt(),
+        "action_rate_rms_per_s": da.square().mean((0, 2)).sqrt() / uenv.step_dt,
+        "yaw_abs_p95_deg": deg(r["yaw"].abs().quantile(0.95, dim=0)),
+        "lateral_abs_p95_m": r["lateral"].abs().quantile(0.95, dim=0),
+        "route_velocity_rmse_m_s": (r["route_vx"] - command).square().mean(0).sqrt(),
+    }
+    per_env = {k: v.cpu().tolist() for k, v in per_env.items()}
     return {
-        "command": command,
-        "base_z_std_cm": (r["z"].std(0) * 100).median().item(),
-        "base_z_ptp_cm": ((r["z"].max(0).values - r["z"].min(0).values) * 100).median().item(),
-        "vz_rms_cm_s": (r["vz"].square().mean(0).sqrt() * 100).median().item(),
-        "vz_freq_hz": zc.median().item(),
-        "pitch_rate_rms_deg_s": torch.rad2deg(r["pitch_rate"].square().mean(0).sqrt()).median().item(),
-        "tilt_ptp_deg": torch.rad2deg(r["tilt"].max(0).values - r["tilt"].min(0).values).median().item(),
-        "arm_vel_rms_rad_s": r["arm_vel"].square().mean((0, 2)).sqrt().median().item(),
-        "arm_pos_ptp_deg": torch.rad2deg((r["arm_pos"].max(0).values - r["arm_pos"].min(0).values).amax(-1)).median().item(),
-        "arm_action_delta_med": da.median().item(),
+        "command": command, "seed": seed, "envs": len(per_env["roll_abs_p95_deg"]), "per_env": per_env,
+        "p95_across_envs": {k: float(np.percentile(v, 95)) for k, v in per_env.items()},
+        # 以下为诊断，不设门
+        "route_velocity_mean_m_s": r["route_vx"].mean().item(),
+        "startup_tilt_p95_deg": torch.rad2deg(torch.stack(startup_tilt)).quantile(0.95).item(),
+        "tilt_p95_deg": torch.rad2deg(r["tilt"]).quantile(0.95).item(),
+        "arm_pose_p95_deg": torch.rad2deg(r["arm_pos"].abs()).quantile(0.95).item(),
+        "arm_pose_mean_deg_per_joint": torch.rad2deg(r["arm_pos"].mean((0, 1))).tolist(),
+        "arm_target_mean_deg_per_joint": torch.rad2deg(0.25 * r["action"][..., :4].mean((0, 1))).tolist(),
+        "wheel_clearance_p95_cm": (torch.stack(support) * 100).quantile(0.95).item(),
+        "four_wheel_support_loss_fraction": torch.stack(support_loss).mean().item(),
     }
 
 
@@ -114,23 +182,29 @@ def main():
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
     env_cfg.seed = args_cli.seed
     configure(env_cfg)
-    from robot_lab.supermimic.lane_offset import add_lane_offset_term, policy_uses_lane_offset
-
     specs = [spec.split("=", 1) for spec in args_cli.policy]
-    lane = {name: policy_uses_lane_offset(path) for name, path in specs}
+    # 233 维为旧车道偏移基线：环境追加该列；当前越障策略为 232 维。
+    lane = {name: actor_input_dim(path) == LANE_OFFSET_OBS_DIM for name, path in specs}
     if any(lane.values()):
+        from robot_lab.supermimic.lane_offset import add_lane_offset_term
+
         add_lane_offset_term(env_cfg)
     env = gym.make(args_cli.task, cfg=env_cfg)
-    reader = RoverStateReader(env, world_frame=False)
+    reader = RoverStateReader(env, world_frame=False, contact_context=args_cli.record_dir is not None)
     out = {}
     for name, path in specs:
         scripted = torch.jit.load(path, map_location=env.unwrapped.device).eval()
         # 环境追加了车道偏移列时，不用该列的策略只取前 232 维
         policy = scripted if lane[name] or not any(lane.values()) else (lambda o, f=scripted: f(o[:, :-1]))
-        out[name] = [run(env, reader, policy, c) for c in args_cli.commands]
+        out[name] = [run(env, reader, policy, c, name, seed)
+                     for seed in (args_cli.seeds or [args_cli.seed]) for c in args_cli.commands]
         for row in out[name]:
-            print(f"[flat] {name} " + " ".join(f"{k}={v:.3g}" for k, v in row.items()), flush=True)
+            print(f"[flat] {name} seed={row['seed']} v={row['command']:.2f} "
+                  + " ".join(f"{k}={v:.3g}" for k, v in row["p95_across_envs"].items()), flush=True)
     print("[flat_json]", json.dumps(out), flush=True)
+    if args_cli.output:
+        args_cli.output.parent.mkdir(parents=True, exist_ok=True)
+        args_cli.output.write_text(json.dumps(out, indent=2) + "\n")
     env.close()
 
 

@@ -2,9 +2,15 @@
 
 @author pony
 @date 2026-10-26
-@version v0.3.0
-@last_modified 2026-10-30
+@version v0.5.0
+@last_modified 2026-11-05
 @changelog
+    - (2026-11-05): _preview 关闭车道惩罚 lane（需要训练特权 lane_center_y），其余目标仍取默认。
+    - (2026-11-05): 删除锚定、旧预抬、平地姿态/支撑、车道观测等旧奖励的测试；越障统一目标测试见 test_supermimic_obstacle.py。
+    - (2026-11-03): 覆盖平地轮速目标正则的动作梯度、接近台阶和跨阶释放边界。
+    - (2026-11-03): 验证想象平地比例、上下文索引一致性及缺少越障状态时的回退。
+    - (2026-11-02): 平地动作锚定须允许完整协调修改；路线critic须能区分相同本体状态的不同航向。
+    - v0.4.0 (2026-11-02): 覆盖承重轮接触压入时预抬梯度与旧奖励兼容。
     - v0.3.0 (2026-10-30): 课程到顶随机回落、课程饱和判据
     - v0.2.0 (2026-10-29): 续训课程等级恢复与横向惩罚爬坡
     - v0.1.0 (2026-10-26): 初始创建
@@ -94,6 +100,54 @@ def test_fk_world_applies_base_pose():
     # 绕 z 转 90°：(x, y) → (−y, x)
     assert torch.allclose(world[0, :, 0], 1.0 - base[0, :, 1], atol=1e-6)
     assert torch.allclose(world[0, :, 1], 2.0 + base[0, :, 0], atol=1e-6)
+
+
+def test_preview_scan_refresh_survives_float32_clock_boundary():
+    """执行真实配置入口的扫描部分，并复现SensorBase的时钟比较，覆盖16秒后的漏更新。"""
+    import ast
+    from types import SimpleNamespace
+
+    path = Path(__file__).parents[1] / "robot_lab/tasks/manager_based/supermimic/terrain_env_cfg.py"
+    config_class = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef))
+
+    class Base(SimpleNamespace):
+        def __post_init__(self):
+            pass
+
+    friction = next(ast.literal_eval(n.value) for n in ast.parse(path.read_text()).body
+                    if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", None) == "WHEEL_FRICTION")
+    scanner = SimpleNamespace(update_period=0.02, offset=SimpleNamespace(pos=(0., 0., 20.)))
+    scope = {"configclass": lambda cls: cls, "ParallelogramRoverVisionTeacherPreviewEnvCfg": Base,
+             "mdp_core": SimpleNamespace(bad_orientation=object()), "TILT_LIMIT_RAD": 1.2,
+             "TerminationTermCfg": lambda **kwargs: kwargs, "WHEEL_FRICTION": friction}
+    exec(compile(ast.Module(body=[config_class], type_ignores=[]), str(path), "exec"), scope)
+    material = SimpleNamespace(params={"static_friction_range": (0.5, 1.2), "dynamic_friction_range": (0.4, 1.0)})
+    events = SimpleNamespace(randomize_wheel_rigid_body_material=material)
+    cfg = scope[config_class.name](scene=SimpleNamespace(height_scanner=scanner), events=events,
+                                   observations=SimpleNamespace(policy=SimpleNamespace(height_scan=SimpleNamespace())),
+                                   terminations=SimpleNamespace())
+    cfg.__post_init__()
+
+    def missed_control_samples(period):
+        timestamp, last = torch.zeros(1), torch.zeros(1)
+        missed = 0
+        for _ in range(1200):
+            outdated = False
+            for _ in range(4):
+                timestamp += 0.005
+                outdated |= bool(timestamp - last + 1e-6 >= period)
+            if outdated:
+                last.copy_(timestamp)
+            else:
+                missed += 1
+        return missed
+
+    assert missed_control_samples(0.02) > 0  # 原更新周期确实在边界后失效。
+    assert missed_control_samples(cfg.scene.height_scanner.update_period) == 0
+    # 轮胎摩擦固定为 μ=1.0（用户 2026-11-07 决定）：训练与平地验收不再随机
+    assert friction == (1.2, 1.0)
+    assert material.params["static_friction_range"] == (1.2, 1.2)
+    assert material.params["dynamic_friction_range"] == (1.0, 1.0)
 
 
 # ---------------- 高度图 / 扫描 ----------------
@@ -192,7 +246,8 @@ def _preview(**cfg):
     hm, kin = _step_map(step_x=1.5), kinematics.RoverKinematics()
     pattern = torch.tensor([[x, y, 20.0] for x in (0.0, 0.3, 0.6) for y in (-0.2, 0.2)])
     limits = torch.tensor([[-1.0, 1.0]] * 8)
-    return preview_task.PreviewTask(hm, kin, pattern, limits, preview_task.PreviewRewardCfg(**cfg)), hm, kin
+    # 这些测试不提供车道中心：关掉车道惩罚（它需要训练特权 lane_center_y），其余目标保持默认
+    return preview_task.PreviewTask(hm, kin, pattern, limits, preview_task.PreviewRewardCfg(**{"lane": 0.0, **cfg})), hm, kin
 
 
 def test_centered_tracking_matches_env_implementation():
@@ -224,97 +279,22 @@ def test_preview_obs_layout_and_scan_straight_through():
     assert torch.allclose(g_smooth, g_st)  # 反向仍是双线性梯度
 
 
-def test_wheel_lift_rewards_lifting_only_when_step_ahead():
-    task, _, kin = _preview()
-    front_x = kin.wheel_centers_base(torch.zeros(1, 4), torch.zeros(1, 4))[0, 0, 0].item()
-    z_rest = 0.37
-    flat = _flat_state(0.0, z_rest)
-    near = _flat_state(1.5 - front_x - 0.10, z_rest)
-    zero = torch.zeros(1, 12)
-    cmd = torch.tensor([[0.3, 0.0, 0.0]])
-    lifted = near.clone()
-    lifted[:, state.JPOS][:, 0] = 0.0
-    # 前轮抬起：直接平移整车 +0.08 m 模拟轮心抬升（只验证奖励随净空单调）
-    lifted[:, 2] += 0.08
-    r_near = task.reward_terms(near, near, cmd, zero, zero)
-    r_lift = task.reward_terms(lifted, lifted, cmd, zero, zero)
-    r_flat_lift = task.reward_terms(flat, flat.clone().index_add_(1, torch.tensor([2]), torch.tensor([[0.08]])),
-                                    cmd, zero, zero)
-    assert r_lift["wheel_lift"] > r_near["wheel_lift"] >= 0
-    # 平地无台阶：has_step=sigmoid(-0.03/0.005)≈0.0025，抬轮塑形几乎为 0，抬轮反被扣分
-    assert r_flat_lift["idle_lift"] < 0 and r_flat_lift["wheel_lift"].abs() < 0.01
-
-
-def test_shaping_terms_values_and_finite_grad_at_upright():
-    task, _, _ = _preview()
-    assert task.shaping_terms(_flat_state(0.0, 0.37)) == {}  # 默认关闭，不改 v2 奖励
-    task, _, _ = _preview(heading=-10.0, lateral_vel=-20.0, tilt_soft=-6.0)
-    # 正立且航向 0：acos/atan2 在此处梯度为无穷，这里必须有限且三项为 0
-    s = _flat_state(0.0, 0.37).requires_grad_(True)
-    terms = task.shaping_terms(s)
-    g = torch.autograd.grad(sum(v.sum() for v in terms.values()), s)[0]
-    assert torch.isfinite(g).all() and all(v.abs().item() < 1e-6 for v in terms.values())
-    yawed = _flat_state(0.0, 0.37, yaw=math.radians(13.0))
-    yawed[:, state.LIN] = torch.tensor([[0.4, 0.0, 0.0]])  # 车体系前进 → 世界系有 vy
-    t = task.shaping_terms(yawed)
-    assert math.isclose(t["heading"].item(), -10.0 * math.sin(math.radians(13.0)) ** 2, rel_tol=1e-4)
-    assert math.isclose(t["lateral_vel"].item(), -20.0 * (0.4 * math.sin(math.radians(13.0))) ** 2, rel_tol=1e-4)
-    # 俯仰 40°：超过 25° 起罚点
-    pitched = state.make_state(torch.tensor([[0.0, 0.0, 0.37]]),
-                               quat.axis_angle_to_quat(torch.tensor([[0.0, math.radians(40.0), 0.0]])),
-                               torch.zeros(1, 3), torch.zeros(1, 3), torch.zeros(1, 12), torch.zeros(1, 12))
-    expected = -6.0 * (math.cos(math.radians(25.0)) - math.cos(math.radians(40.0)))
-    assert math.isclose(task.shaping_terms(pitched)["tilt_soft"].item(), expected, rel_tol=1e-4)
-    assert torch.allclose(task.shaping_reward(pitched), sum(task.shaping_terms(pitched).values()) * 0.02)
-
-
-def test_wheel_heading_penalizes_crab_not_aligned_steering():
-    task, _, _ = _preview(wheel_heading=-10.0)
-    yaw = math.radians(20.0)
-    # 车头 +20°、四轮 −20°：轮子沿路线滚，不罚
-    s = _flat_state(0.0, 0.37, yaw=yaw)
-    jp = s[:, state.JPOS].clone(); jp[:, 4:8] = -yaw; s[:, state.JPOS] = jp
-    assert task.shaping_terms(s)["wheel_heading"].abs().item() < 1e-6
-    # 车头 +20°、四轮 −35°（诊断里的蟹行）：轮子朝 −15° 滚
-    jp[:, 4:8] = math.radians(-35.0); s[:, state.JPOS] = jp
-    expected = -10.0 * math.sin(math.radians(-15.0)) ** 2
-    assert math.isclose(task.shaping_terms(s)["wheel_heading"].item(), expected, rel_tol=1e-4)
-    s.requires_grad_(True)
-    g = torch.autograd.grad(task.shaping_terms(s)["wheel_heading"].sum(), s)[0]
-    assert torch.isfinite(g).all()
-
-
-def test_lateral_pos_uses_nearest_lane_center_and_extends_critic():
-    hm, kin = _step_map(step_x=1.5), kinematics.RoverKinematics()
-    pattern = torch.tensor([[x, y, 20.0] for x in (0.0, 0.3, 0.6) for y in (-0.2, 0.2)])
-    limits = torch.tensor([[-1.0, 1.0]] * 8)
-    centers = torch.tensor([-8.0, 0.0, 8.0])
-    task = preview_task.PreviewTask(hm, kin, pattern, limits, preview_task.PreviewRewardCfg(lateral_pos=-5.0),
-                                    lane_center_y=centers)
-    assert task.critic_extra_dim == terrain_map.RELIEF_DIM + 1
-    s = state.make_state(torch.tensor([[0.0, -0.4, 0.37], [0.0, 8.3, 0.37], [0.0, -7.9, 0.37]]),
-                         quat.axis_angle_to_quat(torch.zeros(3, 3)), torch.zeros(3, 3), torch.zeros(3, 3),
-                         torch.zeros(3, 12), torch.zeros(3, 12))
-    assert torch.allclose(task.lateral_offset(s), torch.tensor([-0.4, 0.3, 0.1]), atol=1e-5)
-    assert torch.allclose(task.shaping_terms(s)["lateral_pos"], -5.0 * torch.tensor([0.16, 0.09, 0.01]), atol=1e-5)
-    assert task.critic_extra(s).shape == (3, terrain_map.RELIEF_DIM + 1)
-    # 未给车道中心时 critic 维度与 v2–v4 相同，旧 checkpoint 仍能续训
-    plain, _, _ = _preview()
-    assert plain.critic_extra_dim == terrain_map.RELIEF_DIM
-
-
-def test_riser_anchor_weights_only_rear_wheels_at_riser():
-    task, _, kin = _preview(riser_anchor=20.0)
-    rear_x = kin.wheel_centers_base(torch.zeros(1, 4), torch.zeros(1, 4))[0, 1, 0].item()
-    # 台阶前缘 x=1.5、高 0.12：后轮心距前缘 0.10 m → 加权；离得远 / 前轮贴立面 → 不加权
-    at = _flat_state(1.5 - rear_x - 0.10, 0.37)
-    far = _flat_state(0.0, 0.37)
-    front_x = kin.wheel_centers_base(torch.zeros(1, 4), torch.zeros(1, 4))[0, 0, 0].item()
-    front_only = _flat_state(1.5 - front_x - 0.10, 0.37)
-    w = task.anchor_weight(torch.cat((at, far, front_only)))
-    assert torch.allclose(w, torch.tensor([21.0, 1.0, 1.0]))
-    plain, _, _ = _preview()
-    assert plain.anchor_weight(at) is None
+def test_route_critic_features_distinguish_heading_while_legacy_layout_is_preserved():
+    task, hm, kin = _preview(heading=-10.0)
+    straight = _flat_state(-2.0, 0.37)
+    turned = _flat_state(-2.0, 0.37, yaw=math.pi / 2)
+    states = torch.cat((straight, turned))
+    # 旧critic完全不看航向，但世界路线奖励随航向变化，不能继续把它们映成同一输入。
+    assert torch.equal(state.features(states)[0], state.features(states)[1])
+    assert torch.allclose(task.critic_extra(states)[0], task.critic_extra(states)[1], atol=1e-6)
+    updated = preview_task.PreviewTask(hm, kin, task.pattern, task.limits, task.cfg, critic_route_features=True)
+    extra = updated.critic_extra(states)
+    assert updated.critic_extra_dim == task.critic_extra_dim + 2
+    assert torch.allclose(extra[:, :-2], task.critic_extra(states), atol=1e-6)
+    assert torch.allclose(extra[:, -2:], torch.tensor([[1.0, 0.0], [0.0, 1.0]]), atol=1e-6)
+    states.requires_grad_(True)
+    gradient = torch.autograd.grad(updated.critic_extra(states)[:, -1].sum(), states)[0]
+    assert torch.isfinite(gradient).all() and gradient[:, state.QUAT].abs().sum() > 0
 
 
 def test_preview_learner_runs_imagination_with_terrain_critic():
@@ -334,6 +314,36 @@ def test_preview_learner_runs_imagination_with_terrain_critic():
         s = state.integrate(s, torch.randn(4, state.DELTA_DIM) * 0.01)
     logs = learner.update()
     assert "actor_loss" in logs and learner.skipped_actor_updates == 0
+
+
+def test_balanced_imagination_keeps_requested_flat_fraction_and_matching_context():
+    torch.manual_seed(42)
+    task, _, kin = _preview()
+    cfg = SuperMimicCfg(num_envs=2, buffer_len=2, wm_hidden=(8,), actor_hidden=(8,), critic_hidden=(8,),
+                        imag_batch=20, imag_flat_fraction=0.4, context_dim=1)
+    learner = SuperMimicLearner(cfg, "cpu", task=task)
+    front_x = kin.wheel_centers_base(torch.zeros(1, 4), torch.zeros(1, 4))[0, 0, 0]
+    states = torch.cat((_flat_state(0.0, 0.37), _flat_state(1.5 - front_x - 0.20, 0.37)))
+    context = torch.tensor([[1.0], [2.0]])
+    learner.observe(states, torch.zeros(2, 12), torch.zeros(2, 12), torch.zeros(2, 3),
+                    torch.zeros(2, dtype=torch.bool), context)
+    batch = learner._sample_imagination_start()
+    flat = task.imagination_flat_mask(batch["state"])
+    assert flat.sum().item() == 8
+    assert batch["state"].shape == (20, 37)
+    assert torch.equal(batch["context"][:, 0], torch.where(flat, 1.0, 2.0))
+
+
+def test_balanced_imagination_uses_available_states_when_obstacles_are_absent():
+    task, _, _ = _preview()
+    cfg = SuperMimicCfg(num_envs=1, buffer_len=2, wm_hidden=(8,), actor_hidden=(8,), critic_hidden=(8,),
+                        imag_batch=20, imag_flat_fraction=0.4)
+    learner = SuperMimicLearner(cfg, "cpu", task=task)
+    learner.observe(_flat_state(0.0, 0.37), torch.zeros(1, 12), torch.zeros(1, 12), torch.zeros(1, 3),
+                    torch.zeros(1, dtype=torch.bool))
+    batch = learner._sample_imagination_start()
+    assert batch["state"].shape == (20, 37)
+    assert task.imagination_flat_mask(batch["state"]).all()
 
 
 def test_clamp_actor_reproduces_rsl_rl_linear_output_within_bound():
@@ -367,51 +377,8 @@ def test_clamp_actor_state_dict_loads_into_rsl_rl_mlp_unchanged():
     assert torch.allclose(rsl(x).clamp(-6.2831853, 6.2831853), a(x))
 
 
-def test_smooth_flat_penalizes_arm_motion_only_away_from_steps():
-    task, _, kin = _preview(smooth_flat_arm=-0.5, smooth_flat_ang=-5.0)
-    front_x = kin.wheel_centers_base(torch.zeros(1, 4), torch.zeros(1, 4))[0, 0, 0].item()
-    flat = _flat_state(0.0, 0.37)
-    near = _flat_state(1.5 - front_x - 0.10, 0.37)  # 前轮 0.10 m 外有 12 cm 台阶
-    for st in (flat, near):
-        jv = st[:, state.JVEL].clone(); jv[:, 0:4] = 1.0; st[:, state.JVEL] = jv
-        an = st[:, state.ANG].clone(); an[:, 1] = 0.4; st[:, state.ANG] = an
-    t_flat, t_near = task.shaping_terms(flat), task.shaping_terms(near)
-    assert math.isclose(t_flat["smooth_flat_arm"].item(), -0.5 * 4.0, rel_tol=1e-2)
-    assert math.isclose(t_flat["smooth_flat_ang"].item(), -5.0 * 0.16, rel_tol=1e-2)
-    assert t_near["smooth_flat_arm"].abs().item() < 1e-3 and t_near["smooth_flat_ang"].abs().item() < 1e-3
-    s = flat.clone().requires_grad_(True)
-    g = torch.autograd.grad(sum(v.sum() for v in task.shaping_terms(s).values()), s)[0]
-    assert torch.isfinite(g).all()
-
-
 # ---------------- 方案 B：车道横向偏移观测 ----------------
 from supermimic import lane_offset  # noqa: E402
-
-
-def test_lane_obs_appends_scaled_offset_and_padded_actor_matches_teacher():
-    hm, kin = _step_map(step_x=1.5), kinematics.RoverKinematics()
-    pattern = torch.tensor([[x, y, 20.0] for x in (0.0, 0.3, 0.6) for y in (-0.2, 0.2)])
-    task = preview_task.PreviewTask(hm, kin, pattern, torch.tensor([[-1.0, 1.0]] * 8), preview_task.PreviewRewardCfg(),
-                                    lane_center_y=torch.tensor([-8.0, 0.0, 8.0]), lane_obs=True)
-    assert task.obs_dim == task.base_obs_dim + 1
-    s = state.make_state(torch.tensor([[0.0, -0.10, 0.37], [0.0, 8.5, 0.37]]),
-                         quat.axis_angle_to_quat(torch.zeros(2, 3)), torch.zeros(2, 3), torch.zeros(2, 3),
-                         torch.zeros(2, 12), torch.zeros(2, 12)).requires_grad_(True)
-    cmd, prev = torch.tensor([[0.3, 0.0, 0.0]] * 2), torch.zeros(2, 12)
-    obs = task.policy_obs(s, cmd, prev)
-    # 与 env 侧 lane_offset_obs 同一公式：(y − 中心线) × 4，±4 截断（8.5 → +0.5 m → 2.0）
-    assert torch.allclose(obs[:, -1], torch.tensor([-0.4, 2.0]), atol=1e-5)
-    g = torch.autograd.grad(obs[:, -1].sum(), s)[0]
-    assert torch.allclose(g[:, 1], torch.full((2,), lane_offset.LANE_OBS_SCALE))  # 梯度经车体 y 回传
-    # 0 列补齐后的 actor 与原 Teacher 输出逐位相同，新输入不影响动作
-    torch.manual_seed(0)
-    teacher = Actor(task.base_obs_dim, (16,), 6.2831853, squash="clamp")
-    padded = Actor(task.obs_dim, (16,), 6.2831853, squash="clamp")
-    padded.load_state_dict(lane_offset.pad_first_layer(teacher.state_dict()))
-    with torch.no_grad():
-        assert torch.equal(padded(obs), teacher(obs[:, :-1]))
-    with pytest.raises(ValueError):
-        preview_task.PreviewTask(hm, kin, pattern, torch.tensor([[-1.0, 1.0]] * 8), lane_obs=True)
 
 
 def test_lane_marker_round_trip(tmp_path):
@@ -444,20 +411,6 @@ def test_replay_priority_sampling_prefers_flagged_rows():
     # 所以优先样本里约 0.19×4≈76% 含事件，整体约 (76%+19%)/2，即至少翻倍
     assert window_priority(0.5) > 2.0 * window_priority(0.0)
     assert rb.sample_states(64, priority_fraction=0.25)["state"].shape == (64, state.STATE_DIM)
-
-
-def test_terminated_penalty_and_event_priority():
-    task, _, kin = _preview(terminated=-20.0)
-    upright, cmd, zero = _flat_state(0.0, 0.37), torch.tensor([[0.3, 0.0, 0.0]]), torch.zeros(1, 12)
-    tipped = state.make_state(torch.tensor([[0.0, 0.0, 0.37]]), quat.axis_angle_to_quat(torch.tensor([[0.0, 1.5, 0.0]])),
-                              torch.zeros(1, 3), torch.zeros(1, 3), torch.zeros(1, 12), torch.zeros(1, 12))
-    assert task.reward_terms(upright, upright, cmd, zero, zero)["terminated"].abs().item() < 0.1
-    assert task.reward_terms(upright, tipped, cmd, zero, zero)["terminated"].item() < -19.0
-    plain, _, _ = _preview()
-    assert "terminated" not in plain.reward_terms(upright, upright, cmd, zero, zero)
-    front_x = kin.wheel_centers_base(torch.zeros(1, 4), torch.zeros(1, 4))[0, 0, 0].item()
-    near = _flat_state(1.5 - front_x - 0.10, 0.37)
-    assert task.event_priority(torch.cat((upright, near))).tolist() == [0.0, 1.0]
 
 
 def test_scratch_lane_gates_follow_cfg():

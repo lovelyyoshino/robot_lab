@@ -43,6 +43,25 @@ def test_same_role_and_teacher_to_student(contract):
     contract.validate_contract(sample("teacher"), sample("student"), teacher_source=True)
 
 
+@pytest.mark.parametrize("period", [0.0, 0.02])
+def test_restored_scan_timing_matches_runtime_without_loosening_other_fields(contract, period):
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(sim=SimpleNamespace(dt=0.005), decimation=4,
+                          scene=SimpleNamespace(height_scanner=SimpleNamespace(update_period=0.02)))
+    source = sample("teacher")
+    source["shared"]["height_scanner"] = {"update_period": period, "offset": [0.3, 0, 20]}
+    contract.restore_height_scan_period(cfg, source)
+    assert cfg.scene.height_scanner.update_period == period
+    target = copy.deepcopy(source)
+    target["shared"]["height_scanner"]["offset"][0] = 0.4
+    with pytest.raises(ValueError, match="合同不匹配"):
+        contract.validate_contract(source, target)
+    source["shared"]["height_scanner"]["update_period"] = 0.1
+    with pytest.raises(ValueError, match="扫描周期"):
+        contract.restore_height_scan_period(cfg, source)
+
+
 @pytest.mark.parametrize("source,target,distillation", [
     ("student", "student", True), ("teacher", "student", False), ("student", "teacher", False),
     ("teacher", "teacher", True),

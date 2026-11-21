@@ -10,9 +10,12 @@ lower_arm 只是平行四边形的另一根杆，不在轮子的运动链上，�
 
 @author pony
 @date 2026-10-26
-@version v0.1.0
-@last_modified 2026-10-26
+@version v0.3.0
+@last_modified 2026-11-06
 @changelog
+    - v0.3.0 (2026-11-06): com_base：由 URDF 质量得到的质心近似（三轮支撑稳定裕度用）。
+    - v0.2.0 (2026-11-05): FK 改用预计算的 R·K / R·K² 缓冲（R(θ)=I+sinθ·K+(1−cosθ)·K²），每个关节只剩
+      sin/cos 与一次小矩阵乘，前向+反向 aten 算子从 ~440 降到 ~90；旧的逐元素 Rodrigues 保留为参考实现。
     - v0.1.0 (2026-10-26): 初始创建
 """
 
@@ -40,9 +43,18 @@ def _rpy_matrix(r: float, p: float, y: float) -> torch.Tensor:
     ], dtype=torch.float64)
 
 
+def _skew(axis: torch.Tensor) -> torch.Tensor:
+    """axis: [..., 3] → 叉乘矩阵 K [..., 3, 3]（K·v = axis × v）。"""
+    x, y, z = axis.unbind(dim=-1)
+    o = torch.zeros_like(x)
+    return torch.stack((torch.stack((o, -z, y), -1), torch.stack((z, o, -x), -1), torch.stack((-y, x, o), -1)), -2)
+
+
 def _axis_angle_matrix(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
-    """Rodrigues，angle: [...]，axis: [3] 单位向量 → [..., 3, 3]，对 angle 可导。"""
-    x, y, z = axis.unbind()
+    """Rodrigues，angle: [...]，axis: [3] 单位向量 → [..., 3, 3]，对 angle 可导。
+
+    逐元素写法（9 次 stack），只作 wheel_centers_base_reference 的参考实现；训练路径用预计算缓冲。"""
+    x, y, z = axis.unbind(dim=-1)
     c, s = torch.cos(angle), torch.sin(angle)
     C = 1.0 - c
     rows = [
@@ -90,17 +102,56 @@ class RoverKinematics(torch.nn.Module):
             mimic.append((float(m.get("multiplier", "1")), float(m.get("offset", "0"))))
             coll = links[f"{corner}_wheel"].find("collision")
             wheel_offset.append(origin(coll)[0] if coll is not None else torch.zeros(3, dtype=torch.float64))
-        for key, value in tensors.items():
-            self.register_buffer(key, torch.stack(value).float())
+        stacked = {key: torch.stack(value) for key, value in tensors.items()}
+        for key, value in stacked.items():
+            self.register_buffer(key, value.float())
         self.register_buffer("mimic", torch.tensor(mimic, dtype=torch.float32))
         self.register_buffer("wheel_offset", torch.stack(wheel_offset).float())
+        # Rodrigues 展开：frame(θ) = R·Rot(θ) = R + sinθ·(R·K) + (1−cosθ)·(R·K²)。三块在 float64 里预乘后拼成
+        # [4, 9, 3]，每个关节一次小矩阵乘得到三组基向量，再按 (1, sinθ, 1−cosθ) 加权；对 θ 可导。
+        for name in names[:3]:
+            R, K = stacked[f"{name}_R"], _skew(stacked[f"{name}_axis"])
+            self.register_buffer(f"{name}_basis", torch.cat((R, R @ K, R @ K @ K), dim=-2).float())
+        wheel_center = stacked["wheel_t"] + (stacked["wheel_R"] @ torch.stack(wheel_offset).unsqueeze(-1)).squeeze(-1)
+        self.register_buffer("wheel_center_link", wheel_center.float())
+
+        # 质量模型（URDF inertial）：车体质量放在其惯性原点；每条腿 驱动+轮 的质量记在轮心，
+        # 摆臂/转向/下摆臂的质量记在髋（arm 关节原点）与轮心的中点。只用于质心投影，误差 ~1 cm。
+        def mass(name):
+            inertial = links[name].find("inertial") if name in links else None
+            if inertial is None:
+                return 0.0, torch.zeros(3, dtype=torch.float64)
+            return float(inertial.find("mass").get("value")), origin(inertial)[0]
+
+        base_mass, base_com = mass("base_link")
+        wheel_assy = [mass(f"{c}_qudong")[0] + mass(f"{c}_wheel")[0] for c in CORNERS]
+        arm_assy = [sum(mass(f"{c}_{part}")[0] for part in ("arm", "zhuanxiang", "lower_arm")) for c in CORNERS]
+        self.register_buffer("base_mass", torch.tensor(base_mass, dtype=torch.float32))
+        self.register_buffer("base_com", base_com.float())
+        self.register_buffer("wheel_assy_mass", torch.tensor(wheel_assy, dtype=torch.float32))
+        self.register_buffer("arm_assy_mass", torch.tensor(arm_assy, dtype=torch.float32))
+        self.register_buffer("total_mass", torch.tensor(base_mass + sum(wheel_assy) + sum(arm_assy), dtype=torch.float32))
 
     def _rot(self, axes, angle):
         # axes: [4,3]，angle: [..., 4] → [..., 4, 3, 3]
-        return torch.stack([_axis_angle_matrix(axes[i], angle[..., i]) for i in range(4)], dim=-3)
+        return _axis_angle_matrix(axes, angle)
 
     def wheel_centers_base(self, arm: torch.Tensor, steer: torch.Tensor) -> torch.Tensor:
-        """arm/steer: [..., 4] 绝对关节角 → 轮心在 base_link 系 [..., 4, 3]。"""
+        """arm/steer: [..., 4] 绝对关节角 → 轮心在 base_link 系 [..., 4, 3]。
+
+        p ← t + R·Rot(θ)·p，自下而上 qudong(steer) → zhuanxiang(mimic) → arm；与 wheel_centers_base_reference
+        数值等价（float32 下 <1e-6 m），算子数约为其 1/5。"""
+        zx = self.mimic[:, 0] * arm + self.mimic[:, 1]
+        p = self.wheel_center_link
+        for name, angle in (("qudong", steer), ("zhuanxiang", zx), ("arm", arm)):
+            # [4,9,3] @ [...,4,3,1] → [...,4,9,1] → [...,4,3(基),3(xyz)]
+            v = torch.matmul(getattr(self, f"{name}_basis"), p.unsqueeze(-1)).unflatten(-2, (3, 3)).squeeze(-1)
+            p = (getattr(self, f"{name}_t") + v[..., 0, :] + angle.sin().unsqueeze(-1) * v[..., 1, :]
+                 + (1.0 - angle.cos()).unsqueeze(-1) * v[..., 2, :])
+        return p
+
+    def wheel_centers_base_reference(self, arm: torch.Tensor, steer: torch.Tensor) -> torch.Tensor:
+        """v0.1 的逐元素 Rodrigues 实现，仅供数值核对（单测与基准）。"""
         zx = self.mimic[:, 0] * arm + self.mimic[:, 1]
         # 自下而上累乘：p = t_arm + R_arm·Rot(θ)·(t_zx + R_zx·Rot(−θ)·(t_qd + R_qd·Rot(φ)·(t_w + R_w·offset)))
         p = self.wheel_t + (self.wheel_R @ self.wheel_offset.unsqueeze(-1)).squeeze(-1)
@@ -110,6 +161,12 @@ class RoverKinematics(torch.nn.Module):
             frame = getattr(self, f"{name}_R") @ rot
             p = getattr(self, f"{name}_t") + (frame @ p.unsqueeze(-1)).squeeze(-1)
         return p
+
+    def com_base(self, wheel_centers_base: torch.Tensor) -> torch.Tensor:
+        """wheel_centers_base [..., 4, 3] → 整车质心在 base 系 [..., 3]（见 __init__ 的质量模型）。"""
+        legs = (self.wheel_assy_mass[:, None] * wheel_centers_base
+                + self.arm_assy_mass[:, None] * 0.5 * (self.arm_t + wheel_centers_base)).sum(-2)
+        return (self.base_mass * self.base_com + legs) / self.total_mass
 
     def wheel_centers_world(self, pos_w, quat_w, arm, steer) -> torch.Tensor:
         local = self.wheel_centers_base(arm, steer)

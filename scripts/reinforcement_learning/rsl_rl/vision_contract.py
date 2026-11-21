@@ -204,6 +204,15 @@ def validate_scan_student(policy_path, current_depth_contract) -> Path:
     return contract_path
 
 
+def restore_height_scan_period(env_cfg, source):
+    """恢复模型保存的扫描周期；0表示同步采样，旧模型保留控制周期，其他合同字段仍严格校验。"""
+    period = source["shared"]["height_scanner"]["update_period"]
+    control_dt = env_cfg.sim.dt * env_cfg.decimation
+    if period not in (0.0, control_dt):
+        raise ValueError(f"不支持的高度扫描周期 {period}，只支持同步采样或控制周期 {control_dt}")
+    env_cfg.scene.height_scanner.update_period = period
+
+
 def validate_supermimic_terrain(policy_path, target) -> Path:
     """supermimic 越障策略（TorchScript，232→12）：核对 run 目录 params/vision_contract.json 与当前 Teacher-Preview 合同。
 

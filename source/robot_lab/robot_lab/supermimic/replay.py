@@ -1,21 +1,22 @@
 """
 replay.py — 按 [时间, 环境] 存储的环形回放，供世界模型窗口训练和想象起点采样。
 
+@author pony
+@date 2026-10-26
+@version v0.4.0
+@last_modified 2026-11-04
+@changelog
+    - (2026-11-04): 窗口事件优先级只计有效前缀；状态采样仍允许终止动作前的真实状态。
+    - v0.4.0 (2026-10-28): 每行可存优先级（台阶边/翻车等关键事件），窗口与起点按 priority_fraction 混合采样。
+    - v0.3.0 (2026-10-26): 存真实奖励与真终止标记，供 critic 拟合真实回报。
+    - v0.2.0 (2026-10-26): 新增 context（ξ）与 aux（env 关节加速度项）两列。
+    - v0.1.0 (2026-10-26): 初始创建
+
 第 t 行存"动作前"的状态、该步动作、上一动作（即观测里的 last_action）、命令、
 动力学上下文 ξ（该回合的执行器增益/质量等），以及 done[t]=该步之后回合是否结束、
 aux[t]=该步 env 实际算出的辅助监督量（关节加速度平方和，见 rover_task）。
 done 之后的下一行是 reset 后的新状态，不是物理后继，所以任何跨过 done 的转移都必须掩掉；
 终止和超时截断一视同仁。
-
-@author pony
-@date 2026-10-26
-@version v0.4.0
-@last_modified 2026-10-28
-@changelog
-    - v0.4.0 (2026-10-28): 每行可存优先级（台阶边/翻车等关键事件），窗口与起点按 priority_fraction 混合采样。
-    - v0.3.0 (2026-10-26): 存真实奖励与真终止标记，供 critic 拟合真实回报。
-    - v0.2.0 (2026-10-26): 新增 context（ξ）与 aux（env 关节加速度项）两列。
-    - v0.1.0 (2026-10-26): 初始创建
 """
 
 from __future__ import annotations
@@ -66,7 +67,7 @@ class ReplayBuffer:
     def _physical(self, logical: torch.Tensor) -> torch.Tensor:
         return (self.ptr - self.size + logical) % self.capacity
 
-    def _pick(self, batch: int, high: int, length: int, priority_fraction: float):
+    def _pick(self, batch: int, high: int, length: int, priority_fraction: float, valid_prefix: bool = True):
         """(逻辑起点, env)；priority_fraction 的样本从 4 倍候选里挑窗口内优先级最高的（go2w 事件优先回放的做法）。"""
         start = torch.randint(0, high, (batch,), device=self.device)
         env = torch.randint(0, self.num_envs, (batch,), device=self.device)
@@ -76,7 +77,13 @@ class ReplayBuffer:
         cs = torch.randint(0, high, (4 * n,), device=self.device)
         ce = torch.randint(0, self.num_envs, (4 * n,), device=self.device)
         rows = self._physical(cs[:, None] + torch.arange(max(length, 1), device=self.device)[None, :])
-        score = self.priority[rows, ce[:, None].expand_as(rows)].amax(-1) + 1e-3 * torch.rand(4 * n, device=self.device)
+        cols = ce[:, None].expand_as(rows)
+        priority = self.priority[rows, cols]
+        if valid_prefix:
+            # reset之后的事件不会参与该窗口监督，不能用它把无效窗口排到采样前列。
+            valid = (~self.done[rows, cols]).float().cumprod(-1)
+            priority = priority * valid
+        score = priority.amax(-1) + 1e-3 * torch.rand(4 * n, device=self.device)
         top = score.topk(n).indices
         start[:n], env[:n] = cs[top], ce[top]
         return start, env
@@ -110,7 +117,7 @@ class ReplayBuffer:
     def sample_states(self, batch: int, priority_fraction: float = 0.0) -> dict[str, torch.Tensor]:
         if self.size == 0:
             raise RuntimeError("回放为空")
-        start, cols = self._pick(batch, self.size, 1, priority_fraction)
+        start, cols = self._pick(batch, self.size, 1, priority_fraction, valid_prefix=False)
         rows = self._physical(start)
         return {
             "state": self.state[rows, cols],

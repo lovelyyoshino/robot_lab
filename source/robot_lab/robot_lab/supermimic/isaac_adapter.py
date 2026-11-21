@@ -2,6 +2,8 @@
 isaac_adapter.py — 从 Isaac Lab ManagerBasedRLEnv 读出 SuperMimic 扁平状态、命令、上一动作、
 动力学上下文 ξ 与关节加速度监督量。
 
+@author pony
+
 必须在 AppLauncher 启动之后导入。关节按动作合同顺序（arm4, steer4, wheel4）取 12 个
 主动关节，8 个 mimic 从动关节不读；位置减 default_joint_pos，与 joint_pos_rel 观测同口径。
 
@@ -9,13 +11,14 @@ isaac_adapter.py — 从 Isaac Lab ManagerBasedRLEnv 读出 SuperMimic 扁平状
 - 8 个腿关节 Kp / 默认 Kp、12 个关节 Kd / 默认 Kd：randomize_actuator_gains 每次 reset 在 0.5–2 倍间
   重抽，是 rover 平地动力学里最大的未观测变量；
 - 整车质量 / 默认质量、base 质量增量 (kg)、base 质心 (3)：startup 随机化，启动后缓存。
-摩擦未纳入：startup 摩擦按 shape 抽样、与 body 的映射不稳定，且轮子摩擦区间（≥8）实际不打滑。
+可选追加四轮静摩擦/动摩擦/恢复系数（12维）；视觉任务摩擦较低，不能沿用普通轮车的高摩擦假设。
 
-@author pony
 @date 2026-10-26
-@version v0.3.0
-@last_modified 2026-10-26
+@version v0.4.0
+@last_modified 2026-11-05
 @changelog
+    - (2026-11-05): exact_riser_fn 一次批量投射四轮水平立面射线，替换只看前轮的预抬边缘函数。
+    - v0.4.0 (2026-11-02): 保留PhysX原生四元数精度，与RayCaster使用同一姿态计算扫描。
     - v0.3.1 (2026-10-26): 新增 exact_scan_fn（直通前向的真实射线扫描）与 leg_soft_limits。
     - v0.3.0 (2026-10-26): world_frame 选项；新增 build_height_map / scan_pattern_base（地形任务）。
     - v0.2.0 (2026-10-26): 新增 context()（ξ）与 acc_aux()（env 关节加速度项真值）。
@@ -32,11 +35,12 @@ from .rover_task import ACC_AUX_NAMES
 from .state import NUM_LEG_JOINTS, make_state
 
 CONTEXT_DIM = NUM_LEG_JOINTS + 12 + 1 + 1 + 3
+CONTACT_CONTEXT_DIM = CONTEXT_DIM + 4 * 3
 
 
 class RoverStateReader:
     def __init__(self, env, asset_name: str = "robot", command_name: str = "base_velocity",
-                 base_body: str = "base_link", world_frame: bool = False):
+                 base_body: str = "base_link", world_frame: bool = False, contact_context: bool = False):
         """world_frame=True：位置保留世界坐标（地形任务需要它去查全局高度图）；
         平地任务默认减 env 原点，只为数值小。"""
         self.env = env.unwrapped
@@ -48,6 +52,8 @@ class RoverStateReader:
             raise ValueError(f"关节顺序与动作合同不符: {names}")
         self.joint_ids = torch.tensor(ids, device=self.env.device)
         self._static_context = self._read_static_context(base_body)
+        self.material_context = self._read_wheel_materials() if contact_context else None
+        self.context_dim = CONTACT_CONTEXT_DIM if contact_context else CONTEXT_DIM
 
     # ---------------- 状态 ----------------
     def state(self) -> torch.Tensor:
@@ -55,8 +61,10 @@ class RoverStateReader:
         ids = self.joint_ids
         # 平地：减 env 原点只为数值不过大，世界模型本身对平移不变；地形：必须是世界系才能查高度图。
         pos = data.root_pos_w if self.world_frame else data.root_pos_w - self.env.scene.env_origins
+        # RayCaster直接使用PhysX姿态；再次归一化造成的1e-7误差会在台阶边切换命中表面。
         return make_state(pos, data.root_quat_w, data.root_lin_vel_b, data.root_ang_vel_b,
-                          data.joint_pos[:, ids] - data.default_joint_pos[:, ids], data.joint_vel[:, ids])
+                          data.joint_pos[:, ids] - data.default_joint_pos[:, ids], data.joint_vel[:, ids],
+                          normalize_quat=False)
 
     def command(self) -> torch.Tensor:
         return self.env.command_manager.get_command(self.command_name).clone()
@@ -91,6 +99,21 @@ class RoverStateReader:
             kd[:, idx] = actuator.damping
         return kp[:, self.joint_ids], kd[:, self.joint_ids]
 
+    def _read_wheel_materials(self) -> torch.Tensor:
+        from .kinematics import CORNERS
+
+        term = self.env.event_manager.get_term_cfg("randomize_wheel_rigid_body_material").func
+        counts = term.num_shapes_per_body
+        view = self.robot.root_physx_view
+        if counts is None or sum(counts) != view.max_shapes:
+            raise RuntimeError("逐轮接触上下文需要经过校验的body到碰撞shape映射")
+        ids, _ = self.robot.find_bodies([f"{corner}_wheel" for corner in CORNERS], preserve_order=True)
+        if len(ids) != 4 or any(counts[i] != 1 for i in ids):
+            raise RuntimeError("逐轮接触上下文要求四个轮子各有一个碰撞shape")
+        shapes = [sum(counts[:i]) for i in ids]
+        # 复用Isaac事件的shape映射读取实际抽样值；startup材料仅在此读取一次。
+        return view.get_material_properties()[:, shapes, :].flatten(1).to(self.env.device).clone()
+
     def context(self) -> torch.Tensor:
         kp, kd = self._gains()
         ids = self.joint_ids
@@ -99,7 +122,10 @@ class RoverStateReader:
         # 轮子 Kp 恒为 0，只取 8 个腿关节的 Kp 比；默认值为 0 的 Kd 比记 1。
         kp_ratio = (kp / kp0.clamp_min(1e-6))[:, :NUM_LEG_JOINTS]
         kd_ratio = torch.where(kd0 > 1e-6, kd / kd0.clamp_min(1e-6), torch.ones_like(kd))
-        return torch.cat((kp_ratio, kd_ratio, self._static_context), dim=-1)
+        parts = [kp_ratio, kd_ratio, self._static_context]
+        if self.material_context is not None:
+            parts.append(self.material_context)
+        return torch.cat(parts, dim=-1)
 
     # ---------------- 关节加速度监督量 ----------------
     def acc_aux(self) -> torch.Tensor:
@@ -173,21 +199,48 @@ def scan_pattern_base(env, sensor_name: str = "height_scanner") -> torch.Tensor:
 
 def exact_scan_fn(env, pattern_b: torch.Tensor, sensor_name: str = "height_scanner"):
     """返回 f(state) → [B, P]：按想象位姿对真实地形网格做射线投射，公式同 height_scan，供直通前向使用。"""
+    from isaaclab.utils.math import quat_apply_yaw
     from isaaclab.utils.warp import raycast_mesh
 
     from .state import POS, QUAT
-    from .terrain_map import SCAN_CLIP, SCAN_OFFSET, scan_points_xy
+    from .terrain_map import SCAN_CLIP, SCAN_OFFSET
 
     sensor = env.unwrapped.scene.sensors[sensor_name]
     mesh = sensor.meshes[sensor.cfg.mesh_prim_paths[0]]
 
     def fn(state: torch.Tensor) -> torch.Tensor:
-        xy = scan_points_xy(state[:, POS], state[:, QUAT], pattern_b)  # [B, P, 2]
-        starts = torch.cat((xy, torch.full_like(xy[..., :1], 20.0) + state[:, None, 2:3]), dim=-1)
-        down = torch.zeros_like(starts)
-        down[..., 2] = -1.0
-        hits = raycast_mesh(starts.contiguous(), down, mesh=mesh, max_dist=1e3)[0]
+        # 前向必须复用RayCaster的归一化、旋转算子和offset；台阶边缘的微小舍入差也会切换命中面。
+        starts = quat_apply_yaw(state[:, QUAT].repeat(1, pattern_b.shape[0]),
+                                pattern_b.expand(state.shape[0], -1, -1))
+        starts += state[:, None, POS]
+        down = sensor.ray_directions[0].expand_as(starts).contiguous()
+        hits = raycast_mesh(starts.contiguous(), down, mesh=mesh, max_dist=sensor.cfg.max_distance)[0]
         return (state[:, None, 2] - hits[..., 2] - SCAN_OFFSET).clamp(*SCAN_CLIP)
+
+    return fn
+
+
+def exact_riser_fn(env, sensor_name: str = "height_scanner", max_dist: float = 0.75):
+    """返回 f(starts [..., 3], directions [..., 3]) → 水平射线到地形网格的距离 [...]（未命中为 inf）。
+
+    PreviewTask 每个状态只调用一次，四个轮同批：起点 = 轮心 xy、轮底 + riser_min_height，方向 = 航向。
+    仅用于训练奖励/统计，不进入 Actor 观测；不反传。"""
+    from isaaclab.utils.warp import raycast_mesh
+
+    sensor = env.unwrapped.scene.sensors[sensor_name]
+    mesh = sensor.meshes[sensor.cfg.mesh_prim_paths[0]]
+
+    @torch.no_grad()
+    def fn(starts, directions):
+        shape = starts.shape[:-1]
+        starts, directions = starts.reshape(-1, 3), directions.reshape(-1, 3)
+        # 非有限起点不能送入 Warp；置零后按未命中处理。
+        valid = torch.isfinite(starts).all(-1)
+        safe = torch.where(valid[:, None], starts, torch.zeros_like(starts)).contiguous()
+        # Warp 射线接口要求 [B, N, 3]；这里把全部射线当作一个批次送入，再取回 [N]。
+        distance = raycast_mesh(safe[None], directions.contiguous()[None], mesh=mesh, max_dist=max_dist,
+                                return_distance=True)[1][0]
+        return torch.where(valid, distance, torch.inf).reshape(shape)
 
     return fn
 

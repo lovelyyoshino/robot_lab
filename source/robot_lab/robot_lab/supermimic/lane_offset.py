@@ -3,7 +3,7 @@ lane_offset.py — 越障方案 B：给 SuperMimic actor 追加 1 维"相对车�
 
 为什么只给 SuperMimic actor 加、不改 Teacher：
 - 16 cm 侧漂发生在爬台阶期间（Teacher 也偏 0.5 m），策略原观测看不到横向位置（扫描 ±0.5 m、车道 3 m、无 base_lin_vel），
-  v5 只在奖励里罚偏移，策略看不到就学不会纠正；
+  旧方案只在奖励里罚偏移，策略看不到就学不会纠正；
 - 新列权重初始化为 0（pad_first_layer），训练起点与 Teacher 完全相同，纠偏能力只靠世界模型梯度学出来。
 
 约定：
