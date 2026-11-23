@@ -4,8 +4,8 @@ train_terrain.py — SuperMimic 越障训练：从零（无 PPO Teacher、无监
 
 @author pony
 @date 2026-10-26
-@version v0.22.0
-@last_modified 2026-11-19
+@version v0.23.0
+@last_modified 2026-11-21
 
 流程：
 1. 前 --warmup_iterations 轮只拟合世界模型（地形输入 relief_features），之后每轮 actor 在想象中按 PreviewTask 的
@@ -20,6 +20,10 @@ train_terrain.py — SuperMimic 越障训练：从零（无 PPO Teacher、无监
 （232→12）、params/vision_contract.json（部署合同）、params/supermimic_terrain.json（全部参数与实现哈希）。
 
 @changelog
+    - v0.23.0 (2026-11-21): --course（preview_task v0.24.0 车轮行进方向对准路线）、--curriculum_goal_lane_termination
+      （obstacle_terrain v1.7.0：0 = 到终点不看横偏一律成功截断）。日志新增回合结局分类：term_<终止项> 每步触发率；
+      end/<地形>_<终止项>_share 各地形回合按结束原因的占比；end/<地形>_goal_lat_mean / _gt15 / _gt40 到终点时 |y| 的
+      均值和超过 0.15 / 0.40 m 的比例；end/<地形>_course_deg 行进方向误差 |ψ + δ̄| 的均值（度）。只在记录日志的轮统计。
     - v0.22.0 (2026-11-19): --post_climb_relief / --post_climb_window_m（preview_task v0.23.0 登顶后回正窗口）。
     - v0.21.0 (2026-11-19): --tilt_temperature（软存活 sigmoid 的温度；与 --terminated 一起决定想象里翻车代价从多大倾角开始计入）。
     - v0.20.0 (2026-11-18): --leg_action_bound：腿关节动作上界取 min(2π, 饱和界)（摆臂 ≈ ±2.72，转向与轮子不变；networks v0.5.0），
@@ -87,7 +91,7 @@ REWARD_FLAGS = (
     ("heading_huber_delta", float), ("yaw_rate", float), ("stairs_slant_deg", float), ("stairs_slant_zone_m", float),
     ("single_slant_deg", float), ("lateral_vel", float),
     ("lateral_vel_delta", float), ("obstacle_lateral_vel_scale", float),
-    ("lane", float), ("steering", float), ("flat_neutral", float),
+    ("lane", float), ("steering", float), ("course", float), ("flat_neutral", float),
     ("rest_clearance", float), ("flat_lookahead", float), ("toe", float), ("flat_steer", float),
     ("wheel_sync", float), ("wheel_sync_delta", float), ("wheel_slip", float),
     ("wheel_slip_delta", float), ("stand_yaw_rate", float), ("stand_yaw_rate_delta", float),
@@ -120,7 +124,7 @@ CURRICULUM_FLAGS = ("promote_m", "success_lane_m", "demote_ratio", "posture_bad_
                     "stairs_collision_frac", "fail_lane_m", "roll_limit_deg", "pitch_dev_limit_deg",
                     "stairs_explore_frac", "stairs_demote_ratio", "stall_truncate_s", "freeze", "promote_streak",
                     "demote_streak", "stairs_promote_streak", "stairs_demote_streak", "freeze_non_stairs",
-                    "stairs_min_level", "stairs_success_lane_m")
+                    "stairs_min_level", "stairs_success_lane_m", "goal_lane_termination")
 
 parser = argparse.ArgumentParser(description="SuperMimic obstacle terrain training (from scratch)")
 parser.add_argument("--task", default=DEFAULT_TASK)
@@ -457,9 +461,11 @@ def main():
     min_rows = max(cfg.wm_window, cfg.real_return_window if cfg.critic_real_returns else 0) + 2
     start_time = time.time()
     lane_strict = float(curriculum_cfg["stairs_success_lane_m"]) or float(curriculum_cfg["success_lane_m"])
+    env_kinds = kinds[terrain.terrain_types]
     for it in range(learner.iteration, args_cli.iterations):
         log_now = it % args_cli.log_interval == 0
         sums: dict[str, torch.Tensor] = {}
+        tallies: dict[str, torch.Tensor] = {}  # 回合结局分类：按环境求和（不是平均），记录日志时再除
         if args_cli.stairs_lane_schedule is not None:
             # 先爬上去、后期再收紧车道：楼梯成功车道 fail_lane_m → lane_strict，楼梯区车道代价 ×0 → ×1
             lane_scale = obstacle_terrain.lane_schedule_scale(it, *args_cli.stairs_lane_schedule)
@@ -472,6 +478,10 @@ def main():
         def add(key, value):
             value = value.float().mean()
             sums[key] = sums[key] + value if key in sums else value
+
+        def tally(key, value):
+            value = value.float().sum()
+            tallies[key] = tallies[key] + value if key in tallies else value
 
         for step in range(args_cli.steps_per_iter):
             s, prev, ctx = reader.state(), reader.last_action(), reader.context()
@@ -517,6 +527,29 @@ def main():
                     add("roll_deg", roll * 180.0 / math.pi)
                     add("pitch_dev_deg", pitch_dev * 180.0 / math.pi)
                     add("pitch_rate_rms", s[:, 11].square())
+                    # 回合结局：终止项在 env.step 内、reset 之前算好，get_term 仍是这一步的值；
+                    # obstacle_goal_rel 是同一时刻相对块原点的位置（obstacle_terrain v1.7.0）
+                    tm = uenv.termination_manager
+                    term_now = {name: tm.get_term(name) for name in tm.active_terms}
+                    for name, hit in term_now.items():
+                        add(f"term_{name}", hit)
+                    rel_end = getattr(uenv, "obstacle_goal_rel", None)
+                    course_deg = torch.rad2deg(task.course_error(s).clamp(-1.0, 1.0).asin().abs())
+                    for kind, kname in obstacle_terrain.KIND_NAMES.items():
+                        mask = env_kinds == kind
+                        ended = done & mask
+                        tally(f"end_{kname}_n", ended)
+                        for name, hit in term_now.items():
+                            tally(f"end_{kname}_{name}", hit & ended)
+                        tally(f"course_{kname}_sum", course_deg * mask)
+                        tally(f"course_{kname}_n", mask)
+                        if rel_end is not None:
+                            goal = ended & (rel_end[:, 0] >= curriculum_cfg["promote_m"])
+                            lat = rel_end[:, 1].abs()
+                            tally(f"goal_{kname}_n", goal)
+                            tally(f"goal_{kname}_lat", lat * goal)
+                            tally(f"goal_{kname}_gt15", goal & (lat > 0.15))
+                            tally(f"goal_{kname}_gt40", goal & (lat > 0.40))
                     add("stall_1s_fraction", stall_steps > stall_limit)
                     add("stall_truncated", stall_cut)
                     add("route_vel_err", (cmd[:, 0] - quat_apply(s[:, QUAT], s[:, LIN])[:, 0]).abs())
@@ -547,6 +580,19 @@ def main():
                     logs[f"curriculum/stairs_{key}_episodes"] = decisions.get(f"stairs_{key}_episodes", 0)
                     logs[f"curriculum/stairs_{key}_pass_rate"] = (decisions.get(f"stairs_{key}_passed", 0)
                                                                   / max(decisions.get(f"stairs_{key}_episodes", 0), 1))
+            # 回合结局分类（只在记录日志的轮统计；键在第一行就全部出现，CSV 表头固定）
+            got = {k: v.item() for k, v in tallies.items()}
+            for kname in obstacle_terrain.KIND_NAMES.values():
+                ends = max(got.get(f"end_{kname}_n", 0.0), 1.0)
+                logs[f"end/{kname}_episodes"] = got.get(f"end_{kname}_n", 0.0)
+                for name in uenv.termination_manager.active_terms:
+                    logs[f"end/{kname}_{name}_share"] = got.get(f"end_{kname}_{name}", 0.0) / ends
+                goals = max(got.get(f"goal_{kname}_n", 0.0), 1.0)
+                logs[f"end/{kname}_goal_lat_mean"] = got.get(f"goal_{kname}_lat", 0.0) / goals
+                logs[f"end/{kname}_goal_lat_gt15"] = got.get(f"goal_{kname}_gt15", 0.0) / goals
+                logs[f"end/{kname}_goal_lat_gt40"] = got.get(f"goal_{kname}_gt40", 0.0) / goals
+                logs[f"end/{kname}_course_deg"] = (got.get(f"course_{kname}_sum", 0.0)
+                                                   / max(got.get(f"course_{kname}_n", 0.0), 1.0))
             logs["elapsed_min"] = (time.time() - start_time) / 60
             for k, v in logs.items():
                 writer.add_scalar(f"supermimic_terrain/{k}", v, it)

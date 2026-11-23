@@ -3,9 +3,12 @@
 
 @author pony
 @date 2026-09-16
-@version v0.12.0
-@last_modified 2026-11-07
+@version v0.13.0
+@last_modified 2026-11-21
 @changelog
+    - v0.13.0 (2026-11-21): 软判（只记录）：爬升协议下另算 stable_soft = 去掉 |y| ≤ 0.15 m 的 stable，单独计保持
+      hold_time_s，连续保持够了就在 _acceptance_sample["soft_ok"] 记真；不参与终止，原判、截断与门完全不变
+      （acceptance_metrics v1.3.0 按它记每回合软成功与扣分）。
     - v0.12.0 (2026-11-07): --supermimic_terrain 未给 --wheel_friction 时用 terrain_env_cfg.WHEEL_FRICTION（固定 μ=1.0），
       与 SuperMimic 训练任务一致，并记入 terrain_override。
     - v0.11.0 (2026-11-07): 诊断参数 --wheel_friction STATIC DYNAMIC（固定轮胎摩擦，验证楼梯后轴对摩擦的依赖）。
@@ -187,23 +190,31 @@ def capture_traversal(env, *, scenario: str):
         in_lane = (relative[:, 1].abs() <= 0.75) & (relative[:, 0] <= 3.75)
         fallen = ~finite | ~climb_upright | ~in_lane
         stable = (relative[:, 0] >= protocol["target_distance_m"]) & ~fallen & upright
-        stable &= (relative[:, 1].abs() <= 0.15) & (alignment >= 0.8)
+        stable &= alignment >= 0.8
         stable &= hit_finite.all(-1) & support["supported"]
         if "total_height_m" in protocol:
             # 后轮与车身须真正登顶；绕楼梯从侧边平地通过不能冒充爬楼成功。
             ground_height = hits[..., 2] - env.scene.env_origins[:, None, 2]
             stable &= ground_height.amin(-1) >= protocol["total_height_m"] - 0.02
+        # 软判：除横偏 ≤0.15 m 外与 stable 相同（|y| ≤ 0.75 m 已在 fallen 里）；只记录，不终止
+        stable_soft = stable.clone()
+        stable &= relative[:, 1].abs() <= 0.15
         squared_error = (robot.data.root_lin_vel_w[:, 0] - protocol["command_velocity_m_s"]).square()
         if not hasattr(env, "_vision_eval_hold_steps"):
             env._vision_eval_hold_steps = torch.zeros(env.num_envs, dtype=torch.long, device=relative.device)
             env._vision_eval_max_progress = torch.zeros(env.num_envs, device=relative.device)
+            env._vision_eval_soft_hold_steps = torch.zeros(env.num_envs, dtype=torch.long, device=relative.device)
         fresh = env.episode_length_buf <= 1
         env._vision_eval_hold_steps[fresh] = 0
+        env._vision_eval_soft_hold_steps[fresh] = 0
         safe_progress = torch.nan_to_num(relative[:, 0], nan=0., posinf=0., neginf=0.)
         env._vision_eval_max_progress[fresh] = safe_progress[fresh]
         env._vision_eval_hold_steps = torch.where(stable, env._vision_eval_hold_steps + 1, 0)
         env._vision_eval_max_progress = torch.maximum(env._vision_eval_max_progress, safe_progress)
-        env._vision_eval_confirmed = env._vision_eval_hold_steps >= math.ceil(protocol["hold_time_s"] / env.step_dt - 1e-9)
+        hold_steps = math.ceil(protocol["hold_time_s"] / env.step_dt - 1e-9)
+        env._vision_eval_confirmed = env._vision_eval_hold_steps >= hold_steps
+        env._vision_eval_soft_hold_steps = torch.where(stable_soft, env._vision_eval_soft_hold_steps + 1, 0)
+        env._vision_eval_soft_confirmed = env._vision_eval_soft_hold_steps >= hold_steps
     env._vision_eval_sample = (
         stable.cpu().tolist(), finite.cpu().tolist(),
         relative[:, 0].cpu().tolist(), squared_error.cpu().tolist(),
@@ -220,6 +231,9 @@ def capture_traversal(env, *, scenario: str):
         from acceptance_metrics import capture_acceptance_sample
 
         env._acceptance_sample = capture_acceptance_sample(env, sample, finite)
+        soft = getattr(env, "_vision_eval_soft_confirmed", None)
+        if soft is not None:
+            env._acceptance_sample["soft_ok"] = soft.cpu().tolist()
     if scenario in STEP_FRONT_WHEELS:
         # 固定地形前缘比离散扫描命中的栅格更准确；必须在自动reset前测量。
         terrain = env.cfg.scene.terrain.terrain_generator.sub_terrains[scenario]

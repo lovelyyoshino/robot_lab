@@ -3,8 +3,8 @@ preview_task.py — SuperMimic 越障任务的可导版本：232 维观测（45 
 
 @author pony
 @date 2026-10-26
-@version v0.23.0
-@last_modified 2026-11-19
+@version v0.24.0
+@last_modified 2026-11-21
 
 越障目标（真实回报与想象回报共用同一函数，每项权重见 PreviewRewardCfg）：
   1 速度跟踪（立面前 slow_band_m 内允许减速到 min(cmd, slow_band_speed)）+ 世界系前进 + 停滞代价；
@@ -45,6 +45,12 @@ preview_task.py — SuperMimic 越障任务的可导版本：232 维观测（45 
 地形几何（轮位、立面距离、θ_ref、平地门、支撑裕度）由 terrain_context 每个状态计算一次，所有奖励项共享。
 
 @changelog
+    - v0.24.0 (2026-11-21): course（默认 0 = 原行为）：车轮行进方向对准路线 course·sin²(ψ + δ̄)，δ̄ 为四轮转向角平均
+      （同相分量；反相分量 = 转车头，不受约束）。actor 看不到横向位置 y，但看得到航向（路线命令转到车体系）和自己的
+      转向角，δ̄ = −ψ 时四个轮子整体沿路线滚、车身不横移。r27@36k 在 16×40 楼梯上同相 ÷ 航向 −0.78、横偏 ≤0.07 m，
+      第 3.8、4 万轮又丢了。转向角符号按 URDF 正运动学核对：正 = 轮头朝左（转 +0.2 rad 时滚动方向 +11.5°），
+      轨迹里车体系侧滑角对 δ̄ 的斜率 +0.85～+0.93；修正平地滚动 / 堵转空转里"轮心沿轮向速度"的符号
+      （原 v_x·cosδ − v_y·sinδ，按"正 = 朝右"写反了，蟹行时会多算 ≈ v·(1 − cos2δ) 的打滑）。
     - v0.23.0 (2026-11-19): post_climb_relief / post_climb_window_m（默认 0 = 原行为）：后轴轮心后方 window 内地面比轮下低
       min_step（刚翻上去）时，平地滚动四项（toe / flat_steer / wheel_sync / wheel_slip）乘 (1 − post_climb_relief)。
     - v0.22.0 (2026-11-19): 校验 tilt_temperature > 0（训练脚本开放 --tilt_temperature）。
@@ -241,6 +247,8 @@ class PreviewRewardCfg:
     # 楼梯区车道约束系数（lane 与越障横向速度额外倍数在楼梯区 × 该值）；训练循环用 set_stairs_lane_scale 逐步收紧
     stairs_lane_scale: float = 1.0
     steering: float = -0.1  # × Σ|转向角|
+    # × sin²(ψ + δ̄)：车轮行进方向与路线（+X）的夹角，δ̄ = 四轮转向角平均（正 = 轮头朝左）；0 关闭（第二十八轮起用）
+    course: float = 0.0
     # 6 平地中立（摆臂回零 + 四轮承重）
     flat_neutral: float = -5.0  # 平地摆臂偏离中立 → 车身俯仰（第四轮平地俯仰 P95 5–6°）
     rest_clearance: float = 0.005
@@ -750,6 +758,8 @@ class PreviewTask:
             terms["riser_spin"] = cfg.riser_spin * self._riser_spin(next_state, ctx)
         if cfg.lane:
             terms["lane"] = cfg.lane * lane_factor * self.lateral_offset(next_state).square()
+        if cfg.course:
+            terms["course"] = cfg.course * self.course_error(next_state).square()
         if cfg.prelift_track:
             terms["prelift_track"] = cfg.prelift_track * self._prelift_tracking(ctx)
         if cfg.early_lift:
@@ -782,13 +792,23 @@ class PreviewTask:
                     terms[name] = terms[name] * relief
         return terms
 
+    def course_error(self, state) -> torch.Tensor:
+        """[...] sin(ψ + δ̄)：车轮整体行进方向与路线（+X）夹角的正弦。δ̄ = 四轮转向角平均（同相分量，正 = 轮头朝左），
+        反相分量（前后轮反向打 = 转车头）不进来。ψ 由车体前向在水平面的投影给出（同航向项）。"""
+        q = state[..., QUAT]
+        forward = quat_apply(q, q.new_tensor([1.0, 0.0, 0.0]).expand(q.shape[:-1] + (3,)))
+        planar = (forward[..., :2].square().sum(-1) + 1e-6).sqrt()
+        sin_yaw, cos_yaw = forward[..., 1] / planar, forward[..., 0] / planar
+        mean_steer = state[..., JPOS][..., STEERING].mean(-1)
+        return sin_yaw * mean_steer.cos() + cos_yaw * mean_steer.sin()
+
     def _flat_rolling(self, state, ctx) -> dict[str, torch.Tensor]:
         """平地滚动的四个代价 [...]：toe = 同轴两轮反向打角的平方和；flat_steer = 转向角平方和；
         wheel_sync = 四轮轮缘速度偏离四轮均值的 Huber 和；wheel_slip = 着地轮"轮缘速度 − 轮心沿轮向速度"的 Huber 和。
 
-        左右转向关节同一符号约定，四轮同号 = 蟹行，同轴异号 = toe（只刮地）。转向角正方向 = 轮头朝右（第十轮平地探针：
-        四轮同号转向与世界系 v_y 的相关系数 −0.67）；轮速正方向 = 前进。轮心速度 = 车体线速度 + ω × 轮心（base 系，
-        摆臂角速度不计）；转向角小时 v_∥ 主要是 v_x·cosδ，符号约定的误差只影响 v_y·sinδ 这一小项。"""
+        左右转向关节同一符号约定，四轮同号 = 蟹行，同轴异号 = toe（只刮地）。转向角正方向 = 轮头朝左（v0.24.0 按 URDF
+        正运动学核对：+0.2 rad 时滚动方向 +11.5°；第十轮"与世界系 v_y 相关 −0.67"被航向混淆，策略本来就按 δ̄ ≈ −ψ 反打）；
+        轮速正方向 = 前进。轮心速度 = 车体线速度 + ω × 轮心（base 系，摆臂角速度不计），v_∥ = v_x·cosδ + v_y·sinδ。"""
         jp, jv = state[..., JPOS], state[..., JVEL]
         steer = jp[..., STEERING]
         left, right = list(LEFT_WHEELS), list(RIGHT_WHEELS)
@@ -796,7 +816,7 @@ class PreviewTask:
         local = self.kin.wheel_centers_base(jp[..., :4], steer)
         lin_b, ang_b = state[..., LIN], state[..., ANG]
         v_wheel = lin_b.unsqueeze(-2) + torch.linalg.cross(ang_b.unsqueeze(-2).expand_as(local), local, dim=-1)
-        v_along = v_wheel[..., 0] * steer.cos() - v_wheel[..., 1] * steer.sin()
+        v_along = v_wheel[..., 0] * steer.cos() + v_wheel[..., 1] * steer.sin()
         rim = jv[..., WHEELS] * WHEEL_RADIUS
         slip = rim - v_along
         grounded = (ctx["clearance"].detach() < 0.01).to(slip.dtype)
@@ -811,7 +831,7 @@ class PreviewTask:
         local = self.kin.wheel_centers_base(jp[..., :4], steer)
         lin_b, ang_b = state[..., LIN], state[..., ANG]
         v_wheel = lin_b.unsqueeze(-2) + torch.linalg.cross(ang_b.unsqueeze(-2).expand_as(local), local, dim=-1)
-        v_along = v_wheel[..., 0] * steer.cos() - v_wheel[..., 1] * steer.sin()
+        v_along = v_wheel[..., 0] * steer.cos() + v_wheel[..., 1] * steer.sin()
         spin = (jv[..., WHEELS] * WHEEL_RADIUS - v_along).clamp_min(0.0)
         lead = ctx["lead"].detach().nan_to_num(posinf=1.0)
         pressed = ((lead > -WHEEL_RADIUS + 0.002) & (lead <= self.cfg.riser_spin_lead_m)).to(spin.dtype)

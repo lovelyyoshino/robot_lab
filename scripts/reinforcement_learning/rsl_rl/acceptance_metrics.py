@@ -8,9 +8,13 @@
 
 @author pony
 @date 2026-11-05
-@version v1.2.0
-@last_modified 2026-11-11
+@version v1.3.0
+@last_modified 2026-11-21
 @changelog
+    - v1.3.0 (2026-11-21): 软判（只记录，原判与门不变）：评测进程给出逐步 soft_ok（去掉 |y| ≤ 0.15 m 的稳定条件后连续保持
+      0.5 s），每回合记 soft_success / soft_time_s / soft_y_m / soft_score / max_abs_y_m。得分按 SOFT_RULE：软成功记 1 分，
+      软成功时 |y| 每超 0.15 m 一厘米扣 0.02，最多扣 0.5；|y| > 0.75 m 仍是出车道终止、不会软成功。aggregate_episodes
+      另给 soft_successes 与 soft_score_mean。用户 11-21 定：验收以软判为主，偏离扣分、不判失败。
     - v1.2.0 (2026-11-11): 楼梯贴面时长门 0.5→1.0 s（stairs_riser_contact_hold_s，用户决定）：楼梯同轴第二个轮按
       "碰到立面后再翻"上去（立面高于轮半径时只能接触翻越），最快约 0.7 s；单台阶仍为 0.5 s。
     - v1.1.0 (2026-11-06): 单台阶预抬起抬窗口 3–12 cm（PRELIFT_WINDOW），成功 = 至少一个前轮严格预抬并通行，
@@ -77,6 +81,25 @@ FLAT_METRICS = EPISODE_METRICS + ("yaw_abs_p95_deg", "lateral_abs_p95_m", "route
 # 踢面接触（楼梯需求 3"轻碰快上"）：无接触的回合为 None，不参与 P95
 CONTACT_METRICS = ("riser_impact_speed_max_m_s", "riser_contact_hold_max_s")
 STEP_KEYS = ("roll", "pitch", "pitch_rate", "vz", "arm_vel", "action", "riser_contact", "tilt_deg", "x", "y", "finite")
+# 评测进程可选给出的逐步键：soft_ok = 软判稳定已连续保持 hold_time_s（v1.3.0）；旧结果、单测样本没有这一列
+OPTIONAL_STEP_KEYS = ("soft_ok",)
+# 软判得分：每回合 1 分，软成功时 |y| 超过 lane_m 的部分每米扣 deduct_per_m（每厘米 0.02），最多扣 max_deduct
+SOFT_RULE = {"lane_m": 0.15, "deduct_per_m": 2.0, "max_deduct": 0.5}
+
+
+def soft_fields(steps: dict, dt: float, rule=SOFT_RULE) -> dict:
+    """逐步序列 → 软判字段。soft_ok 第一次为真即软成功；没有 soft_ok 列时只给 max_abs_y_m。"""
+    ys = [abs(y) for y in steps.get("y", []) if isinstance(y, (int, float)) and math.isfinite(y)]
+    out = {"max_abs_y_m": max(ys) if ys else None}
+    if "soft_ok" not in steps:
+        return out
+    hit = next((i for i, ok in enumerate(steps["soft_ok"]) if ok), None)
+    if hit is None:
+        return {**out, "soft_success": False, "soft_time_s": None, "soft_y_m": None, "soft_score": 0.0}
+    y = steps["y"][hit]
+    excess = max(abs(y) - rule["lane_m"], 0.0)
+    score = 1.0 - min(rule["max_deduct"], rule["deduct_per_m"] * excess)
+    return {**out, "soft_success": True, "soft_time_s": (hit + 1) * dt, "soft_y_m": y, "soft_score": score}
 
 
 def load_stairs_acceptance():
@@ -322,6 +345,9 @@ class EpisodeMetrics:
                 continue
             for key in STEP_KEYS:
                 buffer[key].append(sample[key][i])
+            for key in OPTIONAL_STEP_KEYS:
+                if key in sample:
+                    buffer.setdefault(key, []).append(sample[key][i])
             if ending is None:
                 continue
             last = {key: buffer[key][-1] for key in ("tilt_deg", "x", "y", "finite")}
@@ -333,6 +359,7 @@ class EpisodeMetrics:
                                             climb_tilt_deg=self.climb_tilt_deg,
                                             target_distance_m=self.target_distance_m),
                 "terminal_x_m": last["x"], "terminal_y_m": last["y"], "terminal_tilt_deg": last["tilt_deg"],
+                **soft_fields(buffer, self.dt),
                 **episode_statistics(buffer, self.dt, self.warmup_steps),
             })
             self.buffers[i] = self._empty()
@@ -352,6 +379,9 @@ def aggregate_episodes(episodes, metrics=EPISODE_METRICS + CONTACT_METRICS) -> d
               "worst": {k: max(_finite([e.get(k) for e in episodes]), default=None) for k in metrics},
               "p95_success_only": {k: p95([e.get(k) for e in succeeded]) for k in metrics},
               "outcomes": dict(Counter(e.get("outcome", "unknown") for e in episodes))}
+    if episodes and all("soft_success" in e for e in episodes):
+        result["soft_successes"] = sum(bool(e["soft_success"]) for e in episodes)
+        result["soft_score_mean"] = sum(e["soft_score"] for e in episodes) / len(episodes)
     if episodes and "riser_contact_events" in episodes[0]:
         result["riser_collision_episode_rate"] = {
             label: sum(e["riser_contact_events"][k] > 0 for e in episodes) / len(episodes)

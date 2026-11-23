@@ -7,9 +7,23 @@
 #   （learner 全部状态、课程等级与轮数从旧存档接着走，日志和存档写到新 run；iterations 是总轮数，含旧存档已跑的）
 # @author pony
 # @date 2026-11-05
-# @version v2.18.0
-# @last_modified 2026-11-20
+# @version v2.19.0
+# @last_modified 2026-11-21
 # @changelog
+#   - v2.19.0 (2026-11-21): 第二十八轮（从零，种子 42）= 第二十七轮 + 偏离只扣分、不判失败（方案见
+#     logs/supermimic_terrain/obstacle_r27_scratch/report/r28_plan.md）。第二十七轮第 36000 轮验收的失败大多只是横偏：
+#     把"爬上去、四轮着地、没翻、横偏 0.15–0.75 m"算成功，×40 楼梯和满宽单台阶 95–100%；第 38000/40000 轮 16/17.5×40
+#     严格判 2–8%、软判 100%，到顶横偏中位 0.29–0.31 m。critic 探针（r27@36k）：单台阶、平地 46–48% 的回合因到终点
+#     |y| > 0.15 m 被真终止，楼梯爬升段 critic 给横偏的估值反而更高（偏 0.40 m 比居中高 +5.0）。
+#     A 到终点一律成功截断 --curriculum_goal_lane_termination 0，出车道只剩开出台面 --curriculum_fail_lane_m 0.40→0.75
+#       （与验收的 0.75 一致；0.40 是 v1.1.0 与车道代价同时加的）；
+#     B 晋级横偏门单台阶/平地 --curriculum_success_lane_m 0.15→0.40，楼梯 --stairs_success_lane_schedule 0 0
+#       （从第 0 轮起 = success_lane_m 0.40；fail_lane 改成 0.75 后原 90000 100000 会让楼梯门变成 0.75）；
+#     C 车轮行进方向对准路线 --course -20（preview_task v0.24.0，−20·sin²(ψ + δ̄)，δ̄ = 四轮转向平均；航向 10° 不蟹行
+#       ≈ −0.6/步，与 y = 0.15 m 的车道代价相当；已有轨迹楼梯段 r22@20k −0.18、r27@36k −0.69、r26@34k −1.14/步）；
+#       同版本修正平地滚动 / 堵转空转"轮心沿轮向速度"的符号（转向角正 = 轮头朝左，原式按朝右写反）；
+#     D 日志按地形记回合结局占比、到终点 |y|、行进方向误差（train_terrain v0.23.0）。
+#     不变：车道代价 −30·y²、楼梯区 2000→8000 轮 ×0→×1、critic 车道/路线特征、停滞 12 s 截断、其余全部参数。
 #   - v2.18.0 (2026-11-20): 第二十七轮（从零，种子 42）= 第二十六轮 + 楼梯区车道代价早开 --stairs_lane_schedule 2000 8000，
 #     晋级横偏门不收紧 --stairs_success_lane_schedule 90000 100000（只给前者时晋级门会跟着收紧）。第二十六轮第 34000 轮
 #     16/17.5×40 楼梯 47/64、25/64 回合登顶但 |y| 0.20–0.43 m（验收门 0.15），另 14/37 回合前轴顶最后一级、后轴在第二级
@@ -192,7 +206,8 @@ TRAIN_ARGS=(
   #   （--stairs_lane_scale 是不给 schedule 时的固定系数；给了 schedule 时每轮覆盖）
   #   第二十轮：不收紧（schedule 起点设在训练轮数之外）
   #   第二十七轮：楼梯区车道代价与越障横向速度额外倍数 2000→8000 轮 ×0→×1；晋级横偏门单独给 schedule 且不收紧（一直 0.40 m）
-  --stairs_lane_scale 1.0 --stairs_lane_schedule 2000 8000 --stairs_success_lane_schedule 90000 100000
+  #   第二十八轮：出车道改 0.75 m 后，楼梯晋级横偏门 = fail_lane + (success_lane − fail_lane)·s，s 从第 0 轮起取 1（0.40 m）
+  --stairs_lane_scale 1.0 --stairs_lane_schedule 2000 8000 --stairs_success_lane_schedule 0 0
   # 2 翻车
   --terminated -20.0 --tilt_limit 0.8 --tilt_temperature 0.05
   # 3 姿态（θ_ref = sign(θ_geo)·max(|θ_geo| − 6°, 0)，θ_geo 为前后轮下地形的几何俯仰；横滚超过 4.5° 陡增）
@@ -207,6 +222,8 @@ TRAIN_ARGS=(
   #   第十五轮：越障区（非平地）横向速度代价 ×3（actor 看不到横偏，侧滑多少就偏多少）
   --obstacle_lateral_vel_scale 3.0
   --lane -30.0 --steering -0.1
+  #   第二十八轮：车轮行进方向对准路线 −20·sin²(ψ + δ̄)（δ̄ = 四轮转向平均，只约束同相/蟹行，不碰反相/转车头）
+  --course -20.0
   #   整宽单台阶（同轴两轮都在单台阶区）也斜 12°：前轴两轮先后到立面，先到的轮去预抬（窄台阶不受影响）
   #   第十五轮 12→6：斜行横向分量减半（同轴两前轮到立面仍错开约 6 cm，另一轮可碰到后再翻）
   --single_slant_deg 6.0
@@ -245,8 +262,10 @@ TRAIN_ARGS=(
   --min_step 0.03
   # 8 关节软限位（env 软限位系数 0.95）
   --joint_pos_limits -5.0
-  # 课程（按地形类型）与终止：成功/晋级要求 |y|≤0.15 m，出车道 0.40 m；楼梯不设碰撞晋级门（比例 1.0）
-  --curriculum_promote_m 3.6 --curriculum_success_lane_m 0.15 --curriculum_fail_lane_m 0.40
+  # 课程（按地形类型）与终止：楼梯不设碰撞晋级门（比例 1.0）
+  #   第二十八轮：到终点一律成功截断（不看横偏）；出车道只剩 |y| > 0.75 m（开出台面）；晋级要求 |y| ≤ 0.40 m
+  --curriculum_promote_m 3.6 --curriculum_success_lane_m 0.40 --curriculum_fail_lane_m 0.75
+  --curriculum_goal_lane_termination 0
   --curriculum_demote_ratio 0.5 --curriculum_posture_bad_frac 0.05
   --curriculum_collision_frac 0.10 --curriculum_stairs_collision_frac 1.0
   --curriculum_roll_limit_deg 10 --curriculum_pitch_dev_limit_deg 12

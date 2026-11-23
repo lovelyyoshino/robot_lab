@@ -18,12 +18,17 @@ obstacle_terrain.py — SuperMimic 越障训练地形几何与按地形类型的
   这些高度上后轴翻越的数据，想象梯度也就无从指向。
 终止：x ≥ promote_m 时回合必然结束——|y| ≤ success_lane_m 为成功截断（time_out），否则与 |y| > fail_lane_m
 一样按出车道真终止（楼梯顶端平台在 x≈4 m 处是块边断崖，到终点后不能继续行驶）。
+goal_lane_termination = 0 时到终点一律成功截断，只有 |y| > fail_lane_m 才终止（横偏交给稠密代价，不再判失败）。
 
 @author pony
 @date 2026-11-05
-@version v1.6.0
-@last_modified 2026-11-13
+@version v1.7.0
+@last_modified 2026-11-21
 @changelog
+    - v1.7.0 (2026-11-21): goal_lane_termination（默认 1 = 原行为）：0 时到终点不看横偏一律成功截断，出车道只剩
+      |y| > fail_lane_m。r27@36k 的 critic 探针：单台阶、平地 46–48% 的回合因到终点 |y| > 0.15 m 被真终止，
+      楼梯爬升段 critic 给横偏的估值反而更高（继续开的价值约 −23，终止只扣 0.4）。终止判据计算时把相对块原点的
+      位置存到 env.obstacle_goal_rel（训练循环按它记到终点横偏的分布）。
     - v1.6.0 (2026-11-13): 楼梯单独的成功车道 stairs_success_lane_m（0 = 同 success_lane_m，原行为），课程晋级与终点
       截断/出车道终止都按地形类型取；lane_schedule_scale(it, start, end) 给训练循环逐步收紧用。第十七轮 it12000 楼梯
       12 cm×40 cm 98% 爬上顶，但斜 9–11° 没有蟹行、横偏 0.21–0.32 m，验收 0%；训练里同样到终点 |y|>0.15 判出车道终止，
@@ -85,7 +90,9 @@ CURRICULUM_DEFAULTS = {"promote_m": PROMOTE_M, "success_lane_m": 0.15, "demote_r
                        "stairs_promote_streak": 0.0, "stairs_demote_streak": 0.0, "freeze_non_stairs": 0.0,
                        "stairs_min_level": 0.0,
                        # 楼梯的成功车道（0 = 同 success_lane_m）；训练循环可按 lane_schedule_scale 从宽到严逐步收紧
-                       "stairs_success_lane_m": 0.0}
+                       "stairs_success_lane_m": 0.0,
+                       # 到终点且 |y| > 成功车道时是否按出车道真终止（1 = 原行为；0 = 一律成功截断，只有 |y| > fail_lane_m 终止）
+                       "goal_lane_termination": 1.0}
 
 
 def tile_fraction(seed, difficulty: float, salt: str) -> float:
@@ -342,28 +349,34 @@ def curriculum_summary(levels, kinds, rows: int = NUM_ROWS) -> dict[str, torch.T
 
 
 def goal_and_lane(rel_xy, cfg=CURRICULUM_DEFAULTS, kinds=None) -> tuple[torch.Tensor, torch.Tensor]:
-    """(reached_goal, out_of_lane)：rel_xy 为相对块原点的 (x, y)，kinds 为各环境地形类型（楼梯成功车道单独取）。两者互斥。"""
+    """(reached_goal, out_of_lane)：rel_xy 为相对块原点的 (x, y)，kinds 为各环境地形类型（楼梯成功车道单独取）。两者互斥。
+
+    goal_lane_termination = 0：到终点只要没出 fail_lane_m 就是成功截断，成功车道只用于课程晋级。"""
     cfg = {**CURRICULUM_DEFAULTS, **cfg}
     at_goal = rel_xy[:, 0] >= cfg["promote_m"]
     lateral = rel_xy[:, 1].abs()
-    reached = at_goal & (lateral <= success_lane(kinds, cfg, lateral))
-    out = (lateral > cfg["fail_lane_m"]) | (at_goal & ~reached)
-    return reached, out
+    out_lane = lateral > cfg["fail_lane_m"]
+    if float(cfg["goal_lane_termination"]) > 0.0:
+        reached = at_goal & (lateral <= success_lane(kinds, cfg, lateral))
+        return reached, out_lane | (at_goal & ~reached)
+    return at_goal & ~out_lane, out_lane
 
 
 def _goal_and_lane(env):
     rel = env.scene["robot"].data.root_pos_w - env.scene.env_origins
+    env.obstacle_goal_rel = rel  # reset 之前的最终位置，训练循环记到终点横偏用（只读）
     kinds = _env_kinds(env) if hasattr(env.cfg, "column_kinds") else None
     return goal_and_lane(rel, getattr(env.cfg, "obstacle_curriculum_cfg", {}), kinds)
 
 
 def reached_goal(env):
-    """前进到 promote_m 且 |y| ≤ success_lane_m：成功截断（time_out 语义）。"""
+    """前进到 promote_m 且 |y| ≤ success_lane_m（goal_lane_termination = 0 时为 |y| ≤ fail_lane_m）：成功截断（time_out 语义）。"""
     return _goal_and_lane(env)[0]
 
 
 def out_of_lane(env):
-    """|y| > fail_lane_m，或到达 promote_m 时 |y| > success_lane_m：真终止（训练用特权判据，不进入观测）。"""
+    """|y| > fail_lane_m，或到达 promote_m 时 |y| > success_lane_m（goal_lane_termination = 1 时）：真终止
+    （训练用特权判据，不进入观测）。"""
     return _goal_and_lane(env)[1]
 
 

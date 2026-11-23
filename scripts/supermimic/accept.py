@@ -17,9 +17,11 @@ accept.py — SuperMimic 四轮腿越障验收唯一入口：平地 + 单台阶�
 
 @author pony
 @date 2026-11-05
-@version v1.3.0
-@last_modified 2026-11-11
+@version v1.4.0
+@last_modified 2026-11-21
 @changelog
+    - v1.4.0 (2026-11-21): 单台阶与楼梯表加"软判"列（软成功率 / 平均得分，acceptance_metrics v1.3.0：横偏不判失败、
+      超过 0.15 m 每厘米扣 0.02、最多扣 0.5）；summary.json 每档加 soft_successes、soft_score_mean。门与结论不变。
     - v1.3.0 (2026-11-11): 楼梯贴面时长门用 stairs_riser_contact_hold_s（1.0 s，acceptance_metrics v1.2.0）；单台阶仍 0.5 s。
     - v1.2.0 (2026-11-07): 轮胎摩擦固定 μ=1.0（evaluate 自动对齐）；汇总记录 wheel_friction，复用结果须带摩擦记录。
     - v1.1.0 (2026-11-06): 需求 3 覆盖楼梯（轻碰快上）；预抬起抬窗口 3–12 cm，一个轮先抬、另一个滚上去即可。
@@ -266,6 +268,14 @@ def cell(row_checks, metric):
     return f"{fmt(c['value'])} (≤{c['threshold']:.3g}) {'PASS' if c['passed'] else '**FAIL**'}"
 
 
+def soft_cell(row) -> str:
+    """软判：软成功率 / 平均得分（acceptance_metrics.SOFT_RULE）；旧结果没有软判字段时为 -。"""
+    agg = row["aggregate"]
+    if "soft_successes" not in agg or not agg["episodes"]:
+        return "-"
+    return f"{agg['soft_successes'] / agg['episodes']:.0%} / {agg['soft_score_mean']:.2f}"
+
+
 def render_markdown(summary) -> str:
     v = summary["requirements"]
     lines = [f"# SuperMimic 越障 验收：{'PASS' if summary['passed'] else 'FAIL'}", "",
@@ -296,14 +306,15 @@ def render_markdown(summary) -> str:
     pre = [r for r in rows if r["suite"] == "prelift"]
     if pre:
         lines += ["", "## 3 单台阶预抬（至少一个前轮 3–12 cm 起抬的严格时序 + 通行；其余轮轻碰快上）", "",
-                  "| 档位 | 回合 | 成功率 | 严格预抬 | 四轮无碰撞（诊断） | 通行 | 接触前速度 m/s | 贴面时长 s "
+                  "| 档位 | 回合 | 成功率 | 软判通行 / 得分 | 严格预抬 | 四轮无碰撞（诊断） | 通行 | 接触前速度 m/s | 贴面时长 s "
                   "| 碰撞回合率 fl/rl/fr/rr | 结论 |",
-                  "|---|---|---|---|---|---|---|---|---|---|"]
+                  "|---|---|---|---|---|---|---|---|---|---|---|"]
         for r in pre:
             col = r["aggregate"].get("riser_collision_episode_rate", {})
             ok = all(c["passed"] for c in r["checks"] if c["requirement"] == 3 and c["gating"])
             lines.append(f"| {r['id']} | {r['episodes']}/{r['expected_episodes']} | "
-                         f"{r['successes'] / r['episodes'] if r['episodes'] else 0:.0%} | {r['strict_prelift_rate']:.0%} | "
+                         f"{r['successes'] / r['episodes'] if r['episodes'] else 0:.0%} | {soft_cell(r)} | "
+                         f"{r['strict_prelift_rate']:.0%} | "
                          f"{r['riser_collision_free_rate']:.0%} | {r['traversal_rate']:.0%} | "
                          f"{cell(r['checks'], 'riser_impact_speed_max_m_s')} | {cell(r['checks'], 'riser_contact_hold_max_s')} | "
                          + "/".join(f"{col.get(w, 0):.0%}" for w in m.WHEEL_LABELS)
@@ -311,9 +322,9 @@ def render_markdown(summary) -> str:
     stairs = [r for r in rows if r["suite"] == "stairs"]
     if stairs:
         lines += ["", "## 4 楼梯（严格登顶）+ 3 轻碰快上（接触前速度 / 贴面时长，跨回合 P95）", "",
-                  "| 档位 | 坡度° | 回合 | 成功率 | 停住/超时 | 到终点未稳 | 翻车 | 出车道 | 冲出 | 其他 | 接触前速度 m/s | 贴面时长 s "
-                  "| 碰撞回合率 fl/rl/fr/rr | 结论 |",
-                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+                  "| 档位 | 坡度° | 回合 | 成功率 | 软判成功 / 得分 | 停住/超时 | 到终点未稳 | 翻车 | 出车道 | 冲出 | 其他 "
+                  "| 接触前速度 m/s | 贴面时长 s | 碰撞回合率 fl/rl/fr/rr | 结论 |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for r in stairs:
             o = r["aggregate"]["outcomes"]
             col = r["aggregate"].get("riser_collision_episode_rate", {})
@@ -321,7 +332,8 @@ def render_markdown(summary) -> str:
                 "success", "stall_timeout", "unstable_at_target", "rollover", "out_of_lane", "overshoot"))
             ok = all(c["passed"] for c in r["checks"] if c["requirement"] in (3, 4) and c["gating"])
             lines.append(f"| {r['id']} | {r['pitch_limits']['slope_deg']:.1f} | {r['episodes']}/{r['expected_episodes']} | "
-                         f"{r['successes'] / r['episodes'] if r['episodes'] else 0:.0%} | {o.get('stall_timeout', 0)} | "
+                         f"{r['successes'] / r['episodes'] if r['episodes'] else 0:.0%} | {soft_cell(r)} | "
+                         f"{o.get('stall_timeout', 0)} | "
                          f"{o.get('unstable_at_target', 0)} | {o.get('rollover', 0)} | {o.get('out_of_lane', 0)} | "
                          f"{o.get('overshoot', 0)} | {other} | {cell(r['checks'], 'riser_impact_speed_max_m_s')} | "
                          f"{cell(r['checks'], 'riser_contact_hold_max_s')} | "

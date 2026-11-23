@@ -2,9 +2,11 @@
 
 @author pony
 @date 2026-11-05
-@version v1.15.0
-@last_modified 2026-11-20
+@version v1.16.0
+@last_modified 2026-11-21
 @changelog
+    - v1.16.0 (2026-11-21): launcher 断言跟随第二十八轮：晋级横偏门 0.40、出车道 0.75、到终点一律成功截断、楼梯晋级门
+      --stairs_success_lane_schedule 0 0、--course -20.0；都带行尾，避免被 changelog 里的"0.15→0.40"这类字符串误匹配。
     - v1.15.0 (2026-11-20): launcher 断言第二十七轮楼梯车道代价早开、晋级横偏门不收紧：
       --stairs_lane_schedule 2000 8000 --stairs_success_lane_schedule 90000 100000。
     - v1.14.0 (2026-11-19): launcher 断言第二十六轮登顶后回正窗口 --post_climb_relief 1.0 --post_climb_window_m 1.0。
@@ -146,7 +148,8 @@ def test_reward_cfg_has_only_current_terms_and_every_weight_is_a_cli_flag():
                       and getattr(node.targets[0], "id", "") == "CURRICULUM_FLAGS")
     names = {element.value for element in curriculum.elts}
     assert names <= set(ot.CURRICULUM_DEFAULTS) and {"success_lane_m", "stairs_collision_frac", "collision_frac"} <= names
-    for needle in ("--curriculum_success_lane_m 0.15", "--curriculum_fail_lane_m 0.40", "--curriculum_collision_frac 0.10",
+    for needle in ("--curriculum_success_lane_m 0.40 --curriculum_fail_lane_m 0.75\n", "--curriculum_goal_lane_termination 0\n",
+                   "--course -20.0\n", "--curriculum_collision_frac 0.10",
                    "--curriculum_stairs_collision_frac 1.0", "--episode_length_s 40", "--command_lin_vel_x 0.10 0.40",
                    "--command_standing_fraction 0.10", "--lane -30.0", "--lateral_vel -15.0", "--lateral_vel_delta 0.02",
                    "--heading_huber -5.0", "--heading_huber_delta 0.02", "--flat_neutral -5.0",
@@ -168,7 +171,7 @@ def test_reward_cfg_has_only_current_terms_and_every_weight_is_a_cli_flag():
                    "--curriculum_stairs_promote_streak 2", "--curriculum_stairs_demote_streak 3",
                    "--stall_climb_min_clearance 0.01", "--stall_climb_lead_m 0.05", "--riser_spin -10.0",
                    "--trailing_contact_climb 1.0", "--stairs_climb_pair_sum 1.0", "--stall_linear -3.0 --stall_linear_cap 1.0\n",
-                   "--critic_lane", "--stairs_lane_schedule 2000 8000 --stairs_success_lane_schedule 90000 100000\n",
+                   "--critic_lane", "--stairs_lane_schedule 2000 8000 --stairs_success_lane_schedule 0 0\n",
                    "TRAIN_ARGS"):
         assert needle in launcher, needle
 
