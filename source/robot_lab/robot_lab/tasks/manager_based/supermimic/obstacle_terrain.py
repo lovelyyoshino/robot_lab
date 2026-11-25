@@ -19,12 +19,20 @@ obstacle_terrain.py — SuperMimic 越障训练地形几何与按地形类型的
 终止：x ≥ promote_m 时回合必然结束——|y| ≤ success_lane_m 为成功截断（time_out），否则与 |y| > fail_lane_m
 一样按出车道真终止（楼梯顶端平台在 x≈4 m 处是块边断崖，到终点后不能继续行驶）。
 goal_lane_termination = 0 时到终点一律成功截断，只有 |y| > fail_lane_m 才终止（横偏交给稠密代价，不再判失败）。
+短踏面楼梯列（STAIRS_SHORT，训练循环按需加入）：地形类型仍算楼梯，但每回合都是探索回合（随机等级、不改课程、
+不计入楼梯课程统计），结果单独记 stairs_short_*。
 
 @author pony
 @date 2026-11-05
-@version v1.7.0
-@last_modified 2026-11-21
+@version v1.8.0
+@last_modified 2026-11-23
 @changelog
+    - v1.8.0 (2026-11-23): 短踏面楼梯列 STAIRS_SHORT（column_kinds 算楼梯，column_explore 标为常驻探索；
+      obstacle_curriculum 对这些列每回合都抽探索等级，日志 stairs_short_episodes/passed；curriculum_summary 忽略
+      kind < 0，summary_kinds 把常驻探索列排除在课程统计外）；ProgressStallTracker（本回合最远前进 x 的停滞计时，
+      倒车、原地、前后蹭都不清零）与 stall_hold_scale（停滞时长超过 grace 后线性升到 1）。第二十八轮 2.6 万轮后
+      满宽 ≥14 cm 单台阶与 ≥16 cm 楼梯 90% 以上回合以 0.42 m/s 撞上立面后贴着不动 13–15 s（停滞超时），训练里停滞
+      收尾占比到 0.39–0.42；28 cm 踏面的 16/17.5 cm 楼梯在训练里从未出现（tread_rule 让 ≥15 cm 立面踏面 ≥36 cm）。
     - v1.7.0 (2026-11-21): goal_lane_termination（默认 1 = 原行为）：0 时到终点不看横偏一律成功截断，出车道只剩
       |y| > fail_lane_m。r27@36k 的 critic 探针：单台阶、平地 46–48% 的回合因到终点 |y| > 0.15 m 被真终止，
       楼梯爬升段 critic 给横偏的估值反而更高（继续开的价值约 −23，终止只扣 0.4）。终止判据计算时把相对块原点的
@@ -56,6 +64,7 @@ import numpy as np
 import torch
 
 STAIRS = "pyramid_stairs_inv"  # 沿用旧名，评测/诊断按此名识别楼梯
+STAIRS_SHORT = "pyramid_stairs_inv_short"  # 短踏面楼梯列（常驻探索，只记录）；只在训练时由 --stairs_short_frac 加入
 STAIR_RISER_M = (0.04, 0.20)  # 从零训练须从可滚过的低台阶起步（10 cm≈轮半径时第 0 级无法学习）
 STAIR_TREAD_M = (0.26, 0.40)
 STAIR_STEPS = 5
@@ -154,8 +163,58 @@ def column_names(names, proportions, num_cols):
 
 
 def column_kinds(names, proportions, num_cols) -> tuple[int, ...]:
-    return tuple(KIND_STAIRS if name == STAIRS else KIND_SINGLE if name.startswith("single_step") else KIND_FLAT
-                 for name in column_names(names, proportions, num_cols))
+    return tuple(KIND_STAIRS if name in (STAIRS, STAIRS_SHORT) else KIND_SINGLE if name.startswith("single_step")
+                 else KIND_FLAT for name in column_names(names, proportions, num_cols))
+
+
+def column_explore(names, proportions, num_cols) -> tuple[bool, ...]:
+    """每列是否常驻探索（短踏面楼梯列）：这些列的回合一律随机等级、不改课程、不进楼梯课程统计。"""
+    return tuple(name == STAIRS_SHORT for name in column_names(names, proportions, num_cols))
+
+
+def split_short_stairs(proportions: dict, fraction: float) -> dict:
+    """从楼梯比例里拿出 fraction 给短踏面楼梯列，插在楼梯之后（列顺序决定 Isaac Lab 的列分配）。"""
+    if STAIRS not in proportions or STAIRS_SHORT in proportions:
+        raise ValueError("需要楼梯子地形且尚未加入短踏面楼梯")
+    if not 0.0 < fraction < proportions[STAIRS]:
+        raise ValueError("短踏面楼梯比例须在 (0, 楼梯比例) 内")
+    out = {}
+    for name, value in proportions.items():
+        out[name] = value - fraction if name == STAIRS else value
+        if name == STAIRS:
+            out[STAIRS_SHORT] = fraction
+    return out
+
+
+class ProgressStallTracker:
+    """本回合"最远前进 x"的停滞计时，训练循环逐步更新。
+
+    只有比本回合到过的最远处再多前进 ≥ gain_m 才清零；倒车、原地、贴着立面前后蹭都不清零，"卡住"按位置判，不按瞬时
+    车速判（按车速判时退半步再以 ≥ 门槛的速度顶回去就能把计时清零）。未命令前进（|v_cmd| < 0.05）或回合结束时清零。"""
+
+    def __init__(self, num_envs: int, device, gain_m: float = 0.01):
+        if gain_m <= 0.0:
+            raise ValueError("gain_m 须 > 0")
+        self.best = torch.full((num_envs,), -math.inf, device=device)
+        self.steps = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.gain_m = gain_m
+
+    @torch.no_grad()
+    def update(self, x, commanded, done) -> torch.Tensor:
+        """x：步前相对块原点的前进距离；commanded / done：bool。返回更新后的停滞步数。"""
+        gained = x >= self.best + self.gain_m
+        restart = ~commanded
+        self.best = torch.where(gained | restart, x, self.best)
+        self.steps = torch.where(gained | restart | done, torch.zeros_like(self.steps), self.steps + 1)
+        self.best = torch.where(done, torch.full_like(self.best, -math.inf), self.best)
+        return self.steps
+
+
+def stall_hold_scale(steps, dt: float, grace_s: float, ramp_s: float) -> torch.Tensor:
+    """停滞时长 t = steps·dt：t ≤ grace_s 为 0，之后在 ramp_s 内线性升到 1。"""
+    if grace_s < 0.0 or ramp_s <= 0.0:
+        raise ValueError("grace_s 须 ≥ 0、ramp_s 须 > 0")
+    return ((steps.float() * dt - grace_s) / ramp_s).clamp(0.0, 1.0)
 
 
 def equivalent_height_cm(levels: torch.Tensor, kind: int, rows: int = NUM_ROWS) -> torch.Tensor:
@@ -275,6 +334,21 @@ def _env_kinds(env) -> torch.Tensor:
     return torch.as_tensor(env.cfg.column_kinds, device=terrain.terrain_levels.device)[terrain.terrain_types]
 
 
+def env_forced_explore(env) -> torch.Tensor:
+    """[num_envs] bool：所在列是否常驻探索（env.cfg 没有 column_explore 时全 False = 原行为）。"""
+    terrain = env.scene.terrain
+    flags = getattr(env.cfg, "column_explore", None)
+    if flags is None:
+        return torch.zeros_like(terrain.terrain_levels, dtype=torch.bool)
+    return torch.as_tensor(flags, dtype=torch.bool, device=terrain.terrain_levels.device)[terrain.terrain_types]
+
+
+def summary_kinds(env) -> torch.Tensor:
+    """课程统计用的地形类型：常驻探索列记为 −1（curriculum_summary 忽略），其余同 _env_kinds。"""
+    kinds = _env_kinds(env)
+    return torch.where(env_forced_explore(env), torch.full_like(kinds, -1), kinds)
+
+
 def curriculum_levels(env) -> torch.Tensor:
     """课程等级（不含探索回合的随机地形等级）；没有探索时就是 terrain_levels。存档与日志都用它。"""
     base = getattr(env, "obstacle_base_levels", None)
@@ -292,12 +366,13 @@ def obstacle_curriculum(env, env_ids):
            else torch.as_tensor(env_ids, device=device, dtype=torch.long))
     cfg = {**CURRICULUM_DEFAULTS, **getattr(env.cfg, "obstacle_curriculum_cfg", {})}
     kinds = _env_kinds(env)
+    forced = env_forced_explore(env)
     explore_frac = float(cfg["stairs_explore_frac"])
     if not 0.0 <= explore_frac < 1.0:
         raise ValueError("stairs_explore_frac 须在 [0, 1)")
     if getattr(env, "obstacle_base_levels", None) is None:
         env.obstacle_base_levels = terrain.terrain_levels.clone()
-        env.obstacle_explore = torch.zeros_like(terrain.terrain_levels, dtype=torch.bool)
+        env.obstacle_explore = forced.clone()  # 常驻探索列的第一回合也不进课程
     base, explore = env.obstacle_base_levels, env.obstacle_explore
     if ids.numel():
         robot = env.scene["robot"]
@@ -314,7 +389,7 @@ def obstacle_curriculum(env, env_ids):
         levels = torch.where(was_explore, base[ids], next_levels(base[ids], passed, failed, terrain.max_terrain_level))
         levels = apply_level_floor(levels, kinds[ids], cfg, terrain.max_terrain_level)
         base[ids] = levels
-        draw = (kinds[ids] == KIND_STAIRS) & (torch.rand(ids.numel(), device=device) < explore_frac)
+        draw = forced[ids] | ((kinds[ids] == KIND_STAIRS) & (torch.rand(ids.numel(), device=device) < explore_frac))
         explore[ids] = draw
         episode_levels = torch.where(draw, torch.randint_like(levels, terrain.max_terrain_level), levels)
         terrain.terrain_levels[ids] = episode_levels
@@ -328,16 +403,19 @@ def obstacle_curriculum(env, env_ids):
                 log[f"{name}_demoted"] = log.get(f"{name}_demoted", 0) + int((failed & mask).sum())
                 if stats is not None:
                     log[f"{name}_collided"] = log.get(f"{name}_collided", 0) + int(((stats["collisions"] > 0) & mask).sum())
-            probe = active & was_explore
+            probe = active & was_explore & ~forced[ids]
             high = probe & (ran_level >= EXPLORE_HIGH_LEVEL)
-            for key, mask in (("explore", probe), ("explore_high", high)):
+            short = active & was_explore & forced[ids]
+            for key, mask in (("explore", probe), ("explore_high", high), ("short", short)):
                 log[f"stairs_{key}_episodes"] = log.get(f"stairs_{key}_episodes", 0) + int(mask.sum())
                 log[f"stairs_{key}_passed"] = log.get(f"stairs_{key}_passed", 0) + int((passed & mask).sum())
-    return curriculum_summary(curriculum_levels(env), kinds, terrain.cfg.terrain_generator.num_rows)
+    return curriculum_summary(curriculum_levels(env), summary_kinds(env), terrain.cfg.terrain_generator.num_rows)
 
 
 def curriculum_summary(levels, kinds, rows: int = NUM_ROWS) -> dict[str, torch.Tensor]:
-    out = {"mean_level": levels.float().mean()}
+    """每类平均等级、顶级占比、等效高度；kind < 0（常驻探索列）不计入任何一项。"""
+    counted = kinds >= 0
+    out = {"mean_level": levels[counted].float().mean() if counted.any() else levels.float().mean()}
     for kind, name in KIND_NAMES.items():
         mask = kinds == kind
         if mask.any():

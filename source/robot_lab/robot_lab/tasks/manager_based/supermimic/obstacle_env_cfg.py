@@ -16,9 +16,11 @@ obstacle_env_cfg.py — 从零 SuperMimic 越障任务：楼梯 ≥45%（立面 
 
 @author pony
 @date 2026-11-05
-@version v1.3.0
-@last_modified 2026-11-10
+@version v1.4.0
+@last_modified 2026-11-23
 @changelog
+    - v1.4.0 (2026-11-23): column_explore（每列是否常驻探索）；add_short_stairs 从楼梯比例里拿出一部分做短踏面楼梯列
+      （立面/踏面单独给、不用 tread_rule），插在楼梯之后并重算 column_kinds / column_explore。默认不加 = 原行为。
     - v1.3.0 (2026-11-10): 楼梯子地形 tread_rule 字段（默认 None）。
     - v1.2.0 (2026-11-09): 停滞截断终止项 stall_timeout（time_out；obstacle_curriculum_cfg["stall_truncate_s"]，默认 0 关闭，
       只有训练循环写入停滞步数时才会触发）。
@@ -74,6 +76,32 @@ def obstacle_sub_terrains() -> dict:
     }
 
 
+def refresh_columns(env_cfg) -> None:
+    """按当前 sub_terrains 重算每列的地形类型与是否常驻探索（改过子地形后调用）。"""
+    terrain = env_cfg.scene.terrain.terrain_generator
+    names, proportions = list(terrain.sub_terrains), [t.proportion for t in terrain.sub_terrains.values()]
+    env_cfg.column_kinds = ot.column_kinds(names, proportions, terrain.num_cols)
+    env_cfg.column_explore = ot.column_explore(names, proportions, terrain.num_cols)
+
+
+def add_short_stairs(env_cfg, fraction: float, riser_range, tread_range) -> None:
+    """从楼梯比例里拿出 fraction 做短踏面楼梯列（常驻探索：随机等级、不改课程、只记录），立面/踏面范围单独给，
+    不用 tread_rule。须在楼梯的 tread_rule 设好之后调用（短踏面列不继承它）。"""
+    terrain = env_cfg.scene.terrain.terrain_generator
+    stairs = terrain.sub_terrains[ot.STAIRS]
+    split = ot.split_short_stairs({name: t.proportion for name, t in terrain.sub_terrains.items()}, fraction)
+    short = stairs.replace(proportion=split[ot.STAIRS_SHORT], riser_range=tuple(riser_range),
+                           tread_range=tuple(tread_range), tread_rule=None)
+    stairs.proportion = split[ot.STAIRS]
+    subs = {}
+    for name, sub in terrain.sub_terrains.items():
+        subs[name] = sub
+        if name == ot.STAIRS:
+            subs[ot.STAIRS_SHORT] = short
+    terrain.sub_terrains = subs
+    refresh_columns(env_cfg)
+
+
 @configclass
 class ParallelogramRoverSuperMimicObstacleEnvCfg(ParallelogramRoverSuperMimicTerrainEnvCfg):
     def __post_init__(self):
@@ -83,8 +111,7 @@ class ParallelogramRoverSuperMimicObstacleEnvCfg(ParallelogramRoverSuperMimicTer
         terrain.num_rows, terrain.num_cols = ot.NUM_ROWS, ot.NUM_COLS
         terrain.difficulty_range, terrain.curriculum = (0.0, 1.0), True
         self.scene.terrain.max_init_terrain_level = 0
-        self.column_kinds = ot.column_kinds(list(terrain.sub_terrains),
-                                            [t.proportion for t in terrain.sub_terrains.values()], terrain.num_cols)
+        refresh_columns(self)
         self.obstacle_curriculum_cfg = dict(ot.CURRICULUM_DEFAULTS)
         self.curriculum.terrain_levels.func = ot.obstacle_curriculum
         self.rewards.anticipatory_wheel_lift = None

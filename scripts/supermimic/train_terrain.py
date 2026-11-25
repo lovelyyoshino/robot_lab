@@ -4,8 +4,8 @@ train_terrain.py — SuperMimic 越障训练：从零（无 PPO Teacher、无监
 
 @author pony
 @date 2026-10-26
-@version v0.23.0
-@last_modified 2026-11-21
+@version v0.24.0
+@last_modified 2026-11-23
 
 流程：
 1. 前 --warmup_iterations 轮只拟合世界模型（地形输入 relief_features），之后每轮 actor 在想象中按 PreviewTask 的
@@ -20,6 +20,12 @@ train_terrain.py — SuperMimic 越障训练：从零（无 PPO Teacher、无监
 （232→12）、params/vision_contract.json（部署合同）、params/supermimic_terrain.json（全部参数与实现哈希）。
 
 @changelog
+    - v0.24.0 (2026-11-23): --stairs_short_frac / --stairs_short_riser / --stairs_short_tread（obstacle_env_cfg v1.4.0：
+      从楼梯比例里拿出一列做短踏面楼梯，常驻探索、不改课程；日志 curriculum/stairs_short_episodes / _pass_rate、
+      end/stairs_short_*，楼梯课程统计与 end/stairs_* 不含这一列）。--stall_hold / --stall_hold_grace_s /
+      --stall_hold_ramp_s / --stall_hold_gain_m：卡住加码，只进真实回报（critic）——命令前进时本回合最远前进 x 超过
+      grace 秒没有再前进 gain_m，每步另计 stall_hold × 线性升到 1 的系数（obstacle_terrain v1.8.0 ProgressStallTracker；
+      想象里没有时长信息，不进想象奖励）；日志 r_stall_hold、stall_hold_active。默认关 = 原行为。
     - v0.23.0 (2026-11-21): --course（preview_task v0.24.0 车轮行进方向对准路线）、--curriculum_goal_lane_termination
       （obstacle_terrain v1.7.0：0 = 到终点不看横偏一律成功截断）。日志新增回合结局分类：term_<终止项> 每步触发率；
       end/<地形>_<终止项>_share 各地形回合按结束原因的占比；end/<地形>_goal_lat_mean / _gt15 / _gt40 到终点时 |y| 的
@@ -156,6 +162,17 @@ parser.add_argument("--contact_context", action="store_true",
 parser.add_argument("--wm_hidden", type=int, nargs="+", default=None)
 parser.add_argument("--stairs_tread_rule", type=float, nargs=3, default=None, metavar=("R0", "R1", "T1"),
                     help="楼梯踏面下限随立面提高：立面 ≤R0 不变、≥R1 时下限 T1（米），中间线性；默认不启用")
+parser.add_argument("--stairs_short_frac", type=float, default=0.0,
+                    help="从楼梯比例里拿出该比例做短踏面楼梯列（常驻探索、不改课程、只记录）；0 = 不加")
+parser.add_argument("--stairs_short_riser", type=float, nargs=2, default=(0.14, 0.175), metavar=("LO", "HI"),
+                    help="短踏面楼梯的立面范围（米，随等级线性）")
+parser.add_argument("--stairs_short_tread", type=float, nargs=2, default=(0.26, 0.30), metavar=("LO", "HI"),
+                    help="短踏面楼梯的踏面范围（米，每块均匀抽取，不用 tread_rule）")
+parser.add_argument("--stall_hold", type=float, default=0.0,
+                    help="卡住加码权重（≤0，只进真实回报）：命令前进时本回合最远前进 x 超过 grace 秒没有新进展后每步计入")
+parser.add_argument("--stall_hold_grace_s", type=float, default=1.0, help="卡住加码的宽限时长（秒）")
+parser.add_argument("--stall_hold_ramp_s", type=float, default=2.0, help="卡住加码从 0 升到满权重的时长（秒）")
+parser.add_argument("--stall_hold_gain_m", type=float, default=0.01, help="算作新进展的最小前进量（米）")
 parser.add_argument("--lead_side_obs", action="store_true",
                     help="actor 观测追加每回合随机的先抬侧标记 ±1（镜像取反）；导出时固定 +1，部署仍 232 维")
 parser.add_argument("--leg_action_bound", action="store_true",
@@ -211,7 +228,9 @@ from robot_lab.supermimic.quat import quat_apply  # noqa: E402
 from robot_lab.supermimic.rover_task import CONTROL_DT  # noqa: E402
 from robot_lab.supermimic.schedule import restore_terrain_levels  # noqa: E402
 from robot_lab.supermimic.state import LIN, QUAT  # noqa: E402
-from robot_lab.tasks.manager_based.supermimic import obstacle_terrain  # noqa: E402
+from robot_lab.tasks.manager_based.supermimic import obstacle_env_cfg, obstacle_terrain  # noqa: E402
+
+KIND_SHORT_LOG = 3  # 回合结局日志里短踏面楼梯列（常驻探索）的分组号，不是地形类型
 
 ROOT = Path(__file__).resolve().parents[2]
 LOG_ROOT = Path("logs/supermimic_terrain")
@@ -357,6 +376,14 @@ def main():
         stairs_cfg = env_cfg.scene.terrain.terrain_generator.sub_terrains[obstacle_terrain.STAIRS]
         stairs_cfg.tread_rule = tuple(args_cli.stairs_tread_rule)
         obstacle_terrain.min_tread_for_riser(stairs_cfg.riser_range[1], stairs_cfg.tread_range[0], stairs_cfg.tread_rule)
+    if args_cli.stairs_short_frac > 0:
+        # 短踏面列在 tread_rule 之后加入，不继承踏面下限
+        obstacle_env_cfg.add_short_stairs(env_cfg, args_cli.stairs_short_frac, args_cli.stairs_short_riser,
+                                          args_cli.stairs_short_tread)
+        print(f"[supermimic] 短踏面楼梯列：{sum(env_cfg.column_explore)} 列，立面 {tuple(args_cli.stairs_short_riser)} m、"
+              f"踏面 {tuple(args_cli.stairs_short_tread)} m（常驻探索）", flush=True)
+    if args_cli.stall_hold > 0:
+        raise SystemExit("--stall_hold 是代价，须 ≤ 0")
     if args_cli.episode_length_s is not None:
         env_cfg.episode_length_s = args_cli.episode_length_s
     command_cfg = env_cfg.commands.base_velocity
@@ -451,6 +478,9 @@ def main():
     stall_steps = torch.zeros(n, dtype=torch.long, device=device)
     stall_limit = round(1.0 / CONTROL_DT)  # 停滞 >1 s 记入日志
     uenv.obstacle_stall_steps = stall_steps  # obstacle_terrain.stall_timeout 读取（stall_truncate_s > 0 时截断回合）
+    # 卡住加码：按本回合最远前进 x 计时（倒车、原地、前后蹭都不清零），只进真实回报
+    hold_tracker = (obstacle_terrain.ProgressStallTracker(n, device, args_cli.stall_hold_gain_m)
+                    if args_cli.stall_hold else None)
     obs, _ = env.reset()
     # 先抬侧标记：每回合 ±1 随机，回合结束（done）时重抽；只在 --lead_side_obs 时进命令与 actor 观测。
     lead = torch.randint(0, 2, (n,), device=device).float() * 2.0 - 1.0
@@ -462,6 +492,12 @@ def main():
     start_time = time.time()
     lane_strict = float(curriculum_cfg["stairs_success_lane_m"]) or float(curriculum_cfg["success_lane_m"])
     env_kinds = kinds[terrain.terrain_types]
+    # 回合结局日志按地形分组；短踏面楼梯列（常驻探索）单独一组，不混进 stairs
+    end_names = dict(obstacle_terrain.KIND_NAMES)
+    env_short = obstacle_terrain.env_forced_explore(uenv)
+    if env_short.any():
+        end_names[KIND_SHORT_LOG] = "stairs_short"
+        env_kinds = torch.where(env_short, torch.full_like(env_kinds, KIND_SHORT_LOG), env_kinds)
     for it in range(learner.iteration, args_cli.iterations):
         log_now = it % args_cli.log_interval == 0
         sums: dict[str, torch.Tensor] = {}
@@ -498,6 +534,9 @@ def main():
             # 截断判据在 env.step 内按截至上一步的连续停滞步数计算。
             uenv.obstacle_stall_steps = stall_steps
             stall_cut = obstacle_terrain.stall_steps_exceeded(stall_steps, curriculum_cfg["stall_truncate_s"], CONTROL_DT)
+            if hold_tracker is not None:
+                # 步前相对块原点的前进距离（env.step 里的 reset 会改原点，这里先算好）
+                x_rel = uenv.scene["robot"].data.root_pos_w[:, 0] - uenv.scene.env_origins[:, 0]
             action = learner.act(policy_obs)
             if not torch.isfinite(action).all():
                 raise FloatingPointError("动作含非有限值，拒绝送入仿真")
@@ -511,6 +550,12 @@ def main():
                 rew = rew + reward_cfg.terminated * CONTROL_DT * terminated.float()
                 priority = torch.maximum(priority, terminated.float())
                 stall_steps = torch.where(task.progressing(s, cmd) | done, 0, stall_steps + 1)
+                if hold_tracker is not None:
+                    held = hold_tracker.update(x_rel, cmd[:, 0] >= 0.05, done)
+                    hold = obstacle_terrain.stall_hold_scale(held, CONTROL_DT, args_cli.stall_hold_grace_s,
+                                                             args_cli.stall_hold_ramp_s)
+                    terms["stall_hold"] = args_cli.stall_hold * hold
+                    rew = rew + terms["stall_hold"] * CONTROL_DT
             learner.observe(s, action, prev, cmd, done, ctx, reward=rew, terminated=terminated, priority=priority)
             if args_cli.lead_side_obs:
                 lead = torch.where(done, torch.randint_like(lead, 0, 2) * 2.0 - 1.0, lead)
@@ -535,7 +580,7 @@ def main():
                         add(f"term_{name}", hit)
                     rel_end = getattr(uenv, "obstacle_goal_rel", None)
                     course_deg = torch.rad2deg(task.course_error(s).clamp(-1.0, 1.0).asin().abs())
-                    for kind, kname in obstacle_terrain.KIND_NAMES.items():
+                    for kind, kname in end_names.items():
                         mask = env_kinds == kind
                         ended = done & mask
                         tally(f"end_{kname}_n", ended)
@@ -552,6 +597,8 @@ def main():
                             tally(f"goal_{kname}_gt40", goal & (lat > 0.40))
                     add("stall_1s_fraction", stall_steps > stall_limit)
                     add("stall_truncated", stall_cut)
+                    if hold_tracker is not None:
+                        add("stall_hold_active", hold > 0)
                     add("route_vel_err", (cmd[:, 0] - quat_apply(s[:, QUAT], s[:, LIN])[:, 0]).abs())
                     if lane_center_y is not None:
                         add("lateral_abs_m", task.lateral_offset(s).abs())
@@ -567,7 +614,7 @@ def main():
                 logs["stairs_success_lane_m"] = uenv.cfg.obstacle_curriculum_cfg["stairs_success_lane_m"]
             logs["pitch_rate_rms"] = math.sqrt(logs["pitch_rate_rms"]) * 180.0 / math.pi
             logs.update({f"curriculum/{k}": v.item() for k, v in obstacle_terrain.curriculum_summary(
-                obstacle_terrain.curriculum_levels(uenv), kinds[terrain.terrain_types],
+                obstacle_terrain.curriculum_levels(uenv), obstacle_terrain.summary_kinds(uenv),
                 terrain.cfg.terrain_generator.num_rows).items()})
             decisions, uenv.obstacle_curriculum_log = uenv.obstacle_curriculum_log, {}
             for name in obstacle_terrain.KIND_NAMES.values():
@@ -580,9 +627,14 @@ def main():
                     logs[f"curriculum/stairs_{key}_episodes"] = decisions.get(f"stairs_{key}_episodes", 0)
                     logs[f"curriculum/stairs_{key}_pass_rate"] = (decisions.get(f"stairs_{key}_passed", 0)
                                                                   / max(decisions.get(f"stairs_{key}_episodes", 0), 1))
+            if env_short.any():
+                # 短踏面楼梯列（常驻探索）的通过率：随机等级，立面 --stairs_short_riser、踏面 --stairs_short_tread
+                logs["curriculum/stairs_short_episodes"] = decisions.get("stairs_short_episodes", 0)
+                logs["curriculum/stairs_short_pass_rate"] = (decisions.get("stairs_short_passed", 0)
+                                                             / max(decisions.get("stairs_short_episodes", 0), 1))
             # 回合结局分类（只在记录日志的轮统计；键在第一行就全部出现，CSV 表头固定）
             got = {k: v.item() for k, v in tallies.items()}
-            for kname in obstacle_terrain.KIND_NAMES.values():
+            for kname in end_names.values():
                 ends = max(got.get(f"end_{kname}_n", 0.0), 1.0)
                 logs[f"end/{kname}_episodes"] = got.get(f"end_{kname}_n", 0.0)
                 for name in uenv.termination_manager.active_terms:
