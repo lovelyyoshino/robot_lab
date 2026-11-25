@@ -39,15 +39,15 @@
 
 | 流程 | 状态 | 入口 | 现有产物与结论 |
 |---|---|---|---|
-| SuperMimic 越障 | **当前主线**，训练中 | `scripts/supermimic/run_train.sh`、`watch_accept.sh`、`accept.py` | 2026-11-07 14:10 起训练 `logs/supermimic_terrain/obstacle_stairslant_20261107/`：按预抬的物理边界设计（单台阶每根轴一个轮先抬、另一个滚上去；楼梯前轴每级一个轮先抬、车身斜 12° 让后轴两轮先后翻上立面，见 [docs/supermimic.md §1.1](docs/supermimic.md)）。`obstacle_prelift_20261106/` 第一次学会严格预抬（第 18000 轮 17.5 cm 窄台阶 80–83%），保留 ckpt 12000/16000/18000 作基线；`obstacle_prelift_20261107/` 第 6000 轮窄台阶预抬 52%，但楼梯卡在后轴、整宽台阶停在块上，改动见设计文档"每轮训练后的修正"。更早的 `obstacle_bumpclimb_20261106/` 能碰了再爬，但严格预抬 0%、台阶横滚 8–19°。见[第 7 节](#supermimic) |
-| SuperMimic 对照基线 | 只读保留 | `logs/supermimic_terrain/scratch_40k_r8k/`、`normal_drive_rehearsal_20k_20261103/` | 按旧验收协议，楼梯 8/12/16 cm 的通过率分别为 100/100/84%、100/98/89%。按当前验收协议需要重测，见 [7.6](#sm-baselines) |
+| SuperMimic 越障 | **当前主线**，有可用策略 | `scripts/supermimic/run_train.sh`、`accept.py`、`play.py --supermimic_terrain` | 推荐用 `logs/supermimic_terrain/obstacle_r30_scratch/ckpt_eval/it32000/exported/policy.pt`（r30 第 32000 轮）：40 cm 踏面的 8/12/16/17.5 cm 楼梯 100/100/100/98%，10/14/17.5 cm 单台阶（整宽、左窄、右窄）全部 100%。28 cm 踏面只能上 8/12 cm（100/91%）。用法见[第 7 节](#supermimic) |
+| SuperMimic 对照存档 | 只读保留 | `logs/supermimic_terrain/obstacle_r18_scratch/` 等 | r18、r22、r27、r28 各自最好的存档，同一套验收，见 [7.7](#sm-baselines) |
 | 视觉前瞻 Teacher（PPO） | 冻结，作为对照 | `train.py` + `…-Vision-Teacher-Preview-v0` | `logs/vision_preview/teacher/2026-10-14_11-31-31_stairs_climb/model_7999.pt`：楼梯 8/12/16 cm 通过率 100/75/0%，单障碍提前抬轮未达标 |
 | 深度 Student（DAgger） | 冻结 | `train.py` + `…-Vision-Student-Temporal-Preview-v0` | `logs/vision_preview/student/2026-10-14_19-40-29_stairs_depth/model_7999.pt`：能通行单障碍，未学会提前抬轮 |
 | 侧躺恢复（residual PPO） | 冻结，已通过开发评测和一个留出 seed | `train.py` + `…-Recovery-Side-Residual-…-v0` | `logs/recovery_side_restart_v1/policy/2026-09-30_10-37-40_constant/model_5098.pt`：成功率 100%，门槛为 85% |
 | 盲走（PPO） | 遗留基线 | `train.py` + `…-Rough-Parallelogram-Rover-v0` | `logs/rsl_rl/parallelogram_rover_rough/2026-08-13_17-35-42/model_19999.pt` |
 | 双轮直立、起立、两轮运动 | 遗留，没有保留 checkpoint | `…-Upright-*-v0` | 需要重新训练 |
 | 三策略混合切换 | 遗留，只做过仿真集成 | `scripts/play_parallelogram_hybrid.py` | 依赖直立 checkpoint，当前无法直接运行 |
-| SuperMimic 平地、深度扫描学生、旧越障路线 | 遗留工具 | 见 [7.8](#sm-other) | 未接入当前越障训练 |
+| SuperMimic 平地、深度扫描学生、旧越障路线 | 遗留工具 | 见 [7.9](#sm-other) | 未接入当前越障训练 |
 | 上游四足、轮足、人形任务 | 与上游一致，本分支未改动 | 见[第 4 节](#tasks)、[第 5 节](#generic) | — |
 
 > [!NOTE]
@@ -171,7 +171,7 @@ robot_lab/
     ├── rsl_rl/<experiment_name>/<时间戳>_<run_name>/   # rsl_rl 默认位置：model_*.pt、params/、exported/
     ├── vision_preview/{teacher,student,eval}/
     ├── recovery_side_restart_v1/{source,demos,policy,evaluation}/
-    └── supermimic_terrain/          # SuperMimic 越障 run，布局见 7.5
+    └── supermimic_terrain/          # SuperMimic 越障 run，布局见 7.6
 ```
 
 <a id="tasks"></a>
@@ -567,60 +567,164 @@ python scripts/play_parallelogram_hybrid.py \
 
 ## 7. SuperMimic 越障训练（当前主线）
 
-### 7.1 方法与目标
-
 越障策略完全从零训练，只用 SuperMimic：世界模型加 32 步想象 BPTT，价值梯度全开，想象批量 4096。不使用 PPO Teacher，不做监督初始化，也不加锚定。
-目标是：车身不倾斜；遇到台阶时提前抬轮（10/14/17.5 cm 单台阶，分全宽、左窄、右窄，一次只抬一个轮，同轴另一个轮可以滚上去）；能上 8/12/16/17.5 cm 的楼梯（踏面 0.40 m 和 0.28 m），楼梯上轻碰快上；全程平稳；平地直行时偏航和横移都小。
-两前轮不能同时离地，楼梯上也不可能每级都让四个轮离地预抬，依据见设计文档 §1.1。
-需求门槛、预抬的物理边界、目标函数、地形课程、上一版为什么推倒重来以及每轮训练后的修正，都写在设计文档 [docs/supermimic.md](docs/supermimic.md) 中。代码位于 `source/robot_lab/robot_lab/supermimic/`（`preview_task.py` 为解析目标）和 `tasks/manager_based/supermimic/obstacle_env_cfg.py`、`obstacle_terrain.py`。
+需求门槛、预抬的物理边界、目标函数和地形课程见设计文档 [docs/supermimic.md](docs/supermimic.md)。代码位于 `source/robot_lab/robot_lab/supermimic/`（`preview_task.py` 为解析目标）和 `tasks/manager_based/supermimic/obstacle_env_cfg.py`、`obstacle_terrain.py`。
 
-### 7.2 训练
+### 7.1 现在能用的策略
 
 ```bash
-# nohup + setsid 后台运行；参数为 run 名、env 数、轮数。每 1000 轮存档一次，2048 env 实测约 1.3 s/轮
+P=logs/supermimic_terrain/obstacle_r30_scratch/ckpt_eval/it32000/exported/policy.pt   # sha256 7199d853d951…
+```
+
+这是 r30（`run_train.sh` v2.21.0，从零训练，种子 42）的第 32000 轮。同一个 run 目录下的 `exported/policy.pt` 是第 40000 轮，横偏更大，不要用它。
+
+| 场景（指令 0.30 m/s 直行） | 严格成功率（每档 64 回合） |
+|---|---|
+| 楼梯，踏面 40 cm，立面 8 / 12 / 16 / 17.5 cm | 100 / 100 / 100 / 98% |
+| 楼梯，踏面 28 cm，立面 8 / 12 cm | 100 / 91% |
+| 楼梯，踏面 28 cm，立面 16 / 17.5 cm | 0 / 0%（前轴上去，后轮顶在第一级） |
+| 单台阶 10 / 14 / 17.5 cm（整宽、左侧窄道、右侧窄道，上去再下来） | 9 档全部 100% |
+| 平地 0–0.30 m/s 直行 | 速度跟踪 RMSE 0.10–0.14 m/s；0.30 m/s 时横偏 P95 0.17 m |
+
+- 严格成功：到达终点、四轮着地停稳、没有翻车、终点横偏 ≤0.15 m。
+- 这些数字来自训练中的过程验收（挑选用种子 142/143/144），结果在 `ckpt_eval/it32000/acceptance/summary.md`。留出种子的最终验收还没跑，跑法见 7.4。
+- 视频：`docs/videos/supermimic_r30/r30_it32000_overview.mp4`，约 4 分钟，包括各类楼梯和单台阶。这个目录不进 git，文件只在训练服务器上。
+
+**怎么爬的**（第 32000 轮，从侧面看）：
+
+![r30 第 32000 轮上 16 cm × 40 cm 楼梯](docs/imgs/supermimic/r30_stairs16x40_climb.jpg)
+
+楼梯：前轴先上，后轴跟上，爬的时候车头抬起 15–21°。0.30 m/s 下 4 级约 11 s 到顶。
+
+![r30 第 32000 轮过左侧窄道 17.5 cm 台阶](docs/imgs/supermimic/r30_step17.5_left.jpg)
+
+窄道台阶：只有碰到台阶的那一侧抬轮。左前轮先离地、搭上台面，右侧车轮在地面照常走；前轮下来以后，左后轮再上去。
+
+### 7.2 策略接口
+
+`policy.pt` 是 TorchScript，用 `torch.jit.load` 加载。
+
+- 输入 `[N, 232]` float32，输出 `[N, 12]`；
+- 控制周期 0.02 s（50 Hz）；
+- 导出的是确定性 actor（EMA 权重）；
+- 关节顺序都是 fl、rl、fr、rr。
+
+| 观测下标 | 维数 | 内容 | 缩放 |
+|---|---|---|---|
+| 0–2 | 3 | 车体角速度 | ×0.25 |
+| 3–5 | 3 | 车体系下的重力方向 | ×1 |
+| 6–8 | 3 | 路线指令：世界系路线速度 (vx, vy, ωz) 按车头偏航 ψ 转到车体系，即 (cosψ·vx + sinψ·vy, −sinψ·vx + cosψ·vy, ωz)。训练时 vx 0.1–0.4 m/s、10% 的环境给 0（原地停），vy = ωz = 0 | ×1 |
+| 9–20 | 12 | 关节位置减默认位置（默认全 0），顺序是 4 个 `*_arm_joint`、4 个 `*_qudong_joint`、4 个 `*_wheel_joint`；轮子 4 项恒为 0 | ×1 |
+| 21–32 | 12 | 关节速度，顺序同上 | ×0.05 |
+| 33–44 | 12 | 上一步动作 | ×1 |
+| 45–231 | 187 | 高度扫描，17 × 11 点，位置见下图；随车头偏航转动，截断到 ±1 | ×1 |
+
+| 动作下标 | 关节 | 含义 |
+|---|---|---|
+| 0–3 | `*_arm_joint`（摆臂） | 位置目标 = 默认位置 + 0.25·a（rad） |
+| 4–7 | `*_qudong_joint`（转向） | 位置目标 = 默认位置 + 0.25·a（rad） |
+| 8–11 | `*_wheel_joint`（轮子） | 速度目标 = 5·a（rad/s） |
+
+![高度扫描 187 个点相对车体的位置（俯视）](docs/imgs/supermimic/policy_scan_points.png)
+
+- 高度扫描点的排列顺序和数值定义，以 run 目录的 `params/vision_contract.json`（`height_scanner` 一项）和 `vision_preview.near_field_height_pattern` 为准。
+- `play.py`、`evaluate_parallelogram_vision.py` 和 `accept.py` 加载策略时，会按这份文件核对观测项、动作缩放和 URDF 的 sha256，所以拷贝策略时要连 `params/` 一起拷。
+- 仿真里摆臂执行器的刚度是 20 N·m/rad，力矩上限 10 N·m，上实车前要核对。
+
+### 7.3 回放和单项评测
+
+两个脚本：`play.py` 带界面看效果，`evaluate_parallelogram_vision.py` 按指定的楼梯或台阶尺寸统计成功率。
+
+```bash
+# 带界面回放（场景：pyramid_stairs_inv 楼梯，single_step / single_step_left / single_step_right 单台阶，boxes 方块）
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Teacher-Preview-v0 \
+  --supermimic_terrain --checkpoint $P \
+  --num_envs 4 --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5
+
+# 指定尺寸评测：楼梯立面 16 cm × 踏面 40 cm，结果写成 JSON
+python scripts/reinforcement_learning/rsl_rl/evaluate_parallelogram_vision.py --headless \
+  --policy teacher-preview --supermimic_terrain --checkpoint $P \
+  --scenario pyramid_stairs_inv --difficulty 0.0 --stair_riser_m 0.16 --stair_tread_m 0.40 \
+  --num_envs 16 --episodes_per_env 2 --seed 142 --acceptance_metrics --output /tmp/stairs16x40.json
+
+# 单台阶：换成下面几项
+#   --scenario single_step|single_step_left|single_step_right --difficulty 0.5 --step_height_m 0.175
+```
+
+评测脚本加 `--supermimic_terrain` 时轮胎摩擦固定为 μ = 1.0，和验收一致；要改用 `--wheel_friction`。
+
+同一台机器上同一时间只跑一个 Isaac 评测。训练中的过程验收会对 `logs/.isaac_eval.lock` 加锁，手动评测时建议也套上：
+
+```bash
+flock logs/.isaac_eval.lock timeout -s KILL 1800 <上面的命令>
+```
+
+超时要用 `-s KILL`：Isaac 不理会 SIGTERM，仿真偶尔会卡住空转。
+
+### 7.4 验收
+
+```bash
+# 留出种子 9001–9003 的最终验收，约 50–55 分钟；用 --out 另放，避免覆盖过程验收的结果
+python scripts/supermimic/accept.py --checkpoint $P \
+  --out logs/supermimic_terrain/obstacle_r30_scratch/ckpt_eval/it32000/acceptance_holdout
+# 也可以按 run 名和轮数验收（会自动导出到 ckpt_eval/itN/）
+python scripts/supermimic/accept.py --load_run <run_name> --iteration <N>
+```
+
+- 输出包括 `summary.md`、`summary.json`、`flat.json` 和 `cases/`。不给 `--out` 时，`--iteration N` 写到 `<run>/ckpt_eval/itN/acceptance/`，`--checkpoint` 写到策略所在目录的 `acceptance/`。
+- 退出码：
+  - 0：5 项需求全部通过；
+  - 1：有需求没通过；
+  - 2：执行异常（崩溃、超时或种子冲突），这时结果不能用来下结论。
+- 常用选项：
+  - `--suites flat prelift stairs`；
+  - `--reuse`：中断后续跑；
+  - `--summarize_only`：不启动 Isaac，只重算汇总；
+  - `--dry_run`：只打印计划。
+- 所有统计都是跨回合或跨环境取 P95，口径见 `scripts/reinforcement_learning/rsl_rl/acceptance_metrics.py`。
+
+### 7.5 训练
+
+`run_train.sh` 的默认参数（v2.21.0）就是 r30 的配置。全部目标权重、课程和终止参数、命令和回合长度、优化参数都显式写在这个脚本里，开头的修改记录写了每一轮为什么改。
+
+```bash
+# nohup + setsid 后台运行；参数为 run 名、env 数、轮数。每 1000 轮存档一次
 bash scripts/supermimic/run_train.sh <run_name> 2048 40000
 tail -f logs/supermimic_terrain/<run_name>.log
 tensorboard --logdir logs/supermimic_terrain/<run_name>
-kill $(cat logs/supermimic_terrain/<run_name>.pid)        # 停止训练
+kill $(cat logs/supermimic_terrain/<run_name>.pid)                    # 停止训练
+RESUME=1 bash scripts/supermimic/run_train.sh <run_name> 2048 40000   # 从同名 run 的最新存档续训，日志追加
 ```
 
-全部目标权重、课程/终止参数、命令与回合长度和优化参数都显式写在 `run_train.sh` 中。如果 run 名已经存在，脚本会拒绝启动。续训需要手动执行：`python scripts/supermimic/train_terrain.py --headless --resume --load_run <run_name>`，后面跟上与 `run_train.sh` 中 `TRAIN_ARGS` 相同的参数。
+- r30 用 2048 env 跑 40000 轮约 30 小时，期间同时在跑过程验收。
+- run 名已经存在时，脚本会拒绝启动。
 
-### 7.3 训练中的过程验收
+**过程验收**：训练时另起一个 watch，存档按它的验收结果挑，不要直接用最后一个。
+
+![r30 每 2000 轮过程验收的严格成功率](docs/imgs/supermimic/r30_ckpt_success.png)
+
+从 r30 的曲线看：
+- 相邻存档之间，高楼梯成功率能差几十个点（第 1.6 万轮 70%，第 1.8 万轮 34%）；
+- 最好的几个存档在第 2.6–3.2 万轮；
+- 第 3.6 万轮以后回落，掉的主要是终点横偏超标。
 
 ```bash
 nohup bash scripts/supermimic/watch_accept.sh <run_name> 2000 > logs/supermimic_terrain/<run_name>_watch.log 2>&1 &
 cat logs/supermimic_terrain/<run_name>/acceptance_progress.md
 ```
 
-watch 每 2000 轮把新存档导出到 `ckpt_eval/it<N>/`，然后用挑选用 seed（默认 142/143/144，按档轮换，每个存档约 20 分钟）运行 `accept.py`，把结论表追加到 `acceptance_progress.md`。它以最低优先级运行，不会干预训练。已经评测过的存档会跳过，所以可以随时重启。训练退出、并且没有待评存档时，watch 会自动结束。
-可以用环境变量调整行为：`ACCEPT_SEEDS`、`ACCEPT_SEED_MODE`（`rotate` 或 `split`）、`ACCEPT_SUITES`（默认 `flat prelift stairs`）、`ACCEPT_POLL_S`、`ACCEPT_IDLE_EXIT_H`。
+- 每 2000 轮把新存档导出到 `ckpt_eval/it<N>/`，用挑选用种子跑 `accept.py`。默认种子 142/143/144，按档轮换，每个存档约 20 分钟。结论表追加到 `acceptance_progress.md`。
+- 以最低优先级运行，不影响训练；评测过的存档会跳过，可以随时重启；训练退出、又没有待评存档时自动结束。
+- 可调的环境变量：`ACCEPT_SEEDS`、`ACCEPT_SEED_MODE`（`rotate` 或 `split`）、`ACCEPT_SUITES`（默认 `flat prelift stairs`）、`ACCEPT_POLL_S`、`ACCEPT_IDLE_EXIT_H`。
 
-### 7.4 最终验收
-
-```bash
-# 留出 seed 9001–9003（不能用于训练和挑选），约 50–55 分钟
-python scripts/supermimic/accept.py --load_run <run_name> --iteration 40000
-# 也可以直接指定一个导出的 TorchScript
-python scripts/supermimic/accept.py --checkpoint logs/supermimic_terrain/<run_name>/ckpt_eval/it<N>/exported/policy.pt
-```
-
-- 加 `--iteration N` 时，结果写入 `logs/supermimic_terrain/<run_name>/ckpt_eval/itN/acceptance/`；不加时验收 `<run_name>/exported/policy.pt`，结果写入 `<run_name>/acceptance/`。输出包括 `summary.md`、`summary.json`、`flat.json` 和 `cases/`。
-- 退出码：0 表示 5 项需求全部通过，1 表示有需求未通过，2 表示执行异常（崩溃、超时或 seed 冲突），此时结果不能用来下结论。
-- 常用选项：`--suites flat prelift stairs`、`--reuse`（中断后续跑）、`--summarize_only`（不启动 Isaac，只重算汇总）、`--dry_run`（只打印计划）。所有统计都是跨回合或跨环境取 P95，口径见 `scripts/reinforcement_learning/rsl_rl/acceptance_metrics.py`。
-
-回放越障策略（与验收使用同一个 Teacher-Preview 环境和合同校验）：
+要单独导出某个中间存档：
 
 ```bash
-python scripts/reinforcement_learning/rsl_rl/play.py \
-  --task RobotLab-Isaac-Velocity-Rough-Parallelogram-Rover-Vision-Teacher-Preview-v0 \
-  --supermimic_terrain --load_run <run_name> \
-  --num_envs 4 --preview_scenario pyramid_stairs_inv --preview_difficulty 0.5
+python scripts/supermimic/export_ckpt.py --load_run <run_name> --iterations <N>
 ```
 
-如果要回放某个中间存档，就把 `--load_run` 换成 `--checkpoint logs/supermimic_terrain/<run_name>/ckpt_eval/it<N>/exported/policy.pt`。这个文件需要先用 `python scripts/supermimic/export_ckpt.py --load_run <run_name> --iterations <N>` 导出。
-
-### 7.5 产物与日志位置
+### 7.6 产物与日志位置
 
 ```text
 logs/supermimic_terrain/
@@ -628,47 +732,43 @@ logs/supermimic_terrain/
 └── <run>/
     ├── ckpt_XXXXXX.pt  train_log.csv  events.out.tfevents.*
     ├── params/{supermimic_terrain.json, vision_contract.json}
-    ├── exported/policy.{pt,onnx}                  # 最近一次存档的导出
+    ├── exported/policy.{pt,onnx}                  # 最后一个存档的导出
     ├── acceptance_progress.md                     # watch 的过程验收结论
-    └── ckpt_eval/it<N>/{exported/, params/, acceptance/}
+    ├── ckpt_eval/it<N>/{exported/, params/, acceptance/}
+    └── report/                                    # 部分 run 有：报告、视频、分析脚本
 ```
 
 <a id="sm-baselines"></a>
 
-### 7.6 对照基线
+### 7.7 保留的对照存档
 
-`obstacle_bumpclimb_20261106/` 的 ckpt_006000 和 ckpt_008000 是上一版奖励（碰了再爬，232 维）。第 6000 轮的过程验收（当时预抬窗口为 8–14 cm）结果是：10 cm 单台阶 98–100%，17.5 cm 正面 36%，8 cm 楼梯 94%，平地通过；严格预抬 0%，台阶横滚 P95 8–19°。
+下面这些存档用的是同一套验收（2026-11-11 起没改，轮胎摩擦固定 μ = 1.0），可以直接比较。策略文件都在各自的 `ckpt_eval/it<N>/exported/policy.pt`。更早的 `scratch_40k_r8k`、`normal_drive_rehearsal_20k_20261103`、`obstacle_bumpclimb_20261106` 已经删除。
 
-下面两个旧基线是 233 维观测（多一维车道偏移），`accept.py` 和 `play.py` 会自动识别。
-
-| 基线 | 说明 | 旧协议的楼梯结果（8/12/16 cm，64 回合每档） |
+| 存档（`logs/supermimic_terrain/`） | 强项 | 短板 |
 |---|---|---|
-| `scratch_40k_r8k/ckpt_040000.pt` | 旧的从零训练 | 100 / 100 / 84% |
-| `normal_drive_rehearsal_20k_20261103/ckpt_018400.pt` | 楼梯成绩最好，但不会预抬，平地偏航不达标 | 100 / 98 / 89% |
-| `normal_drive_rehearsal_20k_20261103/ckpt_020000.pt` | 同上 | 100 / 94 / 78% |
+| `obstacle_r30_scratch` 第 32000 轮（**推荐**） | 楼梯和单台阶的成功率最高，见 7.1 | 严格预抬 9 档平均 31%，俯仰不过的项多 |
+| `obstacle_r28_scratch` 第 24000 轮 | 12/16/17.5 cm × 40 楼梯 100/95/91%，12 × 28 91% | 严格预抬平均约 8% |
+| `obstacle_r27_scratch` 第 24000 轮 | 这几个里验收不过的检查项最少；平地俯仰 2.6° | 12 cm 以上楼梯 0–9%，横偏超标 |
+| `obstacle_r27_scratch` 第 36000 轮 | 12/16/17.5 cm × 40 楼梯 100/92/83% | 满宽 14/17.5 cm 单台阶 80/83% |
+| `obstacle_r22_scratch` 第 20000 轮 | 唯一一个 12 × 28 楼梯 100% 的存档 | 姿态和平顺不过的项最多 |
+| `obstacle_r18_scratch` 第 16000 轮 | 严格预抬 9 档平均 63%；12/16/17.5 cm × 40 楼梯 100/95/98% | 平地静止时车头低约 7° |
 
-旧协议的逐存档记录在各自目录的 `acceptance_progress.md` 中，`ckpt_eval/it<N>/acceptance/` 里也是旧协议结果。要按当前协议比较，需要用 `accept.py` 重测（导出文件已经存在于 `ckpt_eval/it<N>/` 中），建议用 `--out` 写到别的目录，避免和旧结果混在一起：
+r27 和 r30 的报告和视频在各自 run 目录的 `report/` 下。
 
-```bash
-python scripts/supermimic/accept.py --load_run scratch_40k_r8k --iteration 40000
-python scripts/supermimic/accept.py --load_run normal_drive_rehearsal_20k_20261103 --iteration 18400
-python scripts/supermimic/accept.py --load_run normal_drive_rehearsal_20k_20261103 --iteration 20000
-```
+### 7.8 已知限制
 
-### 7.7 风险与待办
-
-完整清单见 [docs/supermimic.md](docs/supermimic.md) 第 5 节。要点如下：
-
-- 三轮支撑裕度、轻碰、横滚超限、车道和镜像的权重是按量级估出来的，需要看训练曲线再校准。
-- 三轮支撑的静稳定裕度只有约 2 cm；整宽台阶上同轴两轮谁先抬由策略决定，要看是否两轮都不抬。
-- 12 cm 单台阶的几何俯仰约 9.8°，θ_ref 已扣 6°（约 3.8°）；楼梯上 θ_ref 比坡度低 6°，要确认楼梯俯仰门仍满足。
-- URDF 左右有 4–8 mm 的不对称，镜像增强只是近似。
-- 仿真中摆臂执行器偏软（刚度 20 N·m/rad，力矩上限 10 N·m），需要和实机核对。
-- 深度学生要等越障教师过门之后再适配。
+- **28 cm 踏面的 16/17.5 cm 楼梯上不去**：这种组合训练里没有生成过，直着走时前后轴会同时顶住立面。
+- **只会上楼梯，没练过下楼梯**；单台阶是上去再下来。
+- **长距离直行会慢慢偏**：actor 看不到横向位置，只能靠车头朝向和转向保持车道。实车上需要导航层按定位修正路线指令。
+- **还没有存档 5 项需求全过**：
+  - 接触立面前的车速 0.44–0.69 m/s，门槛 0.15，目前靠冲劲上台阶；
+  - 严格预抬偏低（右窄道 66–84%，左窄道 9–22%，整宽 3–6%）；
+  - 俯仰 P95：平地 5.6–9.1°（门槛 5°），台阶 11–18°（门槛 8°）。
+- r18–r27 的逐轮记录在 `docs/supermimic_history.md`。r28–r30 的记录在 `run_train.sh` 开头的修改记录，以及 r30 报告 `logs/supermimic_terrain/obstacle_r30_scratch/report/r30_report.md`。
 
 <a id="sm-other"></a>
 
-### 7.8 其他 SuperMimic 脚本
+### 7.9 其他 SuperMimic 脚本
 
 | 脚本（`scripts/supermimic/`） | 状态 | 用途 |
 |---|---|---|
